@@ -1,27 +1,22 @@
 <script setup lang="ts">
-// Chat.vue —— 对话主界面：左侧窄会话列表 + 中间对话区 + 右侧结果抽屉
-// 负责 SSE 事件分发（conversation_id/clarification/plan_start/task_*/agent_*/tool_*/final_result）、
-// 会话切换、结果抽屉与导出（图片/PDF）
+// Chat.vue —— 通用对话主界面：左侧窄会话列表 + 中间对话区
+// 负责 SSE 事件分发（conversation_id/token/tool_call/tool_result/done）与会话管理
 import { computed, onMounted, ref } from 'vue'
 import { Plus } from '@element-plus/icons-vue'
 import { useConversationStore } from '@/stores/conversation'
-import { useTripStore } from '@/stores/trip'
 import { chatStream } from '@/services/sse'
 import { listConversations, getConversation, deleteConversation } from '@/services/api'
 import ChatPanel from '@/components/ChatPanel.vue'
-import ProgressPanel from '@/components/ProgressPanel.vue'
-import TripResultPanel from '@/components/TripResultPanel.vue'
-import type { ChatMessage, TripPlanSet } from '@/types'
+import type { ChatMessage, ToolEvent } from '@/types'
 
 const convStore = useConversationStore()
-const tripStore = useTripStore()
 
 // 聊天消息列表
 const messages = ref<ChatMessage[]>([])
 // 是否正在流式请求中
 const streaming = ref(false)
-// 结果抽屉开关
-const drawerOpen = ref(false)
+// 本轮是否已产生助手输出（token / 工具事件）→ 控制呼吸点显示
+const assistantOutput = ref(false)
 
 // 消息 id 自增计数器，保证渲染 key 唯一
 let seq = 0
@@ -30,23 +25,15 @@ function nextId(): string {
   return `m${Date.now()}-${seq}`
 }
 
-// 是否有编排进度（收到 plan_start）→ 控制呼吸点与进度面板的切换
-const hasProgress = computed(() => tripStore.events.some((e) => e.type === 'plan_start'))
-// 呼吸点：流式请求中、且尚未收到 plan_start（助手在拆解任务）
-const thinking = computed(() => streaming.value && !hasProgress.value)
+// 呼吸点：流式请求中、且助手尚未吐出任何 token 或工具事件
+const thinking = computed(() => streaming.value && !assistantOutput.value)
 
 // —— 消息构造辅助 ——
 function pushUser(text: string) {
-  messages.value.push({ id: nextId(), role: 'user', kind: 'text', content: text })
+  messages.value.push({ id: nextId(), role: 'user', content: text })
 }
 function pushAssistantText(text: string) {
-  messages.value.push({ id: nextId(), role: 'assistant', kind: 'text', content: text })
-}
-function pushClarify(questions: string[]) {
-  messages.value.push({ id: nextId(), role: 'assistant', kind: 'clarify', questions })
-}
-function pushResult(planSet: TripPlanSet) {
-  messages.value.push({ id: nextId(), role: 'assistant', kind: 'result', planSet })
+  messages.value.push({ id: nextId(), role: 'assistant', content: text })
 }
 
 // 刷新会话列表（后端未启动时静默失败）
@@ -58,54 +45,73 @@ async function refreshConversations() {
   }
 }
 
-// 发送消息：调用 chatStream，SSE 事件实时驱动进度面板与结果面板
+// 发送消息：调用 chatStream，把 token/tool_call/tool_result 累积到当前助手消息
 async function send(text: string) {
   const t = text.trim()
   if (!t || streaming.value) return
   pushUser(t)
   streaming.value = true
-  // 清空上一轮进度与结果，收起结果抽屉，开始新一轮规划
-  tripStore.events = []
-  tripStore.planSet = null
-  drawerOpen.value = false
+  assistantOutput.value = false
+
+  // 当前正在构建的助手消息：本轮所有 token 与工具事件都累积到它身上
+  let current: ChatMessage | null = null
+  // 懒创建：首条 token 或首个工具事件到达时才生成助手消息，避免空轮次留下空白气泡
+  const ensureAssistant = (): ChatMessage => {
+    if (!current) {
+      current = { id: nextId(), role: 'assistant', content: '', tools: [] }
+      messages.value.push(current)
+    }
+    return current
+  }
+
   try {
     await chatStream(t, convStore.currentId, (ev: any) => {
-      // 记录全部事件供 ProgressPanel 读取（含思考过程）
-      tripStore.events.push(ev)
-      // 事件分发：按 type 更新会话 / 澄清提问 / 最终结果
       switch (ev.type) {
         case 'conversation_id':
           // 首次对话拿到会话 id，记住并刷新侧栏
           convStore.currentId = ev.conversation_id
           refreshConversations()
           break
-        case 'clarification':
-          // 信息不全：渲染提问气泡，等用户补充后继续同一会话
-          pushClarify(ev.questions)
+        case 'token':
+          // 逐字增量（含思考文本，均显示）：追加到助手消息 content
+          ensureAssistant().content += ev.content ?? ''
+          assistantOutput.value = true
           break
-        case 'final_result':
-          // 整合完成：写入方案 store、渲染结果气泡并打开抽屉
-          tripStore.planSet = ev.data
-          pushResult(ev.data)
-          openResult()
+        case 'tool_call':
+          // 工具调用：追加一个气泡，稍后由 tool_result 回填摘要
+          ensureAssistant().tools!.push({ tool: ev.tool, args: ev.args })
+          assistantOutput.value = true
+          break
+        case 'tool_result': {
+          // 回填摘要：找最近一条同名且尚未回填的工具事件
+          const msg = ensureAssistant()
+          const list = msg.tools!
+          for (let i = list.length - 1; i >= 0; i--) {
+            if (list[i]!.tool === ev.tool && !list[i]!.summary) {
+              list[i]!.summary = ev.summary
+              break
+            }
+          }
+          assistantOutput.value = true
+          break
+        }
+        case 'done':
+          // 本轮结束：无需额外处理，finally 里会复位 streaming
           break
       }
     })
   } catch {
-    pushAssistantText('抱歉，规划暂时失败，请稍后重试。')
+    pushAssistantText('抱歉，本次请求失败，请稍后重试。')
   } finally {
     streaming.value = false
   }
 }
 
-// 新对话：重置会话与结果状态
+// 新对话：重置会话状态
 function newChat() {
   convStore.currentId = null
   localStorage.removeItem('current_conv_id')   // 清除持久化的会话
-  tripStore.planSet = null
-  tripStore.events = []
   messages.value = []
-  drawerOpen.value = false
 }
 
 // 删除会话：调后端删除，删除的是当前会话则重置
@@ -125,9 +131,6 @@ async function deleteConv(id: string) {
 async function selectConversation(id: string) {
   convStore.currentId = id
   localStorage.setItem('current_conv_id', id)   // 持久化当前会话，刷新后恢复
-  tripStore.planSet = null
-  tripStore.events = []
-  drawerOpen.value = false
   messages.value = []
   try {
     const history = await getConversation(id)
@@ -137,57 +140,35 @@ async function selectConversation(id: string) {
   }
 }
 
-// 后端历史消息 → 前端 ChatMessage（assistant 的 JSON 结果解析为 result 气泡 / 澄清气泡）
+// 后端历史消息 → 前端 ChatMessage（assistant 的 {content, tools} JSON 还原为 markdown + 工具气泡）
 function historyToMessages(history: { role: string; content: string }[]): ChatMessage[] {
   const out: ChatMessage[] = []
   for (const m of history) {
     if (m.role === 'user') {
-      out.push({ id: nextId(), role: 'user', kind: 'text', content: m.content })
+      out.push({ id: nextId(), role: 'user', content: m.content })
     } else {
-      const planSet = tryParsePlanSet(m.content)
-      if (planSet) {
-        out.push({ id: nextId(), role: 'assistant', kind: 'result', planSet })
+      const parsed = parseAssistantContent(m.content)
+      if (parsed) {
+        out.push({ id: nextId(), role: 'assistant', content: parsed.content, tools: parsed.tools })
       } else {
-        const questions = tryParseClarify(m.content)
-        if (questions) out.push({ id: nextId(), role: 'assistant', kind: 'clarify', questions })
-        else out.push({ id: nextId(), role: 'assistant', kind: 'text', content: m.content })
+        out.push({ id: nextId(), role: 'assistant', content: m.content })
       }
     }
   }
   return out
 }
 
-// 尝试把 assistant 消息解析为多套方案 JSON（失败则返回 null，按纯文本处理）
-function tryParsePlanSet(content: string): TripPlanSet | null {
+// 尝试把 assistant 消息解析为 {content, tools} JSON（失败则返回 null，按纯文本处理）
+function parseAssistantContent(content: string): { content: string; tools?: ToolEvent[] } | null {
   try {
     const o = JSON.parse(content)
-    if (o && typeof o === 'object' && Array.isArray(o.plans)) return o as TripPlanSet
+    if (o && typeof o === 'object' && typeof o.content === 'string') {
+      return { content: o.content, tools: Array.isArray(o.tools) ? o.tools : undefined }
+    }
   } catch {
     /* 非 JSON 文本，忽略 */
   }
   return null
-}
-
-// 尝试把 assistant 消息解析为澄清问题 JSON（失败则返回 null，按纯文本处理）
-function tryParseClarify(content: string): string[] | null {
-  try {
-    const o = JSON.parse(content)
-    if (o && o.clarify === true && Array.isArray(o.questions)) return o.questions
-  } catch {
-    /* 非 JSON 文本，忽略 */
-  }
-  return null
-}
-
-// 打开结果抽屉
-function openResult() {
-  drawerOpen.value = true
-}
-
-// 点击结果气泡「查看方案」：把该结果写回 store 并打开抽屉（支持历史会话）
-function showResult(planSet: TripPlanSet) {
-  tripStore.planSet = planSet
-  openResult()
 }
 
 // 会话时间戳格式化：仅显示 月-日 时:分
@@ -237,42 +218,8 @@ onMounted(async () => {
 
     <!-- 中间对话区：核心，占主导 -->
     <section class="chat__main">
-      <ChatPanel
-        :messages="messages"
-        :streaming="streaming"
-        :thinking="thinking"
-        @send="send"
-        @open-result="showResult"
-      >
-        <!-- 编排进度注入消息流 -->
-        <template #progress>
-          <ProgressPanel v-if="streaming && hasProgress" />
-        </template>
-      </ChatPanel>
+      <ChatPanel :messages="messages" :streaming="streaming" :thinking="thinking" @send="send" />
     </section>
-
-    <!-- 右侧结果抽屉 -->
-    <el-drawer
-      v-model="drawerOpen"
-      direction="rtl"
-      size="480px"
-      :with-header="false"
-      class="result-drawer"
-    >
-      <div v-if="tripStore.planSet" class="result">
-        <header class="result__head">
-          <div>
-            <div class="result__title">行程方案</div>
-            <div class="result__city">{{ tripStore.planSet.plans[0]?.plan.city }}</div>
-          </div>
-        </header>
-
-        <div class="result__body">
-          <TripResultPanel :plan-set="tripStore.planSet" />
-        </div>
-      </div>
-      <p v-else class="result__none">暂无行程方案</p>
-    </el-drawer>
   </div>
 </template>
 
@@ -378,41 +325,5 @@ onMounted(async () => {
   min-width: 0;
   display: flex;
   flex-direction: column;
-}
-/* 结果抽屉内部排版 */
-.result {
-  display: flex;
-  flex-direction: column;
-  height: 100%;
-}
-.result__head {
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  padding: 4px 0 12px;
-  border-bottom: 1px solid var(--border);
-  margin-bottom: 12px;
-}
-.result__title {
-  font-size: 16px;
-  font-weight: 700;
-}
-.result__city {
-  font-size: 13px;
-  color: var(--text-secondary);
-  margin-top: 4px;
-}
-.result__actions {
-  display: flex;
-  gap: 4px;
-}
-.result__body {
-  flex: 1;
-  overflow: hidden;
-}
-.result__none {
-  color: var(--text-secondary);
-  text-align: center;
-  padding: 40px 0;
 }
 </style>

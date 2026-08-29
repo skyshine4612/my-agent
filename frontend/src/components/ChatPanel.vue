@@ -1,51 +1,37 @@
 <script setup lang="ts">
-// ChatPanel.vue —— 对话面板：渲染消息流 + 底部输入框；澄清提问渲染为可点击的追问气泡
+// ChatPanel.vue —— 通用对话面板：渲染 markdown 消息流 + 工具气泡 + 底部输入框
 import { ref } from 'vue'
 import { Promotion } from '@element-plus/icons-vue'
-import type { ChatMessage, TripPlanSet } from '@/types'
+import { marked } from 'marked'
+import DOMPurify from 'dompurify'
+import type { ChatMessage } from '@/types'
 
-// 父级传入的消息列表与流式状态，向上 emit 发送/打开结果两个动作
+// 父级传入的消息列表与流式状态，向上 emit 发送动作
 // streaming：是否在流式请求中（禁用输入）；thinking：是否在等待助手首字（显示呼吸点）
 const props = defineProps<{ messages: ChatMessage[]; streaming: boolean; thinking: boolean }>()
-const emit = defineEmits<{
-  send: [text: string]
-  'open-result': [planSet: TripPlanSet]
-}>()
+const emit = defineEmits<{ send: [text: string] }>()
 
 // 输入框草稿
 const draft = ref('')
-// 输入框实例引用：点击澄清问题后聚焦输入框，引导用户补充答案
-const inputRef = ref<any>(null)
-// 输入框占位提示：点击澄清问题后切换为「补充答案」引导
-const placeholder = ref('描述你的安排，回车发送…')
 
-// 提交输入框内容：非空则发出 send，并清空草稿、复位占位提示
+// 提交输入框内容：非空则发出 send，并清空草稿
 function submit() {
   const t = draft.value.trim()
   if (!t) return
   emit('send', t)
   draft.value = ''
-  placeholder.value = '描述你的安排，回车发送…'
 }
 
-// 澄清追问：点击问题 → 预填进输入框并聚焦，让用户补充自己的答案后再作为 user 消息发送
-// （绝不把提问原文直接回传后端）
-function answer(q: string) {
-  draft.value = q
-  placeholder.value = '请在上方补充你的答案…'
-  inputRef.value?.focus()
+// 把 markdown 文本渲染为安全的 HTML：先 marked 转 HTML，再 DOMPurify 清洗防 XSS
+function renderMarkdown(text: string): string {
+  const raw = marked.parse(text, { async: false }) as string
+  return DOMPurify.sanitize(raw)
 }
 
-// 结果气泡上的「查看方案」：把该结果打开到右侧抽屉
-function openResult(m: ChatMessage) {
-  if (m.planSet) emit('open-result', m.planSet)
-}
-
-// 结果摘要文案：城市 + 方案数
-function planSummary(planSet: TripPlanSet): string {
-  const n = planSet.plans?.length ?? 0
-  const city = planSet.plans[0]?.plan.city ?? ''
-  return `已生成「${city}」${n} 套方案`
+// 工具参数在摘要行里的紧凑展示：超长截断，完整参数放进气泡展开区
+function formatArgs(args: Record<string, any>): string {
+  const s = JSON.stringify(args)
+  return s.length > 60 ? `${s.slice(0, 60)}…` : s
 }
 </script>
 
@@ -56,10 +42,8 @@ function planSummary(planSet: TripPlanSet): string {
       <div class="chat-panel__inner">
         <!-- 空态：尚未开始对话 -->
         <div v-if="!props.messages.length" class="chat-panel__empty">
-          <p class="chat-panel__empty-title">今天想安排点什么？</p>
-          <p class="chat-panel__empty-sub">
-            例如：3000 元成都 4 天，或「带爸妈去杭州玩 3 天，预算 2000」
-          </p>
+          <p class="chat-panel__empty-title">今天想聊点什么？</p>
+          <p class="chat-panel__empty-sub">输入你的问题，回车发送，助手会流式回复并展示工具调用过程</p>
         </div>
 
         <template v-for="m in props.messages" :key="m.id">
@@ -68,46 +52,28 @@ function planSummary(planSet: TripPlanSet): string {
             <div class="msg__bubble msg__bubble--user">{{ m.content }}</div>
           </div>
 
-          <!-- 助手澄清提问：追问气泡，问题可点击回答 -->
-          <div v-else-if="m.kind === 'clarify'" class="msg msg--assistant">
-            <div class="msg__label">助手</div>
-            <div class="msg__clarify">
-              <p class="msg__clarify-text">想帮你安排得更妥帖，还需要确认几点：</p>
-              <div class="msg__questions">
-                <button
-                  v-for="(q, i) in m.questions ?? []"
-                  :key="i"
-                  class="msg__question"
-                  @click="answer(q)"
-                >
-                  {{ q }}
-                </button>
-              </div>
-            </div>
-          </div>
-
-          <!-- 助手结果摘要：简洁一行 + 查看按钮，不抢占对话流 -->
-          <div v-else-if="m.kind === 'result' && m.planSet" class="msg msg--assistant">
-            <div class="msg__label">助手</div>
-            <div class="msg__result">
-              <span class="msg__result-text">{{ planSummary(m.planSet) }}</span>
-              <el-button size="small" round text type="primary" @click="openResult(m)">
-                查看方案
-              </el-button>
-            </div>
-          </div>
-
-          <!-- 助手纯文本回复 -->
+          <!-- 助手消息：markdown 正文 + 工具气泡 -->
           <div v-else class="msg msg--assistant">
             <div class="msg__label">助手</div>
-            <div class="msg__text">{{ m.content }}</div>
+            <!-- markdown 正文（token 流式累积） -->
+            <div v-if="m.content" class="msg__markdown" v-html="renderMarkdown(m.content)"></div>
+            <!-- 工具气泡：tool_call 显示「调用 工具名(参数)」，tool_result 回填摘要；可折叠、持久化 -->
+            <details v-for="(t, i) in m.tools ?? []" :key="i" class="tool">
+              <summary class="tool__head">
+                <span class="tool__status" :class="t.summary ? 'tool__status--done' : 'tool__status--run'"></span>
+                <span class="tool__name">调用 {{ t.tool }}</span>
+                <span v-if="t.args && Object.keys(t.args).length" class="tool__args">{{ formatArgs(t.args) }}</span>
+              </summary>
+              <div class="tool__body">
+                <pre v-if="t.args && Object.keys(t.args).length" class="tool__params">{{ JSON.stringify(t.args, null, 2) }}</pre>
+                <div v-if="t.summary" class="tool__summary">{{ t.summary }}</div>
+                <div v-else class="tool__running">执行中…</div>
+              </div>
+            </details>
           </div>
         </template>
 
-        <!-- 编排进度面板（父级通过插槽注入，跟随消息流滚动） -->
-        <slot name="progress" />
-
-        <!-- 流式等待中的轻量提示 -->
+        <!-- 流式等待中的轻量提示（呼吸点） -->
         <div v-if="props.thinking" class="msg msg--assistant">
           <div class="msg__label">助手</div>
           <div class="msg__typing"><span></span><span></span><span></span></div>
@@ -118,11 +84,10 @@ function planSummary(planSet: TripPlanSet): string {
     <!-- 底部输入框 -->
     <div class="chat-panel__input">
       <el-input
-        ref="inputRef"
         v-model="draft"
         type="textarea"
         :autosize="{ minRows: 1, maxRows: 4 }"
-        :placeholder="placeholder"
+        placeholder="描述你的问题，回车发送…"
         :disabled="props.streaming"
         @keydown.enter.exact.prevent="submit"
       />
@@ -198,56 +163,158 @@ function planSummary(planSet: TripPlanSet): string {
   font-weight: 600;
   margin-bottom: 6px;
 }
-.msg__text {
+/* markdown 正文：注入的 HTML 用 :deep() 才能命中 scoped 之外的子元素 */
+.msg__markdown {
   max-width: 82%;
   line-height: 1.8;
-  white-space: pre-wrap;
-  word-break: break-word;
   color: var(--text);
+  word-break: break-word;
 }
-.msg__clarify {
-  border: 1px solid var(--border);
-  border-radius: 12px;
-  padding: 14px 16px;
-  background: var(--surface);
-  max-width: 82%;
-}
-.msg__clarify-text {
+.msg__markdown :deep(p) {
   margin: 0 0 12px;
+}
+.msg__markdown :deep(p:last-child) {
+  margin-bottom: 0;
+}
+.msg__markdown :deep(h1),
+.msg__markdown :deep(h2),
+.msg__markdown :deep(h3),
+.msg__markdown :deep(h4) {
+  margin: 16px 0 8px;
+  line-height: 1.4;
+}
+.msg__markdown :deep(h1) {
+  font-size: 20px;
+}
+.msg__markdown :deep(h2) {
+  font-size: 18px;
+}
+.msg__markdown :deep(h3) {
+  font-size: 16px;
+}
+.msg__markdown :deep(h4) {
+  font-size: 15px;
+}
+.msg__markdown :deep(pre) {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px;
+  overflow-x: auto;
+  margin: 12px 0;
+}
+.msg__markdown :deep(code) {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace;
+  font-size: 13px;
+  background: var(--bg);
+  padding: 2px 6px;
+  border-radius: 4px;
+}
+.msg__markdown :deep(pre code) {
+  background: transparent;
+  padding: 0;
+}
+.msg__markdown :deep(ul),
+.msg__markdown :deep(ol) {
+  padding-left: 20px;
+  margin: 8px 0;
+}
+.msg__markdown :deep(li) {
+  margin: 4px 0;
+}
+.msg__markdown :deep(blockquote) {
+  border-left: 3px solid var(--border);
+  margin: 12px 0;
+  padding-left: 12px;
   color: var(--text-secondary);
-  font-size: 14px;
 }
-.msg__questions {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
+.msg__markdown :deep(a) {
+  color: var(--accent);
 }
-.msg__question {
-  text-align: left;
-  padding: 10px 14px;
+.msg__markdown :deep(table) {
+  border-collapse: collapse;
+  margin: 12px 0;
+}
+.msg__markdown :deep(th),
+.msg__markdown :deep(td) {
+  border: 1px solid var(--border);
+  padding: 6px 10px;
+}
+/* 工具气泡：用原生 details/summary 实现折叠，展开状态由 DOM 自身持久化 */
+.tool {
+  max-width: 82%;
+  margin-top: 8px;
   border: 1px solid var(--border);
   border-radius: 10px;
-  background: var(--bg);
-  color: var(--text);
-  cursor: pointer;
-  font-size: 14px;
-  transition: border-color 0.15s, background 0.15s;
+  background: var(--surface);
+  overflow: hidden;
 }
-.msg__question:hover {
-  border-color: var(--accent);
-  background: var(--accent-soft);
-}
-.msg__result {
+.tool__head {
   display: flex;
   align-items: center;
-  gap: 12px;
-  border: 1px solid var(--border);
-  border-radius: 12px;
-  padding: 12px 16px;
-  background: var(--surface);
+  gap: 8px;
+  padding: 8px 12px;
+  cursor: pointer;
+  list-style: none;   /* 去掉 summary 默认三角标记 */
+  user-select: none;
 }
-.msg__result-text {
-  font-size: 15px;
+.tool__head::-webkit-details-marker {
+  display: none;
+}
+.tool__status {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+.tool__status--run {
+  background: var(--accent);
+  animation: blink 1.2s infinite ease-in-out;
+}
+.tool__status--done {
+  background: #16a34a;
+}
+.tool__name {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+  white-space: nowrap;
+}
+.tool__args {
+  font-size: 12px;
+  color: var(--text-secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1;
+  min-width: 0;
+}
+.tool__body {
+  padding: 8px 12px 12px;
+  border-top: 1px dashed var(--border);
+}
+.tool__params {
+  margin: 0 0 8px;
+  font-size: 12px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  color: var(--text-secondary);
+  background: var(--bg);
+  border-radius: 6px;
+  padding: 8px;
+  overflow-x: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.tool__summary {
+  font-size: 13px;
+  color: var(--text);
+  line-height: 1.7;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.tool__running {
+  font-size: 13px;
+  color: var(--text-secondary);
 }
 .msg__typing {
   display: flex;
