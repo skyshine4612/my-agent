@@ -1,0 +1,69 @@
+# tests/test_businesses_travel.py
+# 旅行业务 5 个工具工厂的契约测试（迁移自 test_travel_tools，删除 budget_calc 用例）：
+# 用鸭子类型 FakeDS 假数据源验证工具工厂的注入与调用。
+import pytest
+
+from app.businesses.travel.tools import (
+    make_poi_search, make_weather_query, make_route_plan,
+    make_train_ticket_query, make_flight_query,
+)
+
+
+class FakeDS:
+    """高德数据源假实现：返回固定 POI / 天气 / 路线，验证 amap 三个工具工厂的注入与调用。"""
+    async def search_poi(self, keywords, city, **kw):
+        return [{"name": "宽窄巷子", "location": {"lng": 1, "lat": 1}, "price": 0}]
+
+    async def get_weather(self, city, days):
+        return [{"date": "2026-08-30", "day_weather": "晴"}]
+
+    async def plan_route(self, origin, destination, mode):
+        return {"origin": origin, "destination": destination, "mode": mode}
+
+
+class FakeTrainDS:
+    """12306 假数据源：返回固定票务文本。"""
+    async def search_tickets(self, date, from_city, to_city):
+        return f"{date} {from_city}->{to_city} G101 二等座 553元"
+
+
+class FakeFlightDS:
+    """机票假数据源：返回固定航班文本。"""
+    async def search_flights(self, date, from_city, to_city):
+        return f"{date} {from_city}->{to_city} CA123 经济舱 1200元"
+
+
+@pytest.mark.asyncio
+async def test_poi_search():
+    fn = make_poi_search(FakeDS())
+    pois = await fn(keywords="景点", city="成都")
+    assert pois[0]["name"] == "宽窄巷子"
+
+
+@pytest.mark.asyncio
+async def test_weather_query_default_days():
+    """weather_query 的 days 有默认值：只传 city 不传 days 时不应抛 TypeError。"""
+    fn = make_weather_query(FakeDS())
+    res = await fn(city="成都")
+    assert res[0]["day_weather"] == "晴"
+
+
+@pytest.mark.asyncio
+async def test_route_plan():
+    fn = make_route_plan(FakeDS())
+    r = await fn(origin="成都", destination="重庆", mode="driving")
+    assert r["origin"] == "成都" and r["destination"] == "重庆" and r["mode"] == "driving"
+
+
+@pytest.mark.asyncio
+async def test_train_ticket_query():
+    fn = make_train_ticket_query(FakeTrainDS())
+    r = await fn(date="2026-08-30", from_city="成都", to_city="北京")
+    assert "G101" in r and "553" in r
+
+
+@pytest.mark.asyncio
+async def test_flight_query():
+    fn = make_flight_query(FakeFlightDS())
+    r = await fn(date="2026-08-30", from_city="成都", to_city="北京")
+    assert "CA123" in r and "1200" in r
