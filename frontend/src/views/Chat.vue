@@ -83,16 +83,17 @@ async function send(text: string) {
           assistantOutput.value = true
           break
         case 'tool_result': {
-          // 回填摘要：找最近一条同名且尚未回填的工具事件
-          const msg = ensureAssistant()
-          const list = msg.tools!
+          // 回填摘要：仅在存在未回填的同名工具时回填，找不到可回填项则忽略
+          // （不调用 ensureAssistant，避免无匹配时新建 content/tools 全空的气泡）
+          if (!current) break
+          const list = current.tools!
           for (let i = list.length - 1; i >= 0; i--) {
             if (list[i]!.tool === ev.tool && !list[i]!.summary) {
               list[i]!.summary = ev.summary
+              assistantOutput.value = true
               break
             }
           }
-          assistantOutput.value = true
           break
         }
         case 'done':
@@ -163,7 +164,9 @@ function parseAssistantContent(content: string): { content: string; tools?: Tool
   try {
     const o = JSON.parse(content)
     if (o && typeof o === 'object' && typeof o.content === 'string') {
-      return { content: o.content, tools: Array.isArray(o.tools) ? o.tools : undefined }
+      // 过滤历史脏数据：tools 里可能混入 null / 非对象 / tool 非字符串的条目，
+      // 保留形状合法的元素，避免渲染「调用 undefined」气泡
+      return { content: o.content, tools: Array.isArray(o.tools) ? o.tools.filter((t: any) => t && typeof t.tool === 'string') : undefined }
     }
   } catch {
     /* 非 JSON 文本，忽略 */

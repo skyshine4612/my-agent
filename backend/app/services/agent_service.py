@@ -109,7 +109,7 @@ class AgentService:
         queue: asyncio.Queue = asyncio.Queue()
         tools: list[dict] = []
         hard_results: list[str] = []
-        pending_calls: list[dict] = []   # 待配对的 tool_call（工具并行执行时按名匹配回 result）
+        pending_calls: list[dict] = []   # 待配对的 tool_call（工具并行执行时按 tool_call_id 匹配回 result）
 
         async def emit(event):
             # 把 run_stream 的内部事件原样塞进队列，供下方循环实时转 SSE
@@ -123,7 +123,7 @@ class AgentService:
                 await queue.put(None)
 
         async def consume():
-            # 消费队列：把 token/tool_call/tool_result 转成 SSE，忽略 agent_start/agent_think/agent_done；
+            # 消费队列：把 token/tool_call/tool_result 转成 SSE；
             # 同时累积 tools 与 hard_results，供持久化与 critic 使用。
             while True:
                 ev = await queue.get()
@@ -133,21 +133,24 @@ class AgentService:
                 if etype == "token":
                     yield {"type": "token", "content": ev["content"]}
                 elif etype == "tool_call":
-                    pending_calls.append({"tool": ev["tool"], "args": ev["args"]})
+                    # 入队待配对（带 tool_call_id）：后续 tool_result 按 id 回填 summary
+                    pending_calls.append({"tool": ev["tool"], "args": ev["args"], "id": ev["id"]})
                     yield {"type": "tool_call", "tool": ev["tool"], "args": ev["args"]}
                 elif etype == "tool_result":
                     name = ev["tool"]
-                    # 按名匹配最近一次未配对的 tool_call（并行执行时 result 顺序可能不同于 call 顺序）
-                    entry = next((p for p in pending_calls if p["tool"] == name), None)
+                    # 按 tool_call_id 精确配对：并行执行时工具按「完成先后」返回，tool_result 顺序
+                    # 与 tool_call 顺序并不一致；按名或按队列顺序都会在同名工具并发时错配 summary，
+                    # 只有 tool_call_id 是唯一可靠键。
+                    entry = next((p for p in pending_calls if p["id"] == ev["id"]), None)
                     if entry is not None:
                         pending_calls.remove(entry)
                         entry["summary"] = ev["summary"]
+                        entry.pop("id", None)   # id 仅用于配对，持久化 tools 保持 {tool,args,summary} 结构
                         tools.append(entry)
                     if name in HARD_DATA_TOOLS:
                         # 硬数据工具记完整结果（ev["full"]），供 critic 校验回答
                         hard_results.append(ev.get("full", ev["summary"]))
                     yield {"type": "tool_result", "tool": name, "summary": ev["summary"]}
-                # 其余事件类型（agent_start / agent_think / agent_done）不转发给前端
 
         # 第一轮生成
         gen_task = asyncio.create_task(generate(message))
@@ -208,9 +211,10 @@ class AgentService:
                     to_add.append(nf)
             if to_add:
                 await self.ltm.add_facts(user_id, to_add)
-        except Exception:
-            # 提炼失败不影响主对话流程，直接吞掉异常
-            pass
+        except Exception as e:
+            # 提炼失败不影响主对话流程，记录 warning 便于发现数据质量回归
+            # （如 LLM 返回字符串型 importance 触发 max(float, str) 的 TypeError 也会走到这里）
+            logger.warning("[service] 提炼长期记忆失败 user=%s：%s", user_id, e)
 
 
 # 进程级单例：路由层共用同一个 service，避免重复装配/重复创建 LLM 与数据源客户端

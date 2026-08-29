@@ -36,7 +36,7 @@ class Agent:
               但 tool_result 事件额外携带 full（截断前的完整结果），供上层 critic 校验；
             - 组装消息前先用 WorkingMemory 压缩 history（system prompt 与当前 user 指令不参与蒸馏）。
 
-        on_event：可选异步回调，接收流式事件（token / tool_call / tool_result 等）；
+        on_event：可选异步回调，接收流式事件（token / tool_call / tool_result）；
         为 None 时静默（子 Agent 被编排调用时只需最终文本，无需向前端发事件）。
         """
         async def emit(event):
@@ -45,7 +45,6 @@ class Agent:
                 await on_event(event)
 
         logger.info("[Agent:%s] 开始执行（流式），输入：%.60s", self.name, user_message)
-        await emit({"type": "agent_start", "agent": self.name})
         # 1. 压缩历史：只蒸馏 history（历史对话），system prompt（身份/规则）与当前 user 指令保留原样
         history = await WorkingMemory(self.llm).fit(history)
         # 2. 组装消息：system 提示词放最前，其次拼接压缩后的历史，最后追加本轮用户输入
@@ -71,20 +70,24 @@ class Agent:
             # 5.2 无工具调用：模型已给出最终答案，返回累积文本并结束循环
             if not calls:
                 logger.info("[Agent:%s] 完成，返回文本（%d 字）", self.name, len(full_text))
-                await emit({"type": "agent_done", "agent": self.name, "summary": full_text[:120]})
                 return full_text
             # 5.3 有工具调用：把本轮 assistant 回复（含 tool_calls）写入消息，让后续轮次能看见完整上下文
             messages.append({"role": "assistant", "content": round_text, "tool_calls": calls})
             logger.info("[Agent:%s] 第 %d 轮决定调用 %d 个工具", self.name, i + 1, len(calls))
-            await emit({"type": "agent_think", "agent": self.name, "round": i + 1, "tool_count": len(calls)})
 
             # 5.4 并行执行本轮所有无依赖工具调用；gather 保持与 calls 相同的返回顺序
             async def run_tool(tc):
+                """执行单个工具调用，上报 tool_call / tool_result 事件并返回回填项。
+
+                tool_call 与 tool_result 事件都携带 tc["id"]（工具调用唯一 id），供上层精确配对。
+                并行执行时工具按「完成先后」返回，tool_result 顺序与 tool_call 顺序并不一致，
+                故配对必须依赖 id 而非工具名或队列顺序，否则同名工具并发会错配 summary。
+                """
                 fn = tc["function"]
                 # 解析工具入参（JSON 字符串 → dict），入参缺失时兜底为空对象
                 args = json.loads(fn["arguments"] or "{}")
                 logger.info("[Agent:%s] 调工具 %s，参数 %s", self.name, fn["name"], json.dumps(args, ensure_ascii=False))
-                await emit({"type": "tool_call", "agent": self.name, "tool": fn["name"], "args": args})
+                await emit({"type": "tool_call", "agent": self.name, "tool": fn["name"], "args": args, "id": tc["id"]})
                 # 通过 registry 真正执行工具，拿到观察结果
                 out = await registry.call(fn["name"], args)
                 # full 保留截断前的完整结果，供上层的 critic 回路校验回答是否与工具结果矛盾
@@ -95,7 +98,7 @@ class Agent:
                     text = text[:4000] + "[已截断]"
                 logger.info("[Agent:%s] 工具 %s 返回 %.120s", self.name, fn["name"], text)
                 await emit({"type": "tool_result", "agent": self.name, "tool": fn["name"],
-                            "summary": text[:120], "full": full})
+                            "summary": text[:120], "full": full, "id": tc["id"]})
                 # 返回带 tool_call_id 的回填项，供上层按原始顺序组装 tool 消息
                 return {"tool_call_id": tc["id"], "content": text}
 

@@ -69,6 +69,14 @@ class OpenAICompatLLM(LLMClient):
         return r["content"]
 
     async def stream_chat(self, messages, tools=None):
+        """以流式方式发起对话，逐事件产出文本增量与收尾工具调用。
+
+        产出事件：
+            {"type": "content", "text": <增量文本>}          —— 文本 delta，可即时推给前端
+            {"type": "end", "tool_calls": [...] | None}      —— 收尾信号，按 index 合并后的工具调用
+        工具调用分片按 index 归并 id/name/arguments（arguments 跨分片累积拼接），
+        最后按 index 升序组装成与 chat() 同形状的 tool_calls（无工具调用时为 None）。
+        """
         # 组装请求参数，stream=True 开启 SSE 流式返回
         kw = {"model": self.model, "messages": messages, "stream": True}
         if tools:
@@ -122,7 +130,7 @@ class FallbackLLM(LLMClient):
         return ""
 
     async def stream_chat(self, messages, tools=None):
-        # 无凭证时不做真实调用：不产出任何内容，直接发出 end 收尾事件
+        """无凭证时不做真实调用：不产出任何内容，直接发出 end 收尾事件。"""
         yield {"type": "end", "tool_calls": None}
 
 
