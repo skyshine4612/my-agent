@@ -45,14 +45,16 @@ async def test_run_critic_ok_false():
 
 
 class ScriptedStreamLLM:
-    """按脚本产出 stream_chat 事件（每轮生成吐一个 turn），并记录 chat（critic）调用。"""
+    """按脚本产出 stream_chat 事件（每轮生成吐一个 turn），并记录 chat（critic）调用与每轮 messages。"""
     def __init__(self, stream_turns, critic_response='{"ok":true,"issues":[]}'):
         self.stream_turns = list(stream_turns)
         self.i = 0
         self.chat_calls = []
+        self.stream_messages = []   # 记录每次 stream_chat 收到的 messages，供断言修正轮上下文
         self.critic_response = critic_response
 
     async def stream_chat(self, messages, tools=None):
+        self.stream_messages.append(messages)
         turn = self.stream_turns[self.i]
         self.i += 1
         for e in turn:
@@ -120,7 +122,11 @@ async def test_critic_skips_without_hard_data(tmp_path, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_critic_corrects_answer_when_rejected(tmp_path, monkeypatch):
-    """ok=false 分支：critic 拒绝后追加修正指令再生成一轮，落库修正后的回答。"""
+    """ok=false 分支：critic 拒绝后追加修正指令再生成一轮，落库修正后的回答。
+
+    同时断言修正轮收到的 user_message 携带完整上下文（原始问题 + 上一轮回答 + issues），
+    否则 LLM 看不到原始诉求与自己的旧回答，只能凭 claim 猜「重新输出」什么。
+    """
     llm = ScriptedStreamLLM([
         # 第一轮生成：调 weather_query 后给出含编造票价的回答
         [{"type": "end", "tool_calls": [{"id": "1", "function": {"name": "weather_query", "arguments": '{"city":"成都"}'}}]}],
@@ -135,3 +141,9 @@ async def test_critic_corrects_answer_when_rejected(tmp_path, monkeypatch):
     saved = json.loads(history[-1]["content"])
     assert saved["content"] == "成都明天晴"   # 修正后的回答被落库
     assert len(llm.chat_calls) == 1
+    # 缺陷 1 覆盖：修正轮（最后一次 stream_chat）的 user_message 需包含原始问题与上一轮回答
+    correction_messages = llm.stream_messages[-1]
+    last_user = [m for m in correction_messages if m["role"] == "user"][-1]
+    assert "原始问题：成都天气" in last_user["content"]
+    assert "你之前的回答：成都明天晴，机票100元" in last_user["content"]
+    assert "请修正以下问题后重新输出" in last_user["content"]

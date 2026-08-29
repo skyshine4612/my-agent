@@ -37,19 +37,25 @@ class AgentService:
         # 会话 + 长期记忆，共享同一 SQLite（路径可配置，容器内挂载 ./data）
         self.conv = ConversationStore(settings.db_path)
         self.ltm = LongTermMemory(settings.db_path)
-        # LLM 客户端 + 真实高德数据源（火车/机票数据源由旅行业务在注册工具时内联创建）
+        # LLM 客户端 + 真实高德数据源
         self.llm = get_llm()
         self.ds = AmapMcpDataSource()
+        # 业务名 → Business 映射：call_sub_agent 的委派目标与 enum 都从这里取
+        self.businesses_map = {b.name: b for b in BUSINESSES}
+        # 一次性装配扁平 ToolRegistry（含各业务工具 + call_sub_agent）并缓存到 self。
+        # 关键：Train/Flight MCP 数据源在各业务 register_tools 里内联 new，其 __init__ 会创建
+        # httpx 客户端（mcp_base）且从不 close；若每请求重建，高频 SSE 下连接持续泄漏。
+        # 这里启动时 build 一次，chat_stream 直接复用，数据源只在启动时 new 一次。
+        self.registry = self._build_registry()
 
     def _build_registry(self) -> ToolRegistry:
-        """装配扁平 ToolRegistry：各业务工具 + call_sub_agent（供顶层 agent 一次性绑定）。"""
+        """装配扁平 ToolRegistry：各业务工具 + call_sub_agent（只在 __init__ 调用一次，结果缓存到 self.registry）。"""
         registry = ToolRegistry()
-        businesses_map = {b.name: b for b in BUSINESSES}
         # 遍历已注册业务，把各业务工具注入同一个扁平注册表
         for b in BUSINESSES:
             b.register_tools(registry, self.ds)
         # call_sub_agent：把复杂任务委派给对应业务的子 agent，description/parameters 取自工具对象
-        call_sub_agent = make_call_sub_agent(businesses_map, self.llm, registry)
+        call_sub_agent = make_call_sub_agent(self.businesses_map, self.llm, registry)
         registry.register("call_sub_agent", call_sub_agent.description, call_sub_agent.parameters, call_sub_agent)
         return registry
 
@@ -89,8 +95,8 @@ class AgentService:
         # 末尾一条是本轮刚落库的用户消息，run_stream 会再追加一次，这里剔除避免重复
         if history and history[-1]["role"] == "user":
             history = history[:-1]
-        # 5. 装配工具 + 顶层 agent
-        registry = self._build_registry()
+        # 5. 顶层 agent：复用 __init__ 缓存的 registry（不在每请求重建，避免泄漏 MCP 数据源）
+        registry = self.registry
         tool_grounding = load_prompt("grounding")
         business_directory = "\n".join(f"- {b.name}：{b.description}" for b in BUSINESSES)
         system = render_system_prompt(business_directory, tool_grounding)
@@ -153,9 +159,11 @@ class AgentService:
         if hard_results:
             verdict = await run_critic(self.llm, json.dumps(hard_results, ensure_ascii=False), answer)
             if not verdict.get("ok", True):
-                # ok=false：把 issues 作为修正指令再生成一轮（不递归），用修正后的新回答
+                # ok=false：把原始问题 + 上一轮回答 A + issues 一起作为修正指令再生成一轮（不递归），
+                # 修正轮才有完整上下文（否则 LLM 看不到原始诉求与自己的旧回答，只能凭 claim 猜）
                 issues = verdict.get("issues", [])
-                correction = "请修正以下问题后重新输出：\n" + json.dumps(issues, ensure_ascii=False)
+                correction = (f"原始问题：{message}\n你之前的回答：{answer}\n"
+                              f"请修正以下问题后重新输出：\n{json.dumps(issues, ensure_ascii=False)}")
                 gen_task = asyncio.create_task(generate(correction))
                 async for sse in consume():
                     yield sse
