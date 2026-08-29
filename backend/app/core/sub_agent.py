@@ -44,7 +44,10 @@ def make_call_sub_agent(businesses: dict, llm, registry):
         # 这样即使子 Agent 抛异常，计数也能精确还原，不污染同 Task 后续其他调用。
         _sub_call_depth.set(depth + 1)
         try:
-            business = businesses[subagent_type]
+            # 用 get 而非 [] 取值：LLM 可能给出不在 enum 内的 subagent_type，未命中时优雅返回而非抛 KeyError
+            business = businesses.get(subagent_type)
+            if business is None:
+                return {"answer": "未知业务类型"}
             sub = business.build_sub_agent(llm)
             # 隔离上下文：只传子 system(rules)+user(task)，历史为空；
             # on_event=None 表示子 Agent 内部工具调用不上报（前端只显示 call_sub_agent 一个气泡）。

@@ -235,30 +235,6 @@ class AmapMcpDataSource(DataSource):
             self._exit_stack = None
             self._session = None
 
-    async def resolve_poi(self, name, city):
-        """按 POI 名称精确查真实坐标 + 图片 URL（供后处理补行程的经纬度与图片）。
-
-        规划 Agent 生成行程时 location/photo 都是 LLM 按文本中转编造或留空的，这里用名称
-        重走 text_search + search_detail 拿真实坐标与图片；查不到时返回 None。
-        """
-        try:
-            result = await self._call_tool("maps_text_search", {"keywords": name, "city": city})
-            pois = parse_poi_list(self._extract_payload(result))
-            if not pois or not pois[0].get("id"):
-                return None
-            detail = await self._call_tool("maps_search_detail", {"id": pois[0]["id"]})
-            payload = self._extract_payload(detail)
-            if not isinstance(payload, dict):
-                return None
-            loc = payload.get("location")
-            photo = _extract_photo(payload)
-            return {
-                "location": _coerce_location(loc) if loc else None,
-                "photo": photo,
-            }
-        except Exception:
-            return None
-
     @staticmethod
     def _extract_payload(result):
         """从 CallToolResult 中取出结构化 payload（优先 structured_content，兜底解析文本块）。"""
@@ -275,31 +251,12 @@ class AmapMcpDataSource(DataSource):
     async def search_poi(self, keywords, city, **kw):
         """地点关键字搜索：调 maps_text_search，返回 POI 列表（契约结构）。
 
-        因 maps_text_search 返回的 POI 不含经纬度（高德 API 本身的行为），这里对
-        返回的 POI 并行调 maps_search_detail（按 id）补 location 坐标，供前端地图画
-        marker；补充失败的 POI 坐标兜底为 0。
+        简化：不再逐个 POI 补 maps_search_detail 的坐标（额外的 N+1 调用拖慢且易失败），
+        直接返回 parse_poi_list 的解析结果；maps_text_search 本身不含经纬度，location 兜底为 0。
         """
         args = {"keywords": keywords, "city": city, **kw}
         result = await self._call_tool(resolve_tool_name("search_poi"), args)
-        pois = parse_poi_list(self._extract_payload(result))
-        return await self._enrich_locations(pois[:10])   # 限制前 10 个，避免过多额外调用
-
-    async def _enrich_locations(self, pois):
-        """对 POI 列表并行调 maps_search_detail 补经纬度坐标。"""
-        async def enrich(p):
-            pid = p.get("id")
-            if not pid:
-                return p
-            try:
-                detail = await self._call_tool("maps_search_detail", {"id": pid})
-                payload = self._extract_payload(detail)
-                loc = payload.get("location") if isinstance(payload, dict) else None
-                if loc:
-                    p["location"] = _coerce_location(loc)
-            except Exception:
-                pass   # 补失败则保留兜底坐标 0，不影响主流程
-            return p
-        return await asyncio.gather(*(enrich(p) for p in pois))
+        return parse_poi_list(self._extract_payload(result))
 
     async def get_weather(self, city, days):
         """天气查询：调 maps_weather，返回每日天气列表（契约结构）。"""

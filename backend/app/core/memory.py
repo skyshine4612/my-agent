@@ -1,6 +1,6 @@
 # app/core/memory.py
-# 三层记忆 + 会话存储模块：基于标准库 sqlite3 实现持久化，
-# 提供 ConversationStore（会话历史）、TaskMemory（长任务状态）、LongTermMemory（长期 facts）。
+# 记忆 + 会话存储模块：基于标准库 sqlite3 实现持久化，
+# 提供 ConversationStore（会话历史）、LongTermMemory（长期 facts）。
 # 所有阻塞的数据库操作通过 asyncio.to_thread 丢到线程池执行，避免阻塞事件循环。
 import sqlite3
 import uuid
@@ -9,7 +9,7 @@ from datetime import datetime
 
 
 class _Base:
-    """建表基类：三个存储类共享同一套 SQLite 建表逻辑（共 5 张表），并统一持有数据库路径。"""
+    """建表基类：两个存储类共享同一套 SQLite 建表逻辑（共 3 张表），并统一持有数据库路径。"""
 
     def __init__(self, db_path):
         # 保存数据库路径，并立即初始化建表（表已存在时跳过）
@@ -23,13 +23,11 @@ class _Base:
         return c
 
     def _init(self):
-        # 用 executescript 一次性建好全部 5 张表（IF NOT EXISTS 保证幂等）
+        # 用 executescript 一次性建好全部 3 张表（IF NOT EXISTS 保证幂等）
         with self._conn() as c:
             c.executescript("""
             CREATE TABLE IF NOT EXISTS conversations(id TEXT PRIMARY KEY, user_id TEXT, title TEXT, created_at TEXT);
             CREATE TABLE IF NOT EXISTS messages(id INTEGER PRIMARY KEY AUTOINCREMENT, conv_id TEXT, role TEXT, content TEXT, created_at TEXT);
-            CREATE TABLE IF NOT EXISTS task_runs(id TEXT PRIMARY KEY, conversation_id TEXT, plan_json TEXT, status TEXT, created_at TEXT);
-            CREATE TABLE IF NOT EXISTS subtask_results(id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT, subtask_id TEXT, agent TEXT, input TEXT, output TEXT);
             CREATE TABLE IF NOT EXISTS facts(id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT, fact TEXT, importance REAL, created_at TEXT);
             """)
 
@@ -73,7 +71,7 @@ class ConversationStore(_Base):
     async def belongs_to(self, user_id, conv_id):
         """校验指定会话是否归属该用户，返回 bool。
 
-        与 get_history 的读路径校验同源，供写路径（如 plan_stream 落库前）做归属校验：
+        与 get_history 的读路径校验同源，供写路径（如 chat_stream 落库前）做归属校验：
         客户端传入的 conv_id 若不属于当前 user_id，写路径应拒绝写入，防止跨用户注入消息。
         """
         def r():
@@ -107,40 +105,6 @@ class ConversationStore(_Base):
         return await asyncio.to_thread(r)
 
 
-class TaskMemory(_Base):
-    """任务记忆：存储长任务的执行计划（task_runs）与各子任务的中间结果（subtask_results），支持结果传递与基本恢复。"""
-
-    async def create_task(self, conversation_id, plan):
-        """创建一个任务运行记录，保存任务计划（序列化为 JSON），返回任务 id。"""
-        tid = uuid.uuid4().hex
-
-        def r():
-            with self._conn() as c:
-                c.execute("INSERT INTO task_runs VALUES(?,?,?,?,?)",
-                          (tid, conversation_id, __import__("json").dumps(plan, ensure_ascii=False), "running", datetime.now().isoformat()))
-
-        await asyncio.to_thread(r)
-        return tid
-
-    async def save_subtask_result(self, task_id, subtask_id, agent, input_, output):
-        """保存某子任务的执行结果（记录执行 agent、输入与输出）。"""
-        def r():
-            with self._conn() as c:
-                c.execute("INSERT INTO subtask_results(task_id,subtask_id,agent,input,output) VALUES(?,?,?,?,?)",
-                          (task_id, subtask_id, agent, input_, output))
-
-        await asyncio.to_thread(r)
-
-    async def get_results(self, task_id):
-        """返回某任务所有子任务的输出，映射为 {subtask_id: output}，用于结果传递。"""
-        def r():
-            with self._conn() as c:
-                rows = c.execute("SELECT subtask_id,output FROM subtask_results WHERE task_id=?", (task_id,)).fetchall()
-            return {x["subtask_id"]: x["output"] for x in rows}
-
-        return await asyncio.to_thread(r)
-
-
 class LongTermMemory(_Base):
     """长期记忆：存储从对话中提炼出的偏好/事实（facts），超过容量上限时按 importance 淘汰。"""
 
@@ -170,3 +134,26 @@ class LongTermMemory(_Base):
                 return [dict(x) for x in c.execute("SELECT fact,importance FROM facts WHERE user_id=? ORDER BY importance DESC", (user_id,))]
 
         return await asyncio.to_thread(r)
+
+    async def recall(self, user_id, top_n=20):
+        """按 importance 降序取前 top_n 条事实，返回 [{"fact","importance"}]。
+
+        与 get_all 的区别：recall 有数量上限（供组装 LTM 提示，避免提示词被历史偏好撑爆）；
+        无硬阈值，importance 仅用于 add_facts 内的容量淘汰与这里的排序。
+        """
+        def r():
+            with self._conn() as c:
+                return [dict(x) for x in c.execute(
+                    "SELECT fact,importance FROM facts WHERE user_id=? ORDER BY importance DESC LIMIT ?",
+                    (user_id, top_n))]
+
+        return await asyncio.to_thread(r)
+
+    async def update_importance(self, user_id, fact, importance):
+        """更新某条已存在事实的 importance（语义去重时提升其权重而非新增重复条目）。"""
+        def r():
+            with self._conn() as c:
+                c.execute("UPDATE facts SET importance=? WHERE user_id=? AND fact=?",
+                          (importance, user_id, fact))
+
+        await asyncio.to_thread(r)

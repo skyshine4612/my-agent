@@ -4,7 +4,7 @@
 from fastapi import APIRouter, Header
 
 from app.models.schemas import ConversationCreate
-from app.services.trip_service import service
+from app.services.agent_service import service
 
 router = APIRouter()
 

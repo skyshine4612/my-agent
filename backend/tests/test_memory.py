@@ -1,7 +1,7 @@
 # tests/test_memory.py
-# 三层记忆 + 会话存储的契约测试：使用 tmp_path 临时 SQLite，验证会话、任务、长期记忆三层及用户隔离
+# 记忆 + 会话存储的契约测试：使用 tmp_path 临时 SQLite，验证会话、长期记忆两层及用户隔离
 import pytest
-from app.core.memory import ConversationStore, TaskMemory, LongTermMemory
+from app.core.memory import ConversationStore, LongTermMemory
 
 
 @pytest.mark.asyncio
@@ -19,13 +19,15 @@ async def test_conversation_roundtrip(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_task_memory(tmp_path):
-    """验证任务创建与子任务结果保存、读取"""
-    t = TaskMemory(str(tmp_path / "m.db"))
-    tid = await t.create_task("cid1", {"tasks": [{"id": "T1"}]})
-    await t.save_subtask_result(tid, "T1", "天气Agent", "{}", "晴")
-    r = await t.get_results(tid)
-    assert r["T1"] == "晴"
+async def test_long_term_recall(tmp_path):
+    """recall 按 importance 降序取前 top_n 条，且按 user_id 隔离。"""
+    l = LongTermMemory(str(tmp_path / "m.db"), max_facts=10)
+    await l.add_facts("u1", [{"fact": "a", "importance": 0.3},
+                             {"fact": "b", "importance": 0.9},
+                             {"fact": "c", "importance": 0.5}])
+    top = await l.recall("u1", top_n=2)
+    assert [f["fact"] for f in top] == ["b", "c"]
+    assert await l.recall("u2") == []   # 用户隔离
 
 
 @pytest.mark.asyncio

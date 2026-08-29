@@ -38,18 +38,6 @@ class FakeRegistry:
 
 
 @pytest.mark.asyncio
-async def test_react_loop():
-    """验证 ReAct 循环：模型先发起一次工具调用，工具执行后模型给出最终答案。"""
-    llm = ScriptedLLM([
-        {"content": "", "tool_calls": [{"id": "1", "type": "function", "function": {"name": "w", "arguments": "{\"c\":\"成都\"}"}}]},
-        {"content": "成都晴", "tool_calls": None}])
-    reg = FakeRegistry({"w": "晴"})
-    a = Agent(name="t", system_prompt="s", tools=["w"], llm=llm)
-    out = await a.run("查天气", [], reg)
-    assert out == "成都晴" and reg.called == [("w", {"c": "成都"})]
-
-
-@pytest.mark.asyncio
 async def test_working_memory_compression():
     """验证摘要压缩：超长消息列表被蒸馏成少量摘要消息（保留在 system 摘要里），而非简单截断。"""
     llm = ScriptedLLM([])

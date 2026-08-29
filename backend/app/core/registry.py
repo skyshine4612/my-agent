@@ -1,7 +1,6 @@
 # app/core/registry.py
-# 工具注册表（ToolRegistry）与 Agent 注册表（AgentRegistry）：
-# ToolRegistry 统一管理工具元信息，把工具转成 OpenAI function calling schema 供 LLM 决策调用，
-# 并统一执行同步/异步工具函数；AgentRegistry 管理子 Agent，供 Planner 生成能力清单、Orchestrator 按名调度。
+# 工具注册表（ToolRegistry）：统一管理工具元信息，把工具转成 OpenAI function calling schema
+# 供 LLM 决策调用，并统一执行同步/异步工具函数。
 import inspect
 from dataclasses import dataclass
 from typing import Callable
@@ -64,33 +63,3 @@ class ToolRegistry:
             res = await res
         # 统一转成字符串返回，方便 LLM 后续把观察结果回填进对话
         return str(res)
-
-
-class AgentRegistry:
-    """Agent 注册表：管理子 Agent，供 Planner 生成能力清单、Orchestrator 按名调度。
-
-    职责：
-        - register：注册 Agent（名字 → Agent 对象）
-        - get / list_names：按名取回、列出全部 Agent 名
-        - describe：生成能力清单文本，注入 Planner 的 prompt
-    """
-    def __init__(self):
-        # 内部字典：Agent 名 → Agent 对象
-        self._agents = {}
-
-    def register(self, agent):
-        """注册一个 Agent：以 Agent 的 name 字段作为唯一键。"""
-        self._agents[agent.name] = agent
-
-    def get(self, name):
-        """按名字取回 Agent 对象。"""
-        return self._agents[name]
-
-    def list_names(self):
-        """列出当前已注册的所有 Agent 名。"""
-        return list(self._agents.keys())
-
-    def describe(self):
-        """生成能力清单文本（name: system_prompt），供 Planner 的 prompt 注入。"""
-        # 每个 Agent 生成一行「- 名称: system_prompt」，用换行拼接成清单文本
-        return "\n".join(f"- {a.name}: {a.system_prompt}" for a in self._agents.values())

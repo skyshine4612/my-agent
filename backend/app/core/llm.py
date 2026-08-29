@@ -87,8 +87,10 @@ class OpenAICompatLLM(LLMClient):
             for tc in (delta.tool_calls or []):
                 idx = tc.index
                 if idx not in acc:
-                    # 首个分片初始化结构；arguments 会跨多个分片累积拼接
-                    acc[idx] = {"id": "", "function": {"name": "", "arguments": ""}}
+                    # 首个分片初始化结构；arguments 会跨多个分片累积拼接。
+                    # 补 "type":"function" 与 chat() 里 model_dump 的形状对齐，
+                    # 避免回传 API 时被严格端点因缺字段拒收。
+                    acc[idx] = {"id": "", "type": "function", "function": {"name": "", "arguments": ""}}
                 entry = acc[idx]
                 # id 通常在首个分片出现一次，后续分片为空，仅在非空时覆盖
                 if tc.id:

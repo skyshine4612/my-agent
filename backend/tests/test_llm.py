@@ -94,8 +94,8 @@ async def test_stream_chat_merges_tool_calls_by_index():
     content = "".join(e["text"] for e in events if e["type"] == "content")
     end = [e for e in events if e["type"] == "end"][0]
     assert content == "开始"
-    # 两个工具调用，按 index 升序排列，形状为 [{"id","function":{"name","arguments"}}]
+    # 两个工具调用，按 index 升序排列，形状与 chat() 的 model_dump 一致（含 "type":"function"）
     assert end["tool_calls"] == [
-        {"id": "call_0", "function": {"name": "weather", "arguments": '{"city":"成都"}'}},
-        {"id": "call_1", "function": {"name": "route", "arguments": '{"from":"成都"}'}},
+        {"id": "call_0", "type": "function", "function": {"name": "weather", "arguments": '{"city":"成都"}'}},
+        {"id": "call_1", "type": "function", "function": {"name": "route", "arguments": '{"from":"成都"}'}},
     ]
