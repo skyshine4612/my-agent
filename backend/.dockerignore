@@ -1,0 +1,24 @@
+# Python 虚拟环境（构建时无需复制本机 .venv）
+.venv/
+venv/
+
+# Python 字节码缓存
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# SQLite 数据库（数据由挂载卷 /app/data 持久化，不打包进镜像）
+*.db
+*.db-journal
+
+# 环境变量（含真实 key，绝不打进镜像）
+.env
+
+# 测试与缓存
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# IDE
+.idea/
+.vscode/

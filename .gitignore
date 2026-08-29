@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Node
+node_modules/
+dist/
+
+# 环境变量（含真实 key，绝不提交）
+.env
+.env.local
+
+# SQLite 数据库
+*.db
+*.db-journal
+
+# 测试与缓存
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# IDE
+.idea/
+.vscode/
+
+# superpowers 工作区
+.superpowers/

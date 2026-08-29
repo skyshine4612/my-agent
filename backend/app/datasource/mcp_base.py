@@ -1,0 +1,73 @@
+# datasource/mcp_base.py
+"""MCP 数据源基类：封装 ModelScope 托管 MCP（streamable HTTP）的连接管理。
+
+把「懒加载持久 session + 统一工具调用 + 关闭清理」抽成基类，供高德/12306/机票等
+多个 MCP 数据源复用；子类只需实现具体的查询方法，连接管理由基类统一处理。
+"""
+import asyncio
+import json
+import logging
+from contextlib import AsyncExitStack
+
+from mcp import ClientSession
+from mcp.client.streamable_http import streamable_http_client, create_mcp_http_client
+
+logger = logging.getLogger(__name__)
+
+
+class McpDataSource:
+    """MCP 数据源基类：懒加载持久 session + 统一工具调用 + 关闭清理。"""
+
+    def __init__(self, url, token):
+        # 连接参数：MCP 服务地址 + ModelScope 令牌（放入 Authorization 请求头）
+        self.url = url
+        self.headers = {"Authorization": f"Bearer {token}"}
+        # streamable HTTP 协议：headers 需通过 http_client 传入
+        self.http_client = create_mcp_http_client(headers=self.headers)
+        # 懒加载的持久 session：首次调用建立连接，后续复用（省去重复握手）
+        self._session = None
+        self._exit_stack = None
+        self._lock = asyncio.Lock()
+
+    async def _ensure_session(self):
+        """懒加载持久 session：首次调用建立连接+initialize，并发安全，失效时重建。"""
+        async with self._lock:
+            if self._session is not None:
+                return self._session
+            self._exit_stack = AsyncExitStack()
+            read, write = await self._exit_stack.enter_async_context(
+                streamable_http_client(self.url, http_client=self.http_client))
+            self._session = await self._exit_stack.enter_async_context(ClientSession(read, write))
+            await self._session.initialize()
+            return self._session
+
+    async def _call_tool(self, tool_name, arguments):
+        """调用 MCP 工具，返回 CallToolResult。连接失效时清理缓存、下次重建。"""
+        session = await self._ensure_session()
+        try:
+            return await session.call_tool(tool_name, arguments)
+        except Exception:
+            if self._exit_stack is not None:
+                await self._exit_stack.aclose()
+                self._exit_stack = None
+                self._session = None
+            raise
+
+    @staticmethod
+    def _extract_text(result) -> str:
+        """从 CallToolResult 提取文本内容（优先 structured_content，兜底拼 content 文本块）。"""
+        sc = getattr(result, "structured_content", None)
+        if sc is not None:
+            return sc if isinstance(sc, str) else json.dumps(sc, ensure_ascii=False)
+        text = "".join(getattr(b, "text", "") for b in getattr(result, "content", []))
+        return text
+
+    async def close(self):
+        """关闭持久 session（进程退出前调用；anyio 跨 task 退出会报错，静默吞掉）。"""
+        if self._exit_stack is not None:
+            try:
+                await self._exit_stack.aclose()
+            except Exception:
+                pass
+            self._exit_stack = None
+            self._session = None

@@ -1,0 +1,17 @@
+# 依赖与构建产物（均在镜像内重新安装/构建，无需复制本机产物）
+node_modules/
+dist/
+dist-ssr/
+
+# 日志与缓存
+logs
+*.log
+coverage
+*.local
+
+# 编辑器目录
+.vscode/
+.idea/
+
+# TypeScript 构建缓存
+*.tsbuildinfo
