@@ -42,10 +42,14 @@ class McpDataSource:
             return self._session
 
     async def _call_tool(self, tool_name, arguments):
-        """调用 MCP 工具，返回 CallToolResult。连接失效时清理缓存、下次重建。"""
+        """调用 MCP 工具，返回 CallToolResult。连接失效时清理缓存、下次重建。
+
+        加 asyncio.wait_for 超时：ModelScope 限流时连接可能挂起（不返回也不抛异常），
+        超时抛 TimeoutError 由上层（run_stream 的 try/except）兜底，避免整个请求卡死。
+        """
         session = await self._ensure_session()
         try:
-            return await session.call_tool(tool_name, arguments)
+            return await asyncio.wait_for(session.call_tool(tool_name, arguments), timeout=30.0)
         except Exception:
             if self._exit_stack is not None:
                 await self._exit_stack.aclose()

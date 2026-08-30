@@ -30,14 +30,14 @@ class Agent:
         """以流式方式执行一次完整 ReAct 循环，返回最终累积文本答复。
 
         流程：
-            - 通过 llm.stream_chat 逐 token 产出，内容增量即时经 on_event 发为 token 事件；
+            - 通过 llm.stream_chat 逐 token 产出；调工具轮次的 content 是内部思考（thought），不上发前端；
+            - 仅最终答案（不调工具的轮次）经 on_event 发为 token 事件；
             - 同一轮多个 tool_calls 用 asyncio.gather 并行执行，结果按原始顺序回填 tool 消息；
             - 工具结果回填前按 4000 字符截断并追加 [已截断] 标记（提示 LLM 结果不全可重查），
               但 tool_result 事件额外携带 full（截断前的完整结果），供上层 critic 校验；
             - 组装消息前先用 WorkingMemory 压缩 history（system prompt 与当前 user 指令不参与蒸馏）。
 
-        on_event：可选异步回调，接收流式事件（token / tool_call / tool_result）；
-        为 None 时静默（子 Agent 被编排调用时只需最终文本，无需向前端发事件）。
+        on_event：可选异步回调，接收流式事件（token / tool_call / tool_result）；为 None 时静默。
         """
         async def emit(event):
             """向回调上报一个流式事件（无回调则静默跳过）。"""
@@ -52,23 +52,30 @@ class Agent:
         messages.append({"role": "user", "content": user_message})
         # 3. 若本 Agent 声明了工具，则把工具名列表转成 OpenAI 工具 schema，供 LLM 决策是否调用
         tool_schemas = registry.to_openai_schemas(self.tools) if self.tools else None
-        # 4. 累积文本：所有轮次的流出文本（含调工具前思考）都算作回答
+        # 4. 累积文本：只累积最终答案（不调工具轮次的 content）；调工具的思考（thought）是内部推理，
+        # 不计入回答、也不上发前端，避免把 agent 的自言自语当答案展示给用户。
         full_text = ""
         # 5. 进入 ReAct 循环：最多迭代 max_iters 轮，每轮完成一次「思考 → 行动 → 观察」
         for i in range(self.max_iters):
             round_text = ""
             calls = None
-            # 5.1 流式调 LLM：逐事件处理，content 增量即时上发，end 事件携带本轮工具调用
+            status_sent = False
+            # 5.1 流式调 LLM：content 只累积到 round_text，不即时上发——只有确认本轮不再调工具时，
+            # 其内容才是面向用户的最终答案；调工具的轮次 content 是 thought，不上发前端。
             async for event in self.llm.stream_chat(messages, tool_schemas):
                 if event.get("type") == "content":
-                    text = event.get("text", "")
-                    round_text += text
-                    full_text += text
-                    await emit({"type": "token", "content": text})
+                    round_text += event.get("text", "")
+                    # LLM 开始流式产出（思考或答案）时发一次 status，让前端显示「整理中」，覆盖生成期的长静默
+                    if not status_sent:
+                        await emit({"type": "status", "status": "generating"})
+                        status_sent = True
                 elif event.get("type") == "end":
                     calls = event.get("tool_calls")
-            # 5.2 无工具调用：模型已给出最终答案，返回累积文本并结束循环
+            # 5.2 无工具调用：本轮是最终答案，按小块上发（前端逐块渲染，保持流式感）并返回
             if not calls:
+                full_text += round_text
+                for j in range(0, len(round_text), 40):
+                    await emit({"type": "token", "content": round_text[j:j + 40]})
                 logger.info("[Agent:%s] 完成，返回文本（%d 字）", self.name, len(full_text))
                 return full_text
             # 5.3 有工具调用：把本轮 assistant 回复（含 tool_calls）写入消息，让后续轮次能看见完整上下文
@@ -88,8 +95,13 @@ class Agent:
                 args = json.loads(fn["arguments"] or "{}")
                 logger.info("[Agent:%s] 调工具 %s，参数 %s", self.name, fn["name"], json.dumps(args, ensure_ascii=False))
                 await emit({"type": "tool_call", "agent": self.name, "tool": fn["name"], "args": args, "id": tc["id"]})
-                # 通过 registry 真正执行工具，拿到观察结果
-                out = await registry.call(fn["name"], args)
+                # 通过 registry 真正执行工具，拿到观察结果；失败时把错误回传给 LLM 而非让整个 run_stream 崩溃
+                # （MCP 限流/网络抖动会导致工具抛异常，若不上抛会直接中断 SSE 流）
+                try:
+                    out = await registry.call(fn["name"], args)
+                except Exception as e:
+                    logger.warning("[Agent:%s] 工具 %s 执行失败：%s", self.name, fn["name"], e)
+                    out = f"工具执行失败：{e}"
                 # full 保留截断前的完整结果，供上层的 critic 回路校验回答是否与工具结果矛盾
                 full = str(out)
                 # 结果按 4000 字符截断 + [已截断] 标记：提示 LLM 结果不全、可带更精确入参重查（ReAct 自愈）

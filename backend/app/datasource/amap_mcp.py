@@ -1,6 +1,6 @@
 # app/datasource/amap_mcp.py
 # 高德地图数据源实现：通过 mcp SDK 连接 ModelScope 托管的高德 MCP 服务（streamable HTTP），
-# 把 DataSource 契约方法（search_poi/get_weather/plan_route/geocode）映射到高德 MCP 工具，
+# 把 DataSource 契约方法（search_poi/get_weather）映射到高德 MCP 工具，
 # 并将返回结果统一解析成 DataSource 契约结构。
 import asyncio
 import json
@@ -21,30 +21,14 @@ logger = logging.getLogger(__name__)
 AMAP_TOOL_MAP = {
     "search_poi": "maps_text_search",   # 地点关键字搜索
     "get_weather": "maps_weather",       # 天气查询
-    "geocode": "maps_geo",               # 地理编码（地址 → 经纬度）
-}
-
-# plan_route 按出行方式映射到不同的高德路径规划工具
-ROUTE_TOOL_MAP = {
-    "walking": "maps_direction_walking",            # 步行
-    "driving": "maps_direction_driving",            # 驾车
-    "transit": "maps_direction_transit_integrated",  # 公交/地铁综合
 }
 
 
-def route_tool_for_mode(mode):
-    """按出行方式返回对应的高德路径规划工具名；未识别的方式兜底为驾车。"""
-    return ROUTE_TOOL_MAP.get(mode, ROUTE_TOOL_MAP["driving"])
-
-
-def resolve_tool_name(action, mode=None):
+def resolve_tool_name(action):
     """把 DataSource 契约方法名解析成高德 MCP 实际工具名。
 
-    action: search_poi / get_weather / plan_route / geocode
-    mode:   仅 plan_route 需要，取值 walking / driving / transit
+    action: search_poi / get_weather
     """
-    if action == "plan_route":
-        return route_tool_for_mode(mode)
     return AMAP_TOOL_MAP[action]
 
 
@@ -123,46 +107,21 @@ def _coerce_int(value, default=0):
 def parse_weather(payload):
     """把 maps_weather 的返回解析成每日天气列表（契约：date/day_weather/day_temp/night_temp）。
 
-    高德 maps_weather 的预报数据在 forecasts[].casts[] 中，每条 cast 除白天天气外还带
-    daytemp/nighttemp 温度字段。此前解析只返回 date/day_weather，导致前端 WeatherPanel
-    渲染 w.day_temp / w.night_temp 永远为 undefined，这里补出温度字段；温度缺失时兜底 0。
+    高德 maps_weather 的预报数据在 forecasts 数组中，每一项就是某一天的天气
+    （date/dayweather/daytemp/nighttemp），并非 forecasts[].casts[] 的嵌套结构。
+    温度字段为字符串数字，统一转 int；缺失时兜底 0。
     """
     if not isinstance(payload, dict):
         return []
     result = []
-    # 预报数据在 forecasts[].casts[] 中，每条 cast 是某一天的天气
-    for f in payload.get("forecasts", []):
-        for c in f.get("casts", []):
-            result.append({
-                "date": c.get("date", ""),
-                "day_weather": c.get("dayweather", ""),   # 高德白天天气字段 → 契约 day_weather
-                "day_temp": _coerce_int(c.get("daytemp")),     # 高德白天温度 → 契约 day_temp
-                "night_temp": _coerce_int(c.get("nighttemp")), # 高德夜间温度 → 契约 night_temp
-            })
+    for c in payload.get("forecasts", []):
+        result.append({
+            "date": c.get("date", ""),
+            "day_weather": c.get("dayweather", ""),   # 高德白天天气字段 → 契约 day_weather
+            "day_temp": _coerce_int(c.get("daytemp")),     # 高德白天温度 → 契约 day_temp
+            "night_temp": _coerce_int(c.get("nighttemp")), # 高德夜间温度 → 契约 night_temp
+        })
     return result
-
-
-def parse_route(payload):
-    """把 maps_direction_* 的返回解析成路径规划结果 dict（含起终点/距离/耗时）。"""
-    if not isinstance(payload, dict):
-        return {}
-    route = payload.get("route", {}) or {}
-    return {
-        "origin": route.get("origin", ""),
-        "destination": route.get("destination", ""),
-        "distance": route.get("distance", ""),
-        "duration": route.get("duration", ""),
-    }
-
-
-def parse_geocode(payload):
-    """把 maps_geo 的返回解析成 {"lng": float, "lat": float}。"""
-    if not isinstance(payload, dict):
-        return {"lng": 0.0, "lat": 0.0}
-    geocodes = payload.get("geocodes", [])
-    if geocodes:
-        return _coerce_location(geocodes[0].get("location"))
-    return {"lng": 0.0, "lat": 0.0}
 
 
 class AmapMcpDataSource(DataSource):
@@ -208,7 +167,8 @@ class AmapMcpDataSource(DataSource):
         logger.info("[高德MCP] 调 %s，参数 %s", tool_name, json.dumps(arguments, ensure_ascii=False))
         session = await self._ensure_session()
         try:
-            result = await session.call_tool(tool_name, arguments)
+            # 加超时：ModelScope 限流时连接可能挂起，超时抛 TimeoutError 由上层兜底
+            result = await asyncio.wait_for(session.call_tool(tool_name, arguments), timeout=30.0)
             logger.info("[高德MCP] %s 返回成功", tool_name)
             return result
         except Exception:
@@ -259,22 +219,8 @@ class AmapMcpDataSource(DataSource):
         return parse_poi_list(self._extract_payload(result))
 
     async def get_weather(self, city, days):
-        """天气查询：调 maps_weather，返回每日天气列表（契约结构）。"""
+        """天气查询：调 maps_weather，返回每日天气列表（契约结构，按 days 截断）。"""
         args = {"city": city}
         result = await self._call_tool(resolve_tool_name("get_weather"), args)
-        return parse_weather(self._extract_payload(result))
-
-    async def plan_route(self, origin, dest, mode):
-        """路径规划：按 mode 选工具，调对应 maps_direction_*，返回规划结果 dict。"""
-        tool = resolve_tool_name("plan_route", mode)
-        args = {"origin": origin, "destination": dest}
-        result = await self._call_tool(tool, args)
-        payload = parse_route(self._extract_payload(result))
-        payload["mode"] = mode   # 回填出行方式，便于下游识别
-        return payload
-
-    async def geocode(self, address):
-        """地理编码：调 maps_geo，返回 {"lng", "lat"}。"""
-        args = {"address": address}
-        result = await self._call_tool(resolve_tool_name("geocode"), args)
-        return parse_geocode(self._extract_payload(result))
+        weather = parse_weather(self._extract_payload(result))
+        return weather[:days] if days and days > 0 else weather

@@ -7,10 +7,8 @@ import pytest
 from app.datasource.base import DataSource
 from app.datasource.amap_mcp import (
     resolve_tool_name,
-    route_tool_for_mode,
     parse_poi_list,
     parse_weather,
-    parse_geocode,
 )
 
 
@@ -18,8 +16,6 @@ class FakeDS(DataSource):
     """假数据源：实现 DataSource 全部抽象方法，返回固定契约结构，用于验证接口形状。"""
     async def search_poi(self, k, c, **kw): return [{"name": "x", "location": {"lng": 1, "lat": 1}, "price": 0}]
     async def get_weather(self, c, d): return [{"date": "2026-08-29", "day_weather": "晴"}]
-    async def plan_route(self, o, de, m): return {"mode": m}
-    async def geocode(self, a): return {"lng": 1, "lat": 1}
 
 
 @pytest.mark.asyncio
@@ -33,15 +29,6 @@ def test_amap_tool_name_mapping():
     """工具名映射：契约方法 → 高德 MCP 工具名。"""
     assert resolve_tool_name("search_poi") == "maps_text_search"
     assert resolve_tool_name("get_weather") == "maps_weather"
-    assert resolve_tool_name("geocode") == "maps_geo"
-
-
-def test_amap_route_tool_by_mode():
-    """路径规划按出行方式映射，未识别方式兜底驾车。"""
-    assert resolve_tool_name("plan_route", "walking") == "maps_direction_walking"
-    assert resolve_tool_name("plan_route", "driving") == "maps_direction_driving"
-    assert resolve_tool_name("plan_route", "transit") == "maps_direction_transit_integrated"
-    assert route_tool_for_mode("flying") == "maps_direction_driving"
 
 
 def test_parse_poi_list_contract():
@@ -58,18 +45,12 @@ def test_parse_poi_list_contract():
 
 
 def test_parse_weather_contract():
-    """天气解析：把 maps_weather 的 forecasts/casts 解析成 date/day_weather/day_temp/night_temp 列表。"""
-    payload = {"forecasts": [{"casts": [{"date": "2026-08-29", "dayweather": "晴", "daytemp": "31", "nighttemp": "22"}]}]}
+    """天气解析：把 maps_weather 的 forecasts（扁平数组，每项即一天）解析成 date/day_weather/day_temp/night_temp。"""
+    payload = {"forecasts": [{"date": "2026-08-29", "dayweather": "晴", "daytemp": "31", "nighttemp": "22"}]}
     assert parse_weather(payload) == [{"date": "2026-08-29", "day_weather": "晴", "day_temp": 31, "night_temp": 22}]
 
 
 def test_parse_weather_missing_temp_defaults_to_zero():
     """天气解析：温度字段缺失时兜底为 0，保证前端不会渲染 undefined。"""
-    payload = {"forecasts": [{"casts": [{"date": "2026-08-29", "dayweather": "晴"}]}]}
+    payload = {"forecasts": [{"date": "2026-08-29", "dayweather": "晴"}]}
     assert parse_weather(payload) == [{"date": "2026-08-29", "day_weather": "晴", "day_temp": 0, "night_temp": 0}]
-
-
-def test_parse_geocode_contract():
-    """地理编码解析：geocodes[0].location 转 {lng,lat}。"""
-    payload = {"geocodes": [{"location": "116.397,39.908"}]}
-    assert parse_geocode(payload) == {"lng": 116.397, "lat": 39.908}

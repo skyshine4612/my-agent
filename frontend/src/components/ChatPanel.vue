@@ -8,7 +8,8 @@ import type { ChatMessage } from '@/types'
 
 // 父级传入的消息列表与流式状态，向上 emit 发送动作
 // streaming：是否在流式请求中（禁用输入）；thinking：是否在等待助手首字（显示呼吸点）
-const props = defineProps<{ messages: ChatMessage[]; streaming: boolean; thinking: boolean }>()
+// generating：是否处于「工具调用完成、正在整理答案」阶段
+const props = defineProps<{ messages: ChatMessage[]; streaming: boolean; thinking: boolean; generating: boolean }>()
 const emit = defineEmits<{ send: [text: string] }>()
 
 // 输入框草稿
@@ -28,10 +29,19 @@ function renderMarkdown(text: string): string {
   return DOMPurify.sanitize(raw)
 }
 
-// 工具参数在摘要行里的紧凑展示：超长截断，完整参数放进气泡展开区
-function formatArgs(args: Record<string, any>): string {
-  const s = JSON.stringify(args)
-  return s.length > 60 ? `${s.slice(0, 60)}…` : s
+// 工具名 → 简洁中文进度文案（区分执行中/完成两种状态），让用户一眼看懂 agent 在做什么
+const TOOL_LABELS: Record<string, { run: string; done: string }> = {
+  call_sub_agent: { run: '正在规划行程…', done: '行程规划完成' },
+  train_ticket_query: { run: '正在查询火车票…', done: '已查询火车票' },
+  flight_query: { run: '正在查询机票…', done: '已查询机票' },
+  weather_query: { run: '正在查询天气…', done: '已查询天气' },
+  poi_search: { run: '正在搜索景点/酒店…', done: '已搜索景点/酒店' },
+  route_plan: { run: '正在规划路线…', done: '已规划路线' },
+}
+function toolLabel(tool: string, done: boolean): string {
+  const m = TOOL_LABELS[tool]
+  if (m) return done ? m.done : m.run
+  return done ? `已执行 ${tool}` : `正在执行 ${tool}…`
 }
 </script>
 
@@ -52,30 +62,26 @@ function formatArgs(args: Record<string, any>): string {
             <div class="msg__bubble msg__bubble--user">{{ m.content }}</div>
           </div>
 
-          <!-- 助手消息：markdown 正文 + 工具气泡 -->
+          <!-- 助手消息：工具进度（上）+ markdown 正文（下），按时间顺序「先查询、后回答」 -->
           <div v-else class="msg msg--assistant">
             <div class="msg__label">助手</div>
+            <!-- 工具进度：显示在答案之前，一行简洁中文文案 + 状态点（执行中闪烁 / 完成变绿） -->
+            <div v-for="(t, i) in m.tools ?? []" :key="i" class="tool">
+              <span class="tool__status" :class="t.summary ? 'tool__status--done' : 'tool__status--run'"></span>
+              <span class="tool__name">{{ toolLabel(t.tool, !!t.summary) }}</span>
+            </div>
             <!-- markdown 正文（token 流式累积） -->
             <div v-if="m.content" class="msg__markdown" v-html="renderMarkdown(m.content)"></div>
-            <!-- 工具气泡：tool_call 显示「调用 工具名(参数)」，tool_result 回填摘要；可折叠、持久化 -->
-            <details v-for="(t, i) in m.tools ?? []" :key="i" class="tool">
-              <summary class="tool__head">
-                <span class="tool__status" :class="t.summary ? 'tool__status--done' : 'tool__status--run'"></span>
-                <span class="tool__name">调用 {{ t.tool }}</span>
-                <span v-if="t.args && Object.keys(t.args).length" class="tool__args">{{ formatArgs(t.args) }}</span>
-              </summary>
-              <div class="tool__body">
-                <pre v-if="t.args && Object.keys(t.args).length" class="tool__params">{{ JSON.stringify(t.args, null, 2) }}</pre>
-                <div v-if="t.summary" class="tool__summary">{{ t.summary }}</div>
-                <div v-else class="tool__running">执行中…</div>
-              </div>
-            </details>
           </div>
         </template>
 
         <!-- 流式等待中的轻量提示（呼吸点） -->
         <div v-if="props.thinking" class="msg msg--assistant">
           <div class="msg__label">助手</div>
+          <div class="msg__typing"><span></span><span></span><span></span></div>
+        </div>
+        <!-- 工具调用完成、正在整理答案：助手消息已显示工具进度，这里只加呼吸点，不重复「助手」标签 -->
+        <div v-if="props.generating" class="msg msg--assistant">
           <div class="msg__typing"><span></span><span></span><span></span></div>
         </div>
       </div>
@@ -240,26 +246,17 @@ function formatArgs(args: Record<string, any>): string {
   border: 1px solid var(--border);
   padding: 6px 10px;
 }
-/* 工具气泡：用原生 details/summary 实现折叠，展开状态由 DOM 自身持久化 */
+/* 工具进度：一行简洁文案 + 状态点（执行中闪烁 / 完成变绿），不暴露参数与摘要 */
 .tool {
   max-width: 82%;
   margin-top: 8px;
-  border: 1px solid var(--border);
-  border-radius: 10px;
-  background: var(--surface);
-  overflow: hidden;
-}
-.tool__head {
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 8px 12px;
-  cursor: pointer;
-  list-style: none;   /* 去掉 summary 默认三角标记 */
-  user-select: none;
-}
-.tool__head::-webkit-details-marker {
-  display: none;
+  padding: 6px 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface);
 }
 .tool__status {
   width: 8px;
@@ -279,42 +276,6 @@ function formatArgs(args: Record<string, any>): string {
   font-weight: 600;
   color: var(--text);
   white-space: nowrap;
-}
-.tool__args {
-  font-size: 12px;
-  color: var(--text-secondary);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  flex: 1;
-  min-width: 0;
-}
-.tool__body {
-  padding: 8px 12px 12px;
-  border-top: 1px dashed var(--border);
-}
-.tool__params {
-  margin: 0 0 8px;
-  font-size: 12px;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  color: var(--text-secondary);
-  background: var(--bg);
-  border-radius: 6px;
-  padding: 8px;
-  overflow-x: auto;
-  white-space: pre-wrap;
-  word-break: break-word;
-}
-.tool__summary {
-  font-size: 13px;
-  color: var(--text);
-  line-height: 1.7;
-  white-space: pre-wrap;
-  word-break: break-word;
-}
-.tool__running {
-  font-size: 13px;
-  color: var(--text-secondary);
 }
 .msg__typing {
   display: flex;

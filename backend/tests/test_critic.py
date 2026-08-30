@@ -76,12 +76,6 @@ class FakeDS:
     async def get_weather(self, city, days):
         return [{"date": "2026-08-30", "day_weather": "晴"}]
 
-    async def plan_route(self, origin, destination, mode):
-        return {}
-
-    async def geocode(self, address):
-        return {"lng": 0.0, "lat": 0.0}
-
 
 def _make_svc(tmp_path, monkeypatch, llm):
     """构造带假数据源/假 LLM 的 service，并摘掉异步 LTM 提炼。"""
@@ -124,8 +118,8 @@ async def test_critic_skips_without_hard_data(tmp_path, monkeypatch):
 async def test_critic_corrects_answer_when_rejected(tmp_path, monkeypatch):
     """ok=false 分支：critic 拒绝后追加修正指令再生成一轮，落库修正后的回答。
 
-    同时断言修正轮收到的 user_message 携带完整上下文（原始问题 + 上一轮回答 + issues），
-    否则 LLM 看不到原始诉求与自己的旧回答，只能凭 claim 猜「重新输出」什么。
+    同时断言修正轮收到的 user_message 携带原始问题 + issues（修正要点），
+    并明确要求直接输出修正答案（不自我批评、不复述问题）。
     """
     llm = ScriptedStreamLLM([
         # 第一轮生成：调 weather_query 后给出含编造票价的回答
@@ -145,5 +139,5 @@ async def test_critic_corrects_answer_when_rejected(tmp_path, monkeypatch):
     correction_messages = llm.stream_messages[-1]
     last_user = [m for m in correction_messages if m["role"] == "user"][-1]
     assert "原始问题：成都天气" in last_user["content"]
-    assert "你之前的回答：成都明天晴，机票100元" in last_user["content"]
-    assert "请修正以下问题后重新输出" in last_user["content"]
+    assert "修正要点" in last_user["content"]
+    assert "直接输出修正后的最终答案" in last_user["content"]

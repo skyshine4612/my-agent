@@ -3,6 +3,7 @@
 from abc import ABC, abstractmethod
 from typing import AsyncIterator
 
+import httpx
 from openai import AsyncOpenAI
 
 from app.config import settings
@@ -46,7 +47,7 @@ class OpenAICompatLLM(LLMClient):
     def __init__(self, base_url, api_key, model):
         # 保存模型名，并基于 base_url / api_key 构建异步客户端
         self.model = model
-        self.client = AsyncOpenAI(base_url=base_url, api_key=api_key)
+        self.client = AsyncOpenAI(base_url=base_url, api_key=api_key, timeout=httpx.Timeout(120.0, connect=10.0))
 
     async def chat(self, messages, tools=None, response_format=None):
         # 组装请求参数：模型名 + 消息列表，仅在提供 tools 时附带工具定义

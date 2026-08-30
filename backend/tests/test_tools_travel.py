@@ -1,24 +1,20 @@
-# tests/test_businesses_travel.py
-# 旅行业务 5 个工具工厂的契约测试（迁移自 test_travel_tools，删除 budget_calc 用例）：
-# 用鸭子类型 FakeDS 假数据源验证工具工厂的注入与调用。
+# tests/test_tools_travel.py
+# 旅行工具工厂的契约测试：用鸭子类型 FakeDS 验证工具工厂的注入与调用。
 import pytest
 
-from app.businesses.travel.tools import (
-    make_poi_search, make_weather_query, make_route_plan,
+from app.tools.travel import (
+    make_poi_search, make_weather_query,
     make_train_ticket_query, make_flight_query,
 )
 
 
 class FakeDS:
-    """高德数据源假实现：返回固定 POI / 天气 / 路线，验证 amap 三个工具工厂的注入与调用。"""
+    """高德数据源假实现：返回固定 POI / 天气。"""
     async def search_poi(self, keywords, city, **kw):
         return [{"name": "宽窄巷子", "location": {"lng": 1, "lat": 1}, "price": 0}]
 
     async def get_weather(self, city, days):
         return [{"date": "2026-08-30", "day_weather": "晴"}]
-
-    async def plan_route(self, origin, destination, mode):
-        return {"origin": origin, "destination": destination, "mode": mode}
 
 
 class FakeTrainDS:
@@ -46,13 +42,6 @@ async def test_weather_query_default_days():
     fn = make_weather_query(FakeDS())
     res = await fn(city="成都")
     assert res[0]["day_weather"] == "晴"
-
-
-@pytest.mark.asyncio
-async def test_route_plan():
-    fn = make_route_plan(FakeDS())
-    r = await fn(origin="成都", destination="重庆", mode="driving")
-    assert r["origin"] == "成都" and r["destination"] == "重庆" and r["mode"] == "driving"
 
 
 @pytest.mark.asyncio

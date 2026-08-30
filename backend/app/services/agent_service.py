@@ -1,5 +1,5 @@
 # app/services/agent_service.py
-# 多业务通用 service：把记忆（会话 + 长期）、LLM、数据源、业务工具与 call_sub_agent
+# 多业务通用 service：把记忆（会话 + 长期）、LLM、数据源、业务工具
 # 串成一个完整的 AgentService，对外提供 SSE 流式对话 chat_stream 与长期记忆异步提炼。
 # 替代旧的 trip_service（旅行专用「规划 → 澄清/执行 → 三套方案」链路）。
 import asyncio
@@ -12,10 +12,10 @@ from app.core.agent import Agent
 from app.core.critic import run_critic
 from app.core.llm import get_llm
 from app.core.memory import ConversationStore, LongTermMemory
-from app.core.prompts import load_prompt, render_system_prompt
+from app.core.prompts import load_prompt, render_system_prompt, today_hint
 from app.core.registry import ToolRegistry
-from app.core.sub_agent import make_call_sub_agent
-from app.businesses import BUSINESSES
+from app.core.skills import load_skills
+from app.tools import register_all_tools
 from app.datasource.amap_mcp import AmapMcpDataSource
 
 logger = logging.getLogger(__name__)
@@ -31,7 +31,11 @@ def _similar(a: str, b: str, threshold: float = 0.7) -> bool:
 
 
 class AgentService:
-    """多业务通用 service：装配会话/长期记忆 + LLM + 数据源，驱动「通用 agent → 工具/委派 → critic 校验」链路。"""
+    """多业务通用 service：装配会话/长期记忆 + LLM + 数据源，驱动「通用 agent → 工具 → critic 校验」链路。
+
+    单层架构 + 标准 skill 两段式：顶层 agent 直接调用各业务工具（不再委派子 agent）；
+    system prompt 只注入「可用业务清单」（name+description），业务规则正文由 get_skill 工具按需加载。
+    """
 
     def __init__(self):
         # 会话 + 长期记忆，共享同一 SQLite（路径可配置，容器内挂载 ./data）
@@ -40,23 +44,18 @@ class AgentService:
         # LLM 客户端 + 真实高德数据源
         self.llm = get_llm()
         self.ds = AmapMcpDataSource()
-        # 业务名 → Business 映射：call_sub_agent 的委派目标与 enum 都从这里取
-        self.businesses_map = {b.name: b for b in BUSINESSES}
-        # 一次性装配扁平 ToolRegistry（含各业务工具 + call_sub_agent）并缓存到 self。
-        # 关键：Train/Flight MCP 数据源在各业务 register_tools 里内联 new，其 __init__ 会创建
+        # 加载 skills 清单（name/description/body）：name+description 进 system prompt，body 由 get_skill 按需加载
+        self.skills = load_skills()
+        # 一次性装配扁平 ToolRegistry（旅行 + 系统 + 网络工具）并缓存到 self。
+        # 关键：Train/Flight/Bing MCP 数据源在各 register_*_tools 里内联 new，其 __init__ 会创建
         # httpx 客户端（mcp_base）且从不 close；若每请求重建，高频 SSE 下连接持续泄漏。
         # 这里启动时 build 一次，chat_stream 直接复用，数据源只在启动时 new 一次。
         self.registry = self._build_registry()
 
     def _build_registry(self) -> ToolRegistry:
-        """装配扁平 ToolRegistry：各业务工具 + call_sub_agent（只在 __init__ 调用一次，结果缓存到 self.registry）。"""
+        """装配扁平 ToolRegistry：统一注册所有工具（旅行 + 系统 + 网络），只在启动时调用一次。"""
         registry = ToolRegistry()
-        # 遍历已注册业务，把各业务工具注入同一个扁平注册表
-        for b in BUSINESSES:
-            b.register_tools(registry, self.ds)
-        # call_sub_agent：把复杂任务委派给对应业务的子 agent，description/parameters 取自工具对象
-        call_sub_agent = make_call_sub_agent(self.businesses_map, self.llm, registry)
-        registry.register("call_sub_agent", call_sub_agent.description, call_sub_agent.parameters, call_sub_agent)
+        register_all_tools(registry, self.ds, [s["name"] for s in self.skills])
         return registry
 
     async def chat_stream(self, user_id, conv_id, message):
@@ -98,8 +97,10 @@ class AgentService:
         # 5. 顶层 agent：复用 __init__ 缓存的 registry（不在每请求重建，避免泄漏 MCP 数据源）
         registry = self.registry
         tool_grounding = load_prompt("grounding")
-        business_directory = "\n".join(f"- {b.name}：{b.description}" for b in BUSINESSES)
-        system = render_system_prompt(business_directory, tool_grounding)
+        # 可用业务清单（name + description）注入 system prompt；正文由 get_skill 工具按需加载
+        skill_directory = "\n".join(f"- {s['name']}：{s['description']}" for s in self.skills)
+        system = render_system_prompt(skill_directory, tool_grounding)
+        system += "\n" + today_hint()
         if fact_hint:
             system += "\n" + fact_hint
         agent = Agent(name="assistant", system_prompt=system, tools=registry.list_names(), llm=self.llm)
@@ -131,11 +132,15 @@ class AgentService:
                     return
                 etype = ev["type"]
                 if etype == "token":
-                    yield {"type": "token", "content": ev["content"]}
+                    pass   # 答案不立即输出：等 critic 校验通过后统一流式输出，避免「第一段编造答案」先流出
+                elif etype == "status":
+                    # LLM 开始生成（思考或答案）时的心跳，转发给前端显示「整理中」，覆盖生成期长静默
+                    yield {"type": "status", "status": ev["status"]}
                 elif etype == "tool_call":
                     # 入队待配对（带 tool_call_id）：后续 tool_result 按 id 回填 summary
                     pending_calls.append({"tool": ev["tool"], "args": ev["args"], "id": ev["id"]})
-                    yield {"type": "tool_call", "tool": ev["tool"], "args": ev["args"]}
+                    # id 一并下发给前端：同名工具并发时前端也能按 id 精确配对 summary，不串
+                    yield {"type": "tool_call", "tool": ev["tool"], "args": ev["args"], "id": ev["id"]}
                 elif etype == "tool_result":
                     name = ev["tool"]
                     # 按 tool_call_id 精确配对：并行执行时工具按「完成先后」返回，tool_result 顺序
@@ -150,13 +155,16 @@ class AgentService:
                     if name in HARD_DATA_TOOLS:
                         # 硬数据工具记完整结果（ev["full"]），供 critic 校验回答
                         hard_results.append(ev.get("full", ev["summary"]))
-                    yield {"type": "tool_result", "tool": name, "summary": ev["summary"]}
+                    yield {"type": "tool_result", "tool": name, "summary": ev["summary"], "id": ev["id"]}
 
         # 第一轮生成
         gen_task = asyncio.create_task(generate(message))
         async for sse in consume():
             yield sse
         answer = await gen_task
+
+        # 7.5 工具调用结束，进入「整理答案」阶段：发 status 事件让前端显示进度，避免长静默
+        yield {"type": "status", "status": "generating"}
 
         # 8. critic 回路：仅当本轮调用了硬数据工具才校验（否则无事实依据可核对）
         if hard_results:
@@ -165,12 +173,18 @@ class AgentService:
                 # ok=false：把原始问题 + 上一轮回答 A + issues 一起作为修正指令再生成一轮（不递归），
                 # 修正轮才有完整上下文（否则 LLM 看不到原始诉求与自己的旧回答，只能凭 claim 猜）
                 issues = verdict.get("issues", [])
-                correction = (f"原始问题：{message}\n你之前的回答：{answer}\n"
-                              f"请修正以下问题后重新输出：\n{json.dumps(issues, ensure_ascii=False)}")
+                # 修正指令：让 agent 直接给出修正后的最终答案，不自我批评、不复述问题、不提及修正过程
+                correction = (f"原始问题：{message}\n"
+                              f"直接输出修正后的最终答案（不要自我批评、不要提及修正过程、不要复述原始问题）：\n"
+                              f"修正要点：\n{json.dumps(issues, ensure_ascii=False)}")
                 gen_task = asyncio.create_task(generate(correction))
                 async for sse in consume():
                     yield sse
                 answer = await gen_task
+
+        # 8.5 流式输出最终答案：拆小块逐块上发（此时已过 critic 校验，保证只输出一段干净答案）
+        for j in range(0, len(answer), 40):
+            yield {"type": "token", "content": answer[j:j + 40]}
 
         # 9. 持久化：markdown 内容 + 本轮工具调用记录，作为结构化 JSON 落库 assistant 消息
         await self.conv.add_message(conv_id, "assistant",

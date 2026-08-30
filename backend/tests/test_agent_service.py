@@ -6,7 +6,7 @@ import json
 
 import pytest
 
-from app.businesses.travel import TravelBusiness
+from app.tools import travel as travel_tools
 from app.config import settings
 from app.services.agent_service import AgentService
 
@@ -25,7 +25,7 @@ class FakeStreamingLLM:
 
 
 def test_service_assembles_and_tools_non_empty(tmp_path, monkeypatch):
-    """AgentService 装配成功（conv/ltm/llm/ds 就位），扁平工具注册表非空且含 call_sub_agent。"""
+    """AgentService 装配成功（conv/ltm/llm/ds 就位），扁平工具注册表非空。"""
     monkeypatch.setattr(settings, "db_path", str(tmp_path / "svc.db"))
     svc = AgentService()
     assert svc.conv is not None
@@ -34,8 +34,10 @@ def test_service_assembles_and_tools_non_empty(tmp_path, monkeypatch):
     assert svc.ds is not None
     names = svc.registry.list_names()
     assert names, "工具注册表不应为空"
-    assert "call_sub_agent" in names
+    assert "get_skill" in names
     assert "poi_search" in names and "weather_query" in names
+    assert "bing_search" in names
+    assert "get_hot_news" in names and "search_news" in names
 
 
 @pytest.mark.asyncio
@@ -67,18 +69,18 @@ async def test_chat_stream_flow(tmp_path, monkeypatch):
 async def test_registry_built_once_and_reused_across_requests(tmp_path, monkeypatch):
     """registry 在 __init__ 一次 build 并缓存，chat_stream 复用缓存，不每请求重建（不泄漏 MCP 数据源）。
 
-    通过 spy TravelBusiness.register_tools 的调用次数验证：register_tools 内联 new 的
+    通过 spy register_travel_tools 的调用次数验证：register_travel_tools 内联 new 的
     Train/Flight MCP 数据源（其 __init__ 会创建从不 close 的 httpx 客户端）只在启动时 new 一次。
     """
     monkeypatch.setattr(settings, "db_path", str(tmp_path / "svc.db"))
     register_calls = []
-    orig = TravelBusiness.register_tools
+    orig = travel_tools.register_travel_tools
 
-    def spy(self, registry, deps):
+    def spy(registry, amap_ds):
         register_calls.append(registry)
-        return orig(self, registry, deps)
+        return orig(registry, amap_ds)
 
-    monkeypatch.setattr(TravelBusiness, "register_tools", spy)
+    monkeypatch.setattr(travel_tools, "register_travel_tools", spy)
     svc = AgentService()
     assert len(register_calls) == 1          # __init__ 只装配一次（数据源只 new 一次）
     cached = svc.registry
@@ -162,3 +164,8 @@ async def test_tool_result_pairs_by_call_id_same_name_parallel(tmp_path, monkeyp
     assert [t["tool"] for t in tools] == ["poi_search", "poi_search"]
     by_kw = {t["args"]["keywords"]: t["summary"] for t in tools}
     assert by_kw == {"景点A": "结果A", "景点B": "结果B"}
+    # SSE 事件透传 tool_call_id：前端据此按 id 精确回填 summary（同名工具并发也不串）
+    tool_calls = [e for e in events if e["type"] == "tool_call"]
+    tool_results = [e for e in events if e["type"] == "tool_result"]
+    assert {e["id"] for e in tool_calls} == {"call_a", "call_b"}
+    assert {e["id"] for e in tool_results} == {"call_a", "call_b"}

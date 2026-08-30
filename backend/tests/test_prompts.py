@@ -1,24 +1,35 @@
 # tests/test_prompts.py
 # 提示词加载器契约测试：load_prompt 读 .md 全文、render_system_prompt 正确替换两个插槽。
-from app.core.prompts import load_prompt, render_system_prompt
+from datetime import datetime
+
+from app.core.prompts import load_prompt, render_system_prompt, today_hint
+
+
+def test_today_hint_contains_current_date():
+    """today_hint 输出「今天是」+ 当天日期（YYYY-MM-DD）+ 周几，让 LLM 不再编造过去日期。"""
+    hint = today_hint()
+    assert hint.startswith("今天是 ")
+    # 包含今天日期（格式 YYYY-MM-DD）
+    assert datetime.now().strftime("%Y-%m-%d") in hint
+    # 含周几提示（周一 ~ 周日 之一）
+    assert any(f"周{wd}" in hint for wd in "一二三四五六日")
 
 
 def test_load_prompt_reads_markdown():
     """load_prompt 能按名字读到 prompts/<name>.md 的文本内容。"""
-    travel = load_prompt("travel")
-    assert isinstance(travel, str) and travel.strip()
-    assert "旅行规划专家" in travel
+    grounding = load_prompt("grounding")
+    assert isinstance(grounding, str) and grounding.strip()
     # system.md 保留两个待填插槽，由 render_system_prompt 替换
     system = load_prompt("system")
-    assert "{business_directory}" in system and "{tool_grounding}" in system
+    assert "{skill_directory}" in system and "{tool_grounding}" in system
 
 
 def test_render_system_prompt_fills_slots():
-    """render_system_prompt 把业务目录与事实规范填进两个插槽，输出不再含占位符。"""
+    """render_system_prompt 把可用业务清单与事实规范填进两个插槽，输出不再含占位符。"""
     directory = "- travel：旅行规划（行程/交通/景点/天气/预算）"
     grounding = load_prompt("grounding")
     out = render_system_prompt(directory, grounding)
-    assert "{business_directory}" not in out
+    assert "{skill_directory}" not in out
     assert "{tool_grounding}" not in out
     assert directory in out
     assert grounding in out

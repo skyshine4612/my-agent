@@ -92,7 +92,7 @@ class ConcurrentRegistry:
 
 @pytest.mark.asyncio
 async def test_run_stream_tokens_in_order():
-    """验证 run_stream 流式 token：content 增量按序经 on_event 发出，最终返回累积文本。"""
+    """验证 run_stream 最终答案：content 累积后按小块经 on_event 发出，最终返回完整答案。"""
     llm = StreamingLLM([
         [{"type": "content", "text": "成"}, {"type": "content", "text": "都晴"}, {"type": "end", "tool_calls": None}],
     ])
@@ -102,12 +102,13 @@ async def test_run_stream_tokens_in_order():
         events.append(e)
     out = await a.run_stream("查天气", [], FakeRegistry({}), on_event=on_event)
     assert out == "成都晴"
-    assert [e["content"] for e in events if e["type"] == "token"] == ["成", "都晴"]
+    # 最终答案按小块上发（合并后等于完整答案）
+    assert "".join(e["content"] for e in events if e["type"] == "token") == "成都晴"
 
 
 @pytest.mark.asyncio
 async def test_run_stream_tool_call_and_accumulated_text():
-    """验证 run_stream 工具调用：先思考后调工具，工具执行后给出答案；所有流出文本（含思考）都算回答。"""
+    """验证 run_stream 工具调用：思考（调工具轮）不上发不计入回答，只有最终答案（不调工具轮）上发并返回。"""
     llm = StreamingLLM([
         [{"type": "content", "text": "查"}, {"type": "end", "tool_calls": [{"id": "1", "function": {"name": "w", "arguments": "{\"c\":\"成都\"}"}}]}],
         [{"type": "content", "text": "成都晴"}, {"type": "end", "tool_calls": None}],
@@ -118,8 +119,10 @@ async def test_run_stream_tool_call_and_accumulated_text():
     async def on_event(e):
         events.append(e)
     out = await a.run_stream("查天气", [], reg, on_event=on_event)
-    # 累积文本 = 第一轮思考 "查" + 第二轮答案 "成都晴"
-    assert out == "查成都晴"
+    # 回答只含最终答案，思考 "查" 不计入
+    assert out == "成都晴"
+    # 思考 "查" 不上发前端（token 事件只含最终答案）
+    assert "查" not in "".join(e["content"] for e in events if e["type"] == "token")
     assert reg.called == [("w", {"c": "成都"})]
     assert any(e["type"] == "tool_call" and e["tool"] == "w" and e["args"] == {"c": "成都"} for e in events)
     assert any(e["type"] == "tool_result" and e["tool"] == "w" and e["summary"] == "晴" for e in events)
