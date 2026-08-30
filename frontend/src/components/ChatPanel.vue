@@ -4,12 +4,12 @@ import { ref } from 'vue'
 import { Promotion } from '@element-plus/icons-vue'
 import { marked } from 'marked'
 import DOMPurify from 'dompurify'
-import type { ChatMessage } from '@/types'
+import type { ChatMessage, ToolEvent } from '@/types'
 
 // 父级传入的消息列表与流式状态，向上 emit 发送动作
 // streaming：是否在流式请求中（禁用输入）；thinking：是否在等待助手首字（显示呼吸点）
-// generating：是否处于「工具调用完成、正在整理答案」阶段
-const props = defineProps<{ messages: ChatMessage[]; streaming: boolean; thinking: boolean; generating: boolean }>()
+// phase：工具调用完成后的阶段文案（整理答案/核对事实/修正答案），空串表示不在这些阶段
+const props = defineProps<{ messages: ChatMessage[]; streaming: boolean; thinking: boolean; phase: string }>()
 const emit = defineEmits<{ send: [text: string] }>()
 
 // 输入框草稿
@@ -29,19 +29,11 @@ function renderMarkdown(text: string): string {
   return DOMPurify.sanitize(raw)
 }
 
-// 工具名 → 简洁中文进度文案（区分执行中/完成两种状态），让用户一眼看懂 agent 在做什么
-const TOOL_LABELS: Record<string, { run: string; done: string }> = {
-  call_sub_agent: { run: '正在规划行程…', done: '行程规划完成' },
-  train_ticket_query: { run: '正在查询火车票…', done: '已查询火车票' },
-  flight_query: { run: '正在查询机票…', done: '已查询机票' },
-  weather_query: { run: '正在查询天气…', done: '已查询天气' },
-  poi_search: { run: '正在搜索景点/酒店…', done: '已搜索景点/酒店' },
-  route_plan: { run: '正在规划路线…', done: '已规划路线' },
-}
-function toolLabel(tool: string, done: boolean): string {
-  const m = TOOL_LABELS[tool]
-  if (m) return done ? m.done : m.run
-  return done ? `已执行 ${tool}` : `正在执行 ${tool}…`
+// 工具气泡文案：label 是后端注册工具时给出的中文动作短语（如「查询火车票」），
+// 前端统一按执行状态拼「正在{label}… / 已{label}」，无 label 时回退英文名。
+function toolLabel(t: ToolEvent, done: boolean): string {
+  const name = t.label || t.tool
+  return done ? `已${name}` : `正在${name}…`
 }
 </script>
 
@@ -68,7 +60,7 @@ function toolLabel(tool: string, done: boolean): string {
             <!-- 工具进度：显示在答案之前，一行简洁中文文案 + 状态点（执行中闪烁 / 完成变绿） -->
             <div v-for="(t, i) in m.tools ?? []" :key="i" class="tool">
               <span class="tool__status" :class="t.summary ? 'tool__status--done' : 'tool__status--run'"></span>
-              <span class="tool__name">{{ toolLabel(t.tool, !!t.summary) }}</span>
+              <span class="tool__name">{{ toolLabel(t, !!t.summary) }}</span>
             </div>
             <!-- markdown 正文（token 流式累积） -->
             <div v-if="m.content" class="msg__markdown" v-html="renderMarkdown(m.content)"></div>
@@ -80,9 +72,12 @@ function toolLabel(tool: string, done: boolean): string {
           <div class="msg__label">助手</div>
           <div class="msg__typing"><span></span><span></span><span></span></div>
         </div>
-        <!-- 工具调用完成、正在整理答案：助手消息已显示工具进度，这里只加呼吸点，不重复「助手」标签 -->
-        <div v-if="props.generating" class="msg msg--assistant">
-          <div class="msg__typing"><span></span><span></span><span></span></div>
+        <!-- 工具调用完成后的阶段（整理答案/核对事实/修正答案）：呼吸点 + 阶段文案，让用户知道在做什么 -->
+        <div v-if="props.phase" class="msg msg--assistant">
+          <div class="msg__phase">
+            <span class="msg__typing"><span></span><span></span><span></span></span>
+            <span class="msg__phase-text">{{ props.phase }}</span>
+          </div>
         </div>
       </div>
     </div>
@@ -276,6 +271,15 @@ function toolLabel(tool: string, done: boolean): string {
   font-weight: 600;
   color: var(--text);
   white-space: nowrap;
+}
+.msg__phase {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.msg__phase-text {
+  font-size: 13px;
+  color: var(--text-secondary);
 }
 .msg__typing {
   display: flex;

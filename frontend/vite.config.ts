@@ -16,10 +16,11 @@ export default defineConfig({
     },
   },
   server: {
+    host: '127.0.0.1',
     // 开发环境下将 /api 请求代理到后端 FastAPI 服务
     proxy: {
       '/api': {
-        target: 'http://localhost:8000',
+        target: 'http://127.0.0.1:8000',
         changeOrigin: true,
       },
     },

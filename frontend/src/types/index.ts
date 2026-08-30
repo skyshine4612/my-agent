@@ -5,6 +5,7 @@
 // id 用于同名工具并发时精确配对（历史落库消息不含 id，故设为可选）
 export interface ToolEvent {
   tool: string
+  label?: string
   args?: Record<string, any>
   summary?: string
   id?: string

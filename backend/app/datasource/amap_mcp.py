@@ -171,14 +171,26 @@ class AmapMcpDataSource(DataSource):
             result = await asyncio.wait_for(session.call_tool(tool_name, arguments), timeout=30.0)
             logger.info("[高德MCP] %s 返回成功", tool_name)
             return result
+        except asyncio.CancelledError as e:
+            # 服务器断连导致任务组取消本次调用，转成普通异常让上层兜底，避免穿透炸掉 SSE 流
+            logger.warning("[高德MCP] %s 调用被中断（服务器断连）", tool_name)
+            await self._discard_session()
+            raise ConnectionError(f"MCP 工具 {tool_name} 调用被中断（服务器断连）") from e
         except Exception:
             # 连接失效：清理缓存的 session 与连接，下次调用自动重建
             logger.warning("[高德MCP] %s 调用失败，将重建连接", tool_name, exc_info=True)
-            if self._exit_stack is not None:
-                await self._exit_stack.aclose()
-                self._exit_stack = None
-                self._session = None
+            await self._discard_session()
             raise
+
+    async def _discard_session(self):
+        """丢弃失效的 session 与连接；吞掉 aclose 抛出的取消/异常组（避免二次异常掩盖原错误）。"""
+        if self._exit_stack is not None:
+            try:
+                await self._exit_stack.aclose()
+            except BaseException:
+                pass
+            self._exit_stack = None
+            self._session = None
 
     async def close(self):
         """关闭持久 session 与连接（进程退出前调用）。
@@ -187,13 +199,7 @@ class AmapMcpDataSource(DataSource):
         退出（exit），anyio 的 cancel scope 要求同一 task 进出会抛 RuntimeError；这里吞掉该
         异常——进程退出时 OS 会兜底清理连接，不影响功能。
         """
-        if self._exit_stack is not None:
-            try:
-                await self._exit_stack.aclose()
-            except Exception:
-                pass
-            self._exit_stack = None
-            self._session = None
+        await self._discard_session()
 
     @staticmethod
     def _extract_payload(result):

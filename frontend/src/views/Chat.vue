@@ -17,8 +17,14 @@ const messages = ref<ChatMessage[]>([])
 const streaming = ref(false)
 // 本轮是否已产生助手输出（token / 工具事件）→ 控制呼吸点显示
 const assistantOutput = ref(false)
-// 是否处于「工具调用完成、正在整理答案」阶段 → 显示「正在整理答案…」
-const generating = ref(false)
+// 工具调用结束后的阶段文案（整理答案 / 核对事实 / 修正答案），空串表示不在这些阶段
+const phase = ref('')
+// status 事件 → 前端展示的阶段文案
+const PHASE_LABELS: Record<string, string> = {
+  generating: '正在整理答案…',
+  checking: '正在核对事实…',
+  correcting: '正在修正答案…',
+}
 
 // 消息 id 自增计数器，保证渲染 key 唯一
 let seq = 0
@@ -27,8 +33,9 @@ function nextId(): string {
   return `m${Date.now()}-${seq}`
 }
 
-// 呼吸点：流式请求中、且助手尚未吐出任何 token 或工具事件
-const thinking = computed(() => streaming.value && !assistantOutput.value)
+// 呼吸点：流式请求中、且尚未进入任何阶段（phase）、也未吐出 token/工具事件
+// 一旦进入生成/核对/修正阶段，改用 phase 文案展示，避免「助手」呼吸点与阶段文案同时出现
+const thinking = computed(() => streaming.value && !assistantOutput.value && !phase.value)
 
 // —— 消息构造辅助 ——
 function pushUser(text: string) {
@@ -54,7 +61,7 @@ async function send(text: string) {
   pushUser(t)
   streaming.value = true
   assistantOutput.value = false
-  generating.value = false
+  phase.value = ''
 
   // 当前正在构建的助手消息：本轮所有 token 与工具事件都累积到它身上
   let current: ChatMessage | null = null
@@ -76,20 +83,20 @@ async function send(text: string) {
           refreshConversations()
           break
         case 'status':
-          // 工具调用结束、进入整理答案阶段：显示「正在整理答案…」
-          generating.value = ev.status === 'generating'
+          // 工具调用结束后的各阶段（整理/核对/修正）：映射成文案展示，避免 critic 等阶段长静默
+          phase.value = PHASE_LABELS[ev.status] ?? ''
           break
         case 'token':
           // 逐字增量：追加到助手消息 content；答案开始输出，结束「整理中」状态
           ensureAssistant().content += ev.content ?? ''
           assistantOutput.value = true
-          generating.value = false
+          phase.value = ''
           break
         case 'tool_call':
           // 工具调用：追加一个气泡（带 id，供 tool_result 精确配对），稍后回填摘要；工具进度替代「整理中」呼吸点
-          ensureAssistant().tools!.push({ tool: ev.tool, args: ev.args, id: ev.id })
+          ensureAssistant().tools!.push({ tool: ev.tool, label: ev.label, args: ev.args, id: ev.id })
           assistantOutput.value = true
-          generating.value = false
+          phase.value = ''
           break
         case 'tool_result': {
           // 回填摘要：优先按 id 精确匹配（同名工具并发也不串），id 缺失时回退按工具名。
@@ -117,7 +124,7 @@ async function send(text: string) {
     pushAssistantText('抱歉，本次请求失败，请稍后重试。')
   } finally {
     streaming.value = false
-    generating.value = false
+    phase.value = ''
   }
 }
 
@@ -234,7 +241,7 @@ onMounted(async () => {
 
     <!-- 中间对话区：核心，占主导 -->
     <section class="chat__main">
-      <ChatPanel :messages="messages" :streaming="streaming" :thinking="thinking" :generating="generating" @send="send" />
+      <ChatPanel :messages="messages" :streaming="streaming" :thinking="thinking" :phase="phase" @send="send" />
     </section>
   </div>
 </template>

@@ -1,6 +1,6 @@
 # app/tools/__init__.py
-# 统一工具注册：把所有工具（旅行 / 系统 / 网络 / 新闻）注入同一个 ToolRegistry。
-from app.tools import network, news, system, travel
+# 统一工具注册：把所有工具（旅行 / 系统 / 网络）注入同一个 ToolRegistry。
+from app.tools import network, system, travel
 
 
 def register_all_tools(registry, amap_ds, skill_names):
@@ -14,4 +14,3 @@ def register_all_tools(registry, amap_ds, skill_names):
     travel.register_travel_tools(registry, amap_ds)
     system.register_system_tools(registry, skill_names)
     network.register_network_tools(registry)
-    news.register_news_tools(registry)

@@ -45,13 +45,15 @@ async def test_run_critic_ok_false():
 
 
 class ScriptedStreamLLM:
-    """按脚本产出 stream_chat 事件（每轮生成吐一个 turn），并记录 chat（critic）调用与每轮 messages。"""
-    def __init__(self, stream_turns, critic_response='{"ok":true,"issues":[]}'):
+    """按脚本产出 stream_chat 事件（每轮生成吐一个 turn），并记录 chat（critic）/complete（修正轮）调用。"""
+    def __init__(self, stream_turns, critic_response='{"ok":true,"issues":[]}', complete_response=""):
         self.stream_turns = list(stream_turns)
         self.i = 0
         self.chat_calls = []
-        self.stream_messages = []   # 记录每次 stream_chat 收到的 messages，供断言修正轮上下文
+        self.stream_messages = []   # 记录每次 stream_chat 收到的 messages
+        self.complete_calls = []    # 记录修正轮的 complete 调用
         self.critic_response = critic_response
+        self.complete_response = complete_response
 
     async def stream_chat(self, messages, tools=None):
         self.stream_messages.append(messages)
@@ -65,7 +67,8 @@ class ScriptedStreamLLM:
         return {"content": self.critic_response, "tool_calls": None}
 
     async def complete(self, messages):
-        return ""
+        self.complete_calls.append(messages)
+        return self.complete_response
 
 
 class FakeDS:
@@ -116,28 +119,23 @@ async def test_critic_skips_without_hard_data(tmp_path, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_critic_corrects_answer_when_rejected(tmp_path, monkeypatch):
-    """ok=false 分支：critic 拒绝后追加修正指令再生成一轮，落库修正后的回答。
-
-    同时断言修正轮收到的 user_message 携带原始问题 + issues（修正要点），
-    并明确要求直接输出修正答案（不自我批评、不复述问题）。
-    """
+    """ok=false 分支：critic 拒绝后，复用第一轮工具结果，用 complete 直接生成修正答案（不重新调工具）。"""
     llm = ScriptedStreamLLM([
         # 第一轮生成：调 weather_query 后给出含编造票价的回答
         [{"type": "end", "tool_calls": [{"id": "1", "function": {"name": "weather_query", "arguments": '{"city":"成都"}'}}]}],
         [{"type": "content", "text": "成都明天晴，机票100元"}, {"type": "end", "tool_calls": None}],
-        # 修正轮：给出去掉票价的新回答
-        [{"type": "content", "text": "成都明天晴"}, {"type": "end", "tool_calls": None}],
-    ], critic_response='{"ok":false,"issues":[{"claim":"机票100元","problem":"编造票价","correction":"删除票价"}]}')
+    ], critic_response='{"ok":false,"issues":[{"claim":"机票100元","problem":"编造票价","correction":"删除票价"}]}',
+       complete_response="成都明天晴")
     svc = _make_svc(tmp_path, monkeypatch, llm)
     events = [e async for e in svc.chat_stream("u1", None, "成都天气")]
     conv_id = next(e["conversation_id"] for e in events if e["type"] == "conversation_id")
     history = await svc.conv.get_history("u1", conv_id)
     saved = json.loads(history[-1]["content"])
     assert saved["content"] == "成都明天晴"   # 修正后的回答被落库
-    assert len(llm.chat_calls) == 1
-    # 缺陷 1 覆盖：修正轮（最后一次 stream_chat）的 user_message 需包含原始问题与上一轮回答
-    correction_messages = llm.stream_messages[-1]
-    last_user = [m for m in correction_messages if m["role"] == "user"][-1]
-    assert "原始问题：成都天气" in last_user["content"]
-    assert "修正要点" in last_user["content"]
-    assert "直接输出修正后的最终答案" in last_user["content"]
+    assert len(llm.chat_calls) == 1           # critic 调一次
+    assert len(llm.complete_calls) == 1       # 修正轮用 complete（不再重新 stream_chat 调工具）
+    # 修正轮的 complete 收到工具结果 + 修正要点
+    correction_user = [m for m in llm.complete_calls[0] if m["role"] == "user"][-1]
+    assert "原始问题：成都天气" in correction_user["content"]
+    assert "修正要点" in correction_user["content"]
+    assert "工具结果" in correction_user["content"]

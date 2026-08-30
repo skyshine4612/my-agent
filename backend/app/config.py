@@ -25,12 +25,8 @@ class Settings(BaseSettings):
     flight_variflight_url: str = ""
     # bing 网页搜索 MCP 服务地址（查询实时信息/攻略/价格）
     bing_mcp_url: str = ""
-    # 每日新闻 MCP 服务地址（热点新闻/新闻搜索）
-    news_mcp_url: str = ""
     # SQLite 数据库文件路径
     db_path: str = "app.db"
-    # 允许跨域访问的前端来源（逗号分隔的多个来源）
-    cors_origins: str = "http://localhost:5173"
 
 
 # 全局配置实例，供各模块导入使用

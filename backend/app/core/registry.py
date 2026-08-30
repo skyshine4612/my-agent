@@ -15,11 +15,13 @@ class Tool:
         description: 工具用途描述，写入 OpenAI schema 供 LLM 理解何时调用
         parameters:  JSON Schema 形式的入参定义，约束工具接受的参数结构
         fn:          真正的可调用对象（支持同步或异步函数）
+        label:       中文动作短语（如「查询火车票」），供前端工具气泡展示；空则回退英文名
     """
     name: str
     description: str
     parameters: dict
     fn: Callable
+    label: str = ""
 
 
 class ToolRegistry:
@@ -34,9 +36,12 @@ class ToolRegistry:
         # 内部字典：工具名 → Tool 对象
         self._tools = {}
 
-    def register(self, name, description, parameters, fn):
-        """注册一个工具：用名字作为唯一键，保存元信息与可调用函数。"""
-        self._tools[name] = Tool(name, description, parameters, fn)
+    def register(self, name, description, parameters, fn, label=""):
+        """注册一个工具：用名字作为唯一键，保存元信息与可调用函数。
+
+        label：可选的中文动作短语（如「查询火车票」），供前端工具气泡展示；缺省回退英文名。
+        """
+        self._tools[name] = Tool(name, description, parameters, fn, label)
 
     def get(self, name):
         """按名字取回工具对象。"""
@@ -45,6 +50,11 @@ class ToolRegistry:
     def list_names(self):
         """列出当前已注册的所有工具名。"""
         return list(self._tools.keys())
+
+    def label(self, name):
+        """返回工具的中文动作短语，未设 label 或未注册时回退英文名。"""
+        t = self._tools.get(name)
+        return (t.label or name) if t else name
 
     def to_openai_schemas(self, names):
         """把指定名字的工具转成 OpenAI function calling 的 schema 列表。"""

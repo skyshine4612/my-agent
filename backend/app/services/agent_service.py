@@ -6,6 +6,7 @@ import asyncio
 import difflib
 import json
 import logging
+import time
 
 from app.config import settings
 from app.core.agent import Agent
@@ -89,7 +90,7 @@ class AgentService:
                     if isinstance(data, dict) and isinstance(data.get("content"), str):
                         content = data["content"]
                 except (json.JSONDecodeError, TypeError):
-                    pass   # 非 JSON 的 assistant 消息原样保留
+                    pass  # 非 JSON 的 assistant 消息原样保留
                 history.append({"role": "assistant", "content": content})
         # 末尾一条是本轮刚落库的用户消息，run_stream 会再追加一次，这里剔除避免重复
         if history and history[-1]["role"] == "user":
@@ -110,7 +111,7 @@ class AgentService:
         queue: asyncio.Queue = asyncio.Queue()
         tools: list[dict] = []
         hard_results: list[str] = []
-        pending_calls: list[dict] = []   # 待配对的 tool_call（工具并行执行时按 tool_call_id 匹配回 result）
+        pending_calls: list[dict] = []  # 待配对的 tool_call（工具并行执行时按 tool_call_id 匹配回 result）
 
         async def emit(event):
             # 把 run_stream 的内部事件原样塞进队列，供下方循环实时转 SSE
@@ -132,15 +133,17 @@ class AgentService:
                     return
                 etype = ev["type"]
                 if etype == "token":
-                    pass   # 答案不立即输出：等 critic 校验通过后统一流式输出，避免「第一段编造答案」先流出
+                    pass  # 答案不立即输出：等 critic 校验通过后统一流式输出，避免「第一段编造答案」先流出
                 elif etype == "status":
                     # LLM 开始生成（思考或答案）时的心跳，转发给前端显示「整理中」，覆盖生成期长静默
                     yield {"type": "status", "status": ev["status"]}
                 elif etype == "tool_call":
-                    # 入队待配对（带 tool_call_id）：后续 tool_result 按 id 回填 summary
-                    pending_calls.append({"tool": ev["tool"], "args": ev["args"], "id": ev["id"]})
-                    # id 一并下发给前端：同名工具并发时前端也能按 id 精确配对 summary，不串
-                    yield {"type": "tool_call", "tool": ev["tool"], "args": ev["args"], "id": ev["id"]}
+                    # 入队待配对（带 tool_call_id）：后续 tool_result 按 id 回填 summary；
+                    # label 一并入队，随 tools 持久化，供前端历史气泡还原中文名
+                    label = ev.get("label", ev["tool"])
+                    pending_calls.append({"tool": ev["tool"], "args": ev["args"], "id": ev["id"], "label": label})
+                    # id/label 一并下发给前端：同名工具并发时前端也能按 id 精确配对 summary，不串
+                    yield {"type": "tool_call", "tool": ev["tool"], "args": ev["args"], "id": ev["id"], "label": label}
                 elif etype == "tool_result":
                     name = ev["tool"]
                     # 按 tool_call_id 精确配对：并行执行时工具按「完成先后」返回，tool_result 顺序
@@ -150,12 +153,13 @@ class AgentService:
                     if entry is not None:
                         pending_calls.remove(entry)
                         entry["summary"] = ev["summary"]
-                        entry.pop("id", None)   # id 仅用于配对，持久化 tools 保持 {tool,args,summary} 结构
+                        entry.pop("id", None)  # id 仅用于配对，持久化 tools 保持 {tool,args,summary} 结构
                         tools.append(entry)
                     if name in HARD_DATA_TOOLS:
                         # 硬数据工具记完整结果（ev["full"]），供 critic 校验回答
                         hard_results.append(ev.get("full", ev["summary"]))
-                    yield {"type": "tool_result", "tool": name, "summary": ev["summary"], "id": ev["id"]}
+                    yield {"type": "tool_result", "tool": name, "summary": ev["summary"], "id": ev["id"],
+                           "label": ev.get("label", name)}
 
         # 第一轮生成
         gen_task = asyncio.create_task(generate(message))
@@ -163,24 +167,38 @@ class AgentService:
             yield sse
         answer = await gen_task
 
-        # 7.5 工具调用结束，进入「整理答案」阶段：发 status 事件让前端显示进度，避免长静默
-        yield {"type": "status", "status": "generating"}
+        # 7.5 工具调用结束，进入「整理答案」阶段：发 status 事件让前端显示进度，避免长静默。
+        #     有硬数据先做事实校验（checking），校验不过再修正（correcting），最后统一流式输出答案。
+        if hard_results:
+            yield {"type": "status", "status": "checking"}
+        else:
+            yield {"type": "status", "status": "generating"}
 
         # 8. critic 回路：仅当本轮调用了硬数据工具才校验（否则无事实依据可核对）
         if hard_results:
             verdict = await run_critic(self.llm, json.dumps(hard_results, ensure_ascii=False), answer)
             if not verdict.get("ok", True):
-                # ok=false：把原始问题 + 上一轮回答 A + issues 一起作为修正指令再生成一轮（不递归），
-                # 修正轮才有完整上下文（否则 LLM 看不到原始诉求与自己的旧回答，只能凭 claim 猜）
+                # ok=false：第一轮工具结果本身是准的，问题只在模型生成答案时编造了价格。
+                # 修正时复用第一轮的工具结果（tools），直接让模型重新生成答案——不重新调工具、不重新走 ReAct。
                 issues = verdict.get("issues", [])
-                # 修正指令：让 agent 直接给出修正后的最终答案，不自我批评、不复述问题、不提及修正过程
-                correction = (f"原始问题：{message}\n"
-                              f"直接输出修正后的最终答案（不要自我批评、不要提及修正过程、不要复述原始问题）：\n"
-                              f"修正要点：\n{json.dumps(issues, ensure_ascii=False)}")
-                gen_task = asyncio.create_task(generate(correction))
-                async for sse in consume():
-                    yield sse
-                answer = await gen_task
+                logger.info("[service] critic 判定不通过（%d 条问题），进入修正答案", len(issues))
+                yield {"type": "status", "status": "correcting"}
+                # 修正 prompt 只喂 {tool,args,summary} 事实依据，剥离展示用的 label，避免噪音
+                tool_results_text = json.dumps(
+                    [{k: v for k, v in t.items() if k != "label"} for t in tools], ensure_ascii=False)
+                correction_prompt = (
+                    f"原始问题：{message}\n\n"
+                    f"以下是本轮已经查询到的工具结果（事实依据，请严格基于这些，不要编造）：\n{tool_results_text}\n\n"
+                    f"请基于以上工具结果直接输出修正后的最终答案（中文 Markdown）。"
+                    f"用户明确询问但工具没查到的关键信息，如实说明「该信息未查到」，不要编造；用户没问的字段不要罗列缺失。\n"
+                    f"修正要点：\n{json.dumps(issues, ensure_ascii=False)}"
+                )
+                t0 = time.perf_counter()
+                answer = await self.llm.complete([
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": correction_prompt},
+                ])
+                logger.info("[service] 修正答案完成，耗时 %.1fs，%d 字", time.perf_counter() - t0, len(answer))
 
         # 8.5 流式输出最终答案：拆小块逐块上发（此时已过 critic 校验，保证只输出一段干净答案）
         for j in range(0, len(answer), 40):
@@ -205,7 +223,8 @@ class AgentService:
             if not user_msgs:
                 return
             resp = await self.llm.complete([
-                {"role": "system", "content": "从下面的用户发言里，只提取【稳定的、跨会话可复用的】偏好或事实（如常住城市、长期的兴趣偏好、习惯性要求，例：'偏好经济型酒店'、'喜欢自然风光'）。不要提取一次性的行程请求参数（如'去成都玩2天预算2000'这种某次旅行的具体目的地/天数/预算），也不要提取助手推荐的内容。没有稳定偏好就输出空列表。每条打 importance(0~1)。输出 JSON:{\"facts\":[{\"fact\":\"...\",\"importance\":0.8}]}"},
+                {"role": "system",
+                 "content": "从下面的用户发言里，只提取【稳定的、跨会话可复用的】偏好或事实（如常住城市、长期的兴趣偏好、习惯性要求，例：'偏好经济型酒店'、'喜欢自然风光'）。不要提取一次性的行程请求参数（如'去成都玩2天预算2000'这种某次旅行的具体目的地/天数/预算），也不要提取助手推荐的内容。没有稳定偏好就输出空列表。每条打 importance(0~1)。输出 JSON:{\"facts\":[{\"fact\":\"...\",\"importance\":0.8}]}"},
                 {"role": "user", "content": json.dumps(user_msgs, ensure_ascii=False)}])
             data = json.loads(resp[resp.index("{"):resp.rindex("}") + 1])
             new_facts = data.get("facts", [])
@@ -220,7 +239,7 @@ class AgentService:
                 matched = next((ex for ex in existing if _similar(fact_text, ex["fact"])), None)
                 if matched:
                     await self.ltm.update_importance(user_id, matched["fact"],
-                                                      max(matched["importance"], importance))
+                                                     max(matched["importance"], importance))
                 else:
                     to_add.append(nf)
             if to_add:

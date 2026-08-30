@@ -4,14 +4,12 @@ services:
     build: ./backend
     restart: unless-stopped
     environment:
-      LLM_API_KEY: ${LLM_API_KEY}
-      LLM_BASE_URL: ${LLM_BASE_URL:-https://dashscope.aliyuncs.com/compatible-mode/v1}
-      LLM_MODEL: ${LLM_MODEL:-qwen-plus}
-      MODELSCOPE_TOKEN: ${MODELSCOPE_TOKEN}
-      AMAP_MCP_URL: ${AMAP_MCP_URL}
+      # 仅注入部署相关配置；LLM/MCP 等密钥类参数由挂载的 backend/.env 提供，
+      # config.py 通过 env_file=".env" 在容器内 /app 直接读取
       DB_PATH: /app/data/app.db
     volumes:
       - ./data:/app/data          # SQLite 持久化
+      - ./backend/.env:/app/.env:ro  # 配置挂载：Python 直接读 .env，无需在 compose 罗列密钥
     expose:
       - "8000"
 

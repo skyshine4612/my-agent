@@ -22,4 +22,4 @@ def register_system_tools(registry, skill_names):
         "properties": {"name": {"type": "string", "enum": skill_names, "description": "业务名"}},
         "required": ["name"],
     }
-    registry.register("get_skill", get_skill.description, get_skill.parameters, get_skill)
+    registry.register("get_skill", get_skill.description, get_skill.parameters, get_skill, "读取业务规则")

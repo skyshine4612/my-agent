@@ -82,7 +82,7 @@ class StubClient:
 @pytest.mark.asyncio
 async def test_stream_chat_merges_tool_calls_by_index():
     """验证 OpenAICompatLLM.stream_chat：content 增量按序产出，tool_calls 按 index 合并成 chat() 形状"""
-    llm = OpenAICompatLLM("http://localhost", "k", "m")
+    llm = OpenAICompatLLM("http://127.0.0.1", "k", "m")
     llm.client = StubClient([
         _chunk(content="开始"),
         _chunk(tool_calls=[_tc(0, id="call_0", name="weather", arguments='{"ci')]),

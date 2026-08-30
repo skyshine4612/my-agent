@@ -36,6 +36,9 @@ class FakeRegistry:
     def to_openai_schemas(self, names):
         return []
 
+    def label(self, name):
+        return name
+
 
 @pytest.mark.asyncio
 async def test_working_memory_compression():
@@ -88,6 +91,9 @@ class ConcurrentRegistry:
 
     def to_openai_schemas(self, names):
         return []
+
+    def label(self, name):
+        return name
 
 
 @pytest.mark.asyncio

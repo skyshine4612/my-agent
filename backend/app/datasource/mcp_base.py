@@ -50,12 +50,25 @@ class McpDataSource:
         session = await self._ensure_session()
         try:
             return await asyncio.wait_for(session.call_tool(tool_name, arguments), timeout=30.0)
+        except asyncio.CancelledError as e:
+            # MCP 连接中途被任务组取消（如服务器断连），不是上层主动取消本次请求；
+            # 转成普通异常，让 run_stream 的工具兜底当「执行失败」处理，避免 CancelledError
+            # 一路穿透 except Exception 把整个 SSE 流炸掉。
+            await self._discard_session()
+            raise ConnectionError(f"MCP 工具 {tool_name} 调用被中断（服务器断连）") from e
         except Exception:
-            if self._exit_stack is not None:
-                await self._exit_stack.aclose()
-                self._exit_stack = None
-                self._session = None
+            await self._discard_session()
             raise
+
+    async def _discard_session(self):
+        """丢弃失效的 session 与连接；吞掉 aclose 抛出的取消/异常组（避免二次异常掩盖原错误）。"""
+        if self._exit_stack is not None:
+            try:
+                await self._exit_stack.aclose()
+            except BaseException:
+                pass
+            self._exit_stack = None
+            self._session = None
 
     @staticmethod
     def _extract_text(result) -> str:
@@ -68,10 +81,4 @@ class McpDataSource:
 
     async def close(self):
         """关闭持久 session（进程退出前调用；anyio 跨 task 退出会报错，静默吞掉）。"""
-        if self._exit_stack is not None:
-            try:
-                await self._exit_stack.aclose()
-            except Exception:
-                pass
-            self._exit_stack = None
-            self._session = None
+        await self._discard_session()

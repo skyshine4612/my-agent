@@ -37,7 +37,6 @@ def test_service_assembles_and_tools_non_empty(tmp_path, monkeypatch):
     assert "get_skill" in names
     assert "poi_search" in names and "weather_query" in names
     assert "bing_search" in names
-    assert "get_hot_news" in names and "search_news" in names
 
 
 @pytest.mark.asyncio
@@ -133,6 +132,9 @@ class SlowFastRegistry:
 
     def to_openai_schemas(self, names):
         return []
+
+    def label(self, name):
+        return name
 
     async def call(self, name, args):
         kw = args.get("keywords", "")

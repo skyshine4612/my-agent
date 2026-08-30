@@ -12,7 +12,7 @@ def register_network_tools(registry):
         return await bing_ds.search(query, count)
 
     bing_search.__name__ = "bing_search"
-    bing_search.description = "用必应搜索网页，返回标题/链接/摘要。查实时信息、攻略、价格等用。"
+    bing_search.description = "用必应搜索网页，返回标题/链接/摘要。用于专用工具未覆盖的实时信息、新闻或通用知识查询。"
     bing_search.parameters = {
         "type": "object",
         "properties": {
@@ -21,4 +21,4 @@ def register_network_tools(registry):
         },
         "required": ["query"],
     }
-    registry.register("bing_search", bing_search.description, bing_search.parameters, bing_search)
+    registry.register("bing_search", bing_search.description, bing_search.parameters, bing_search, "联网搜索")

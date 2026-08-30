@@ -1,9 +1,7 @@
 # main.py
 # FastAPI 应用入口：创建应用实例、注册中间件与路由
 from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
 
-from app.config import settings
 from app.core.logging import setup_logging
 from app.api.routes import chat, conversation
 
@@ -12,11 +10,6 @@ setup_logging()
 
 # 创建 FastAPI 应用实例
 app = FastAPI(title="可扩展业务 Agent 平台")
-
-# 添加 CORS 中间件，允许前端跨域访问
-app.add_middleware(CORSMiddleware,
-    allow_origins=[o.strip() for o in settings.cors_origins.split(",")],
-    allow_methods=["*"], allow_headers=["*"])
 
 # 挂载业务路由：SSE 流式对话 + 会话管理（统一挂到 /api 前缀下）
 app.include_router(chat.router, prefix="/api")

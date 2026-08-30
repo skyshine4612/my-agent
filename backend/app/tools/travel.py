@@ -45,16 +45,16 @@ def register_travel_tools(registry, amap_ds):
         registry: ToolRegistry，工具注册表
         amap_ds:  高德数据源（poi_search / weather_query 共用）
     """
-    registry.register("poi_search", "按关键词搜索POI(景点/酒店/美食)，仅返回名称/地址，不含门票价/开放时间/实时房价",
+    registry.register("poi_search", "按关键词搜索POI(景点/酒店/美食)，返回名称/地址等基本信息",
         {"type": "object", "properties": {"keywords": {"type": "string"}, "city": {"type": "string"}, "price_max": {"type": "number"}}, "required": ["keywords", "city"]},
-        make_poi_search(amap_ds))
+        make_poi_search(amap_ds), "搜索景点/酒店")
     registry.register("weather_query", "查询城市未来天气",
         {"type": "object", "properties": {"city": {"type": "string"}, "days": {"type": "integer"}}, "required": ["city"]},
-        make_weather_query(amap_ds))
+        make_weather_query(amap_ds), "查询天气")
     # 火车/机票数据源内联 new（其 __init__ 会创建从不 close 的 httpx 客户端，只在启动时 new 一次）
     registry.register("train_ticket_query", "查询跨城火车票(车次/时间/票价/余票)",
         {"type": "object", "properties": {"date": {"type": "string"}, "from_city": {"type": "string"}, "to_city": {"type": "string"}}, "required": ["date", "from_city", "to_city"]},
-        make_train_ticket_query(Train12306DataSource()))
+        make_train_ticket_query(Train12306DataSource()), "查询火车票")
     registry.register("flight_query", "查询跨城机票(航班/时间/票价)",
         {"type": "object", "properties": {"date": {"type": "string"}, "from_city": {"type": "string"}, "to_city": {"type": "string"}}, "required": ["date", "from_city", "to_city"]},
-        make_flight_query(FlightVariflightDataSource()))
+        make_flight_query(FlightVariflightDataSource()), "查询机票")

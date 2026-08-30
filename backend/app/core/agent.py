@@ -94,7 +94,7 @@ class Agent:
                 # 解析工具入参（JSON 字符串 → dict），入参缺失时兜底为空对象
                 args = json.loads(fn["arguments"] or "{}")
                 logger.info("[Agent:%s] 调工具 %s，参数 %s", self.name, fn["name"], json.dumps(args, ensure_ascii=False))
-                await emit({"type": "tool_call", "agent": self.name, "tool": fn["name"], "args": args, "id": tc["id"]})
+                await emit({"type": "tool_call", "agent": self.name, "tool": fn["name"], "args": args, "id": tc["id"], "label": registry.label(fn["name"])})
                 # 通过 registry 真正执行工具，拿到观察结果；失败时把错误回传给 LLM 而非让整个 run_stream 崩溃
                 # （MCP 限流/网络抖动会导致工具抛异常，若不上抛会直接中断 SSE 流）
                 try:
@@ -110,7 +110,7 @@ class Agent:
                     text = text[:4000] + "[已截断]"
                 logger.info("[Agent:%s] 工具 %s 返回 %.120s", self.name, fn["name"], text)
                 await emit({"type": "tool_result", "agent": self.name, "tool": fn["name"],
-                            "summary": text[:120], "full": full, "id": tc["id"]})
+                            "summary": text[:120], "full": full, "id": tc["id"], "label": registry.label(fn["name"])})
                 # 返回带 tool_call_id 的回填项，供上层按原始顺序组装 tool 消息
                 return {"tool_call_id": tc["id"], "content": text}
 

@@ -3,6 +3,7 @@
 # 找出无法被工具结果支撑、或与工具结果矛盾的事实声明，返回 ok/issues 供上层决定是否修正。
 import json
 import logging
+import time
 
 from app.core.prompts import load_prompt
 
@@ -23,6 +24,8 @@ async def run_critic(llm, tool_results: str, answer: str) -> dict:
     system = load_prompt("critic")
     # 事实依据（工具结果）放前、待校验回答放后，让 critic 逐条比对
     user = f"工具结果：\n{tool_results}\n\n待校验回答：\n{answer}"
+    start = time.perf_counter()
+    logger.info("[critic] 开始事实校验：工具结果 %d 字、回答 %d 字", len(tool_results), len(answer))
     try:
         resp = await llm.chat(
             [{"role": "system", "content": system},
@@ -33,9 +36,15 @@ async def run_critic(llm, tool_results: str, answer: str) -> dict:
         logger.warning("[critic] 校验调用失败，跳过事实校验：%s", e)
         return {"ok": True, "issues": []}
     data = _parse_json(resp.get("content", ""))
+    elapsed = time.perf_counter() - start
     if not isinstance(data, dict):
+        # 判定结果解析失败：宁可放过，不因校验器故障阻塞主流程
+        logger.info("[critic] 校验完成，耗时 %.1fs，判定结果解析失败，按通过处理", elapsed)
         return {"ok": True, "issues": []}
-    return {"ok": bool(data.get("ok", True)), "issues": data.get("issues", [])}
+    result = {"ok": bool(data.get("ok", True)), "issues": data.get("issues", [])}
+    logger.info("[critic] 校验完成，耗时 %.1fs，ok=%s，issue %d 条",
+                elapsed, result["ok"], len(result["issues"]))
+    return result
 
 
 def _parse_json(text):
