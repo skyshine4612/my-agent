@@ -17,6 +17,7 @@ from app.core.prompts import load_prompt, render_system_prompt, today_hint
 from app.core.registry import ToolRegistry
 from app.core.skills import load_skills
 from app.tools import register_all_tools
+from app.tools.sub_agent import make_call_sub_agent
 from app.datasource.amap_web import AmapWebDataSource
 
 logger = logging.getLogger(__name__)
@@ -57,6 +58,9 @@ class AgentService:
         registry = ToolRegistry()
         amap_web_ds = AmapWebDataSource()  # 高德数据源只 new 一次，旅行/通用工具共享
         register_all_tools(registry, amap_web_ds, [s["name"] for s in self.skills])
+        # 注册 call_sub_agent（子 Agent 委派，需要 llm + skill 清单，只能在 service 层注册）
+        sub_agent_fn = make_call_sub_agent(self.llm, registry, [s["name"] for s in self.skills])
+        registry.register("call_sub_agent", sub_agent_fn.description, sub_agent_fn.parameters, sub_agent_fn, "委派子任务")
         return registry
 
     async def chat_stream(self, user_id, conv_id, message):
