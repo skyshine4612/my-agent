@@ -79,12 +79,16 @@ class ConversationStore:
 
         return await asyncio.to_thread(r)
 
-    def list_conversations(self, user_id):
+    async def list_conversations(self, user_id):
         """列出某用户的所有会话（按创建时间倒序），按 user_id 过滤实现用户隔离。"""
-        with self._conn() as c:
-            return [dict(r) for r in
-                    c.execute("SELECT id,title,created_at FROM conversations WHERE user_id=? ORDER BY created_at DESC",
-                              (user_id,))]
+
+        def r():
+            with self._conn() as c:
+                return [dict(x) for x in c.execute(
+                    "SELECT id,title,created_at FROM conversations WHERE user_id=? ORDER BY created_at DESC",
+                    (user_id,))]
+
+        return await asyncio.to_thread(r)
 
     async def update_title(self, conv_id, title):
         """更新会话标题（首次用户消息时用消息摘要作为标题）。"""

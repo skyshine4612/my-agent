@@ -13,9 +13,9 @@ async def test_conversation_roundtrip(tmp_path):
     await s.add_message(cid, "user", "成都4天")
     hist = await s.get_history("u1", cid)
     assert [h["role"] for h in hist] == ["user"]
-    assert s.list_conversations("u1")[0]["title"] == "成都行"
+    assert (await s.list_conversations("u1"))[0]["title"] == "成都行"
     # 隔离：其他用户看不到
-    assert s.list_conversations("u2") == []
+    assert await s.list_conversations("u2") == []
     assert await s.get_history("u2", cid) == []
 
 

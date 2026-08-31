@@ -12,7 +12,7 @@ router = APIRouter()
 @router.get("/conversations")
 async def list_conversations(x_user_id: str = Header(default="anonymous")):
     """列出当前用户的所有会话（按创建时间倒序）。"""
-    return service.conversation_store.list_conversations(x_user_id)
+    return await service.conversation_store.list_conversations(x_user_id)
 
 
 @router.post("/conversations")
