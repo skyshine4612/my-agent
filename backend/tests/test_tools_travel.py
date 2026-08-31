@@ -3,18 +3,15 @@
 import pytest
 
 from app.tools.travel import (
-    make_poi_search, make_weather_query,
+    make_poi_search,
     make_train_ticket_query, make_flight_query,
 )
 
 
 class FakeDS:
-    """高德数据源假实现：返回固定 POI / 天气。"""
+    """高德数据源假实现：返回固定 POI。"""
     async def search_poi(self, keywords, city, **kw):
         return [{"name": "宽窄巷子", "location": {"lng": 1, "lat": 1}, "price": 0}]
-
-    async def get_weather(self, city, days):
-        return [{"date": "2026-08-30", "day_weather": "晴"}]
 
 
 class FakeTrainDS:
@@ -37,11 +34,11 @@ async def test_poi_search():
 
 
 @pytest.mark.asyncio
-async def test_weather_query_default_days():
-    """weather_query 的 days 有默认值：只传 city 不传 days 时不应抛 TypeError。"""
-    fn = make_weather_query(FakeDS())
-    res = await fn(city="成都")
-    assert res[0]["day_weather"] == "晴"
+async def test_poi_search_without_city():
+    """poi_search 的 city 可选：不传 city 时全局搜索不抛 TypeError。"""
+    fn = make_poi_search(FakeDS())
+    pois = await fn(keywords="景点")
+    assert pois[0]["name"] == "宽窄巷子"
 
 
 @pytest.mark.asyncio

@@ -31,12 +31,11 @@ def test_service_assembles_and_tools_non_empty(tmp_path, monkeypatch):
     assert svc.conv is not None
     assert svc.ltm is not None
     assert svc.llm is not None
-    assert svc.ds is not None
     names = svc.registry.list_names()
     assert names, "工具注册表不应为空"
     assert "get_skill" in names
     assert "poi_search" in names and "weather_query" in names
-    assert "bing_search" in names
+    assert "tavily_search" in names and "tavily_extract" in names
 
 
 @pytest.mark.asyncio
@@ -75,9 +74,9 @@ async def test_registry_built_once_and_reused_across_requests(tmp_path, monkeypa
     register_calls = []
     orig = travel_tools.register_travel_tools
 
-    def spy(registry, amap_ds):
+    def spy(registry, amap_web_ds):
         register_calls.append(registry)
-        return orig(registry, amap_ds)
+        return orig(registry, amap_web_ds)
 
     monkeypatch.setattr(travel_tools, "register_travel_tools", spy)
     svc = AgentService()

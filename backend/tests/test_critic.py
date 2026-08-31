@@ -71,20 +71,10 @@ class ScriptedStreamLLM:
         return self.complete_response
 
 
-class FakeDS:
-    """高德数据源假实现：返回空/固定契约结构，避免真实 MCP 网络。"""
-    async def search_poi(self, keywords, city, **kw):
-        return []
-
-    async def get_weather(self, city, days):
-        return [{"date": "2026-08-30", "day_weather": "晴"}]
-
-
 def _make_svc(tmp_path, monkeypatch, llm):
-    """构造带假数据源/假 LLM 的 service，并摘掉异步 LTM 提炼。"""
+    """构造带假 LLM 的 service，并摘掉异步 LTM 提炼。"""
     monkeypatch.setattr(settings, "db_path", str(tmp_path / "svc.db"))
     svc = AgentService()
-    svc.ds = FakeDS()
     svc.llm = llm
 
     async def noop(user_id, conv_id):

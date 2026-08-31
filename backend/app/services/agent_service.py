@@ -17,13 +17,13 @@ from app.core.prompts import load_prompt, render_system_prompt, today_hint
 from app.core.registry import ToolRegistry
 from app.core.skills import load_skills
 from app.tools import register_all_tools
-from app.datasource.amap_mcp import AmapMcpDataSource
+from app.datasource.amap_web import AmapWebDataSource
 
 logger = logging.getLogger(__name__)
 
 # 硬数据工具集合：这些工具返回的是「事实性」数据（车次/航班/天气），最容易被 LLM 编造或扭曲，
 # 只有本轮调用了它们才触发 critic 回路（省成本，仅在硬数据场景做事实校验）。
-HARD_DATA_TOOLS = {"train_ticket_query", "flight_query", "weather_query"}
+HARD_DATA_TOOLS = {"train_ticket_query", "flight_query", "weather_query", "holiday_calendar"}
 
 
 def _similar(a: str, b: str, threshold: float = 0.7) -> bool:
@@ -42,13 +42,12 @@ class AgentService:
         # 会话 + 长期记忆，共享同一 SQLite（路径可配置，容器内挂载 ./data）
         self.conv = ConversationStore(settings.db_path)
         self.ltm = LongTermMemory(settings.db_path)
-        # LLM 客户端 + 真实高德数据源
+        # LLM 客户端
         self.llm = get_llm()
-        self.ds = AmapMcpDataSource()
         # 加载 skills 清单（name/description/body）：name+description 进 system prompt，body 由 get_skill 按需加载
         self.skills = load_skills()
         # 一次性装配扁平 ToolRegistry（旅行 + 系统 + 网络工具）并缓存到 self。
-        # 关键：Train/Flight/Bing MCP 数据源在各 register_*_tools 里内联 new，其 __init__ 会创建
+        # 关键：Train/Flight/HTTP 数据源在各 register_*_tools 里内联 new，其 __init__ 会创建
         # httpx 客户端（mcp_base）且从不 close；若每请求重建，高频 SSE 下连接持续泄漏。
         # 这里启动时 build 一次，chat_stream 直接复用，数据源只在启动时 new 一次。
         self.registry = self._build_registry()
@@ -56,7 +55,8 @@ class AgentService:
     def _build_registry(self) -> ToolRegistry:
         """装配扁平 ToolRegistry：统一注册所有工具（旅行 + 系统 + 网络），只在启动时调用一次。"""
         registry = ToolRegistry()
-        register_all_tools(registry, self.ds, [s["name"] for s in self.skills])
+        amap_web_ds = AmapWebDataSource()  # 高德数据源只 new 一次，旅行/通用工具共享
+        register_all_tools(registry, amap_web_ds, [s["name"] for s in self.skills])
         return registry
 
     async def chat_stream(self, user_id, conv_id, message):

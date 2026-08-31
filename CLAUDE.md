@@ -6,10 +6,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 多业务对话式 Agent 平台，前后端分离：
 
-- **backend/**：FastAPI 应用，实现「通用 ReAct agent → 工具调用 → critic 事实校验」链路。真实数据来自 ModelScope 托管的 MCP 服务（高德地图 / 12306 火车票 / variflight 机票 / Bing 搜索），LLM 默认接阿里云百炼 DashScope（`qwen-plus`）。
+- **backend/**：FastAPI 应用，实现「通用 ReAct agent → 工具调用 → critic 事实校验」链路。真实数据：高德（POI/天气，Web 服务 API）、节假日/翻译/热榜/菜谱/营养（UAPIS）、搜索（Tavily）经 HTTP 直连；12306 火车票经 ModelScope 托管 MCP；机票直连 variflight 官方 MCP，LLM 默认接阿里云百炼 DashScope（`qwen-plus`）。
 - **frontend/**：Vue 3 + Vite + Element Plus + Pinia 的单页应用，通用对话界面（会话列表 + 流式聊天 + 工具调用气泡）。
 
-架构当前处于 `refactor/multi-business-agent` 分支的重构中：已从「旅行专用」链路收敛为「通用 agent + 标准 skill」两段式（见下）。
+架构已从「旅行专用」链路收敛为「通用 agent + 标准 skill」两段式（见下）。
 
 ## 常用命令
 
@@ -61,9 +61,9 @@ api/routes/chat.py  →  services/agent_service.py  →  core/agent.py (ReAct �
 
 ### 关键机制 / 不变量
 
-1. **critic 事实校验回路**（`agent_service.py` + `critic.py`）：仅当本轮调用了「硬数据工具」（`HARD_DATA_TOOLS = {train_ticket_query, flight_query, weather_query}`）才触发。第一轮答案先在 `consume()` 里被缓存、不直接下发；critic 判不通过时，**复用已查到的工具结果**让 LLM 直接重写答案（不重新调工具、不走 ReAct）。最终答案才拆成 40 字符块流式下发。所以 `token` 事件不是真正的逐 token 流式，而是「校验通过后分块补发」。
+1. **critic 事实校验回路**（`agent_service.py` + `critic.py`）：仅当本轮调用了「硬数据工具」（`HARD_DATA_TOOLS = {train_ticket_query, flight_query, weather_query, holiday_calendar}`）才触发。第一轮答案先在 `consume()` 里被缓存、不直接下发；critic 判不通过时，**复用已查到的工具结果**让 LLM 直接重写答案（不重新调工具、不走 ReAct）。最终答案才拆成 40 字符块流式下发。所以 `token` 事件不是真正的逐 token 流式，而是「校验通过后分块补发」。
 
-2. **ToolRegistry 只在启动时装配一次**：`AgentService.__init__` 里 `_build_registry()` 一次性 `new` 所有数据源并缓存到 `self.registry`。原因：`Train12306DataSource` / `FlightVariflightDataSource` / `BingMcpDataSource` 的 `__init__` 会创建从不 `close()` 的 httpx 客户端，若每请求重建会导致连接泄漏。**新增工具时注意保持这个「启动时装配一次」的模式**。
+2. **ToolRegistry 只在启动时装配一次**：`AgentService.__init__` 里 `_build_registry()` 一次性 `new` 所有数据源并缓存到 `self.registry`。原因：`Train12306DataSource` / `FlightVariflightDataSource` 及各 HTTP 数据源（UAPIS/Tavily/高德 Web）的 `__init__` 会创建从不 `close()` 的 httpx 客户端，若每请求重建会导致连接泄漏。**新增工具时注意保持这个「启动时装配一次」的模式**。
 
 3. **用户隔离**：所有路由从请求头 `X-User-Id`（缺省 `anonymous`）解析用户身份，透传给 `ConversationStore` / `LongTermMemory`，所有读写/删除/淘汰都按 `user_id` 过滤，防止跨用户读写注入。前端在 localStorage 生成 `client_id` 并通过 header 注入（`services/api.ts` 的 axios 拦截器 + `sse.ts` 手动加 header）。
 
@@ -73,9 +73,9 @@ api/routes/chat.py  →  services/agent_service.py  →  core/agent.py (ReAct �
 
 6. **提示词集中在 `app/prompts/*.md`**：`system.md`（含 `{skill_directory}` / `{tool_grounding}` 两个插槽，由 `render_system_prompt` 用 `str.replace` 填充）、`grounding.md`（严禁编造事实数据）、`critic.md`（critic 输出 JSON 契约）。`today_hint()` 会注入当前日期，避免 LLM 编造过去日期。
 
-7. **数据源分层**：`datasource/base.py` 定义 `DataSource` 契约（`search_poi` / `get_weather`），`datasource/mcp_base.py` 的 `McpDataSource` 封装 ModelScope streamable-HTTP MCP 的「懒加载持久 session + 超时 + 失效重建」，高德 / 12306 / 机票 / Bing 都继承它。`amap_mcp.py` 把高德 MCP 的返回解析成契约结构（纯函数 `parse_poi_list` / `parse_weather` 便于单测）。
+7. **数据源分层**：两个基类——`datasource/mcp_base.py` 的 `McpDataSource` 封装 MCP 的「懒加载持久 session + 超时 + 失效重建」（12306 / 机票继承）；`datasource/http_base.py` 的 `HttpDataSource` 封装 httpx 异步客户端（高德 Web / UAPIS / Tavily 继承）。`amap_web.py` 把高德返回解析成约定结构（纯函数 `parse_poi_list` / `parse_weather` 便于单测）。
 
-8. **配置**：`app/config.py` 用 pydantic-settings 从 `backend/.env` 读取（`LLM_*`、`MODELSCOPE_TOKEN`、各 `*_MCP_URL`、`DB_PATH`）。容器内通过 compose 挂载 `./backend/.env` 到 `/app/.env`，密钥类参数不写进 compose。
+8. **配置**：`app/config.py` 用 pydantic-settings 从 `backend/.env` 读取（`LLM_*`、`MODELSCOPE_TOKEN`、各 `*_MCP_URL`、`UAPIS_API_KEY`、`TAVILY_API_KEY`、`AMAP_API_KEY`、`VARIFLIGHT_API_KEY`、`DB_PATH`）。容器内通过 compose 挂载 `./backend/.env` 到 `/app/.env`，密钥类参数不写进 compose。
 
 ### 前端结构
 

@@ -14,10 +14,13 @@ CITY_IATA = {
 
 
 class FlightVariflightDataSource(McpDataSource):
-    """variflight 机票数据源：封装 ModelScope variflight-MCP 的航班查询。"""
+    """variflight 机票数据源：直连 variflight 官方 MCP（不走 ModelScope 代理）。
+
+    认证用 X-API-Key header（区别于 ModelScope 托管 MCP 的 Bearer 令牌）。
+    """
 
     def __init__(self):
-        super().__init__(settings.flight_variflight_url, settings.modelscope_token)
+        super().__init__(settings.flight_variflight_url, headers={"X-API-Key": settings.variflight_api_key})
 
     @staticmethod
     def _to_iata(city: str) -> str:
@@ -25,9 +28,9 @@ class FlightVariflightDataSource(McpDataSource):
         return CITY_IATA.get(city, city)
 
     async def search_flights(self, date: str, from_city: str, to_city: str) -> str:
-        """查跨城机票，返回航班信息（航班号/航司/时间/机型 + 价格）。"""
-        result = await self._call_tool("searchFlightsByDepArr", {
-            "date": date,
-            "depcity": self._to_iata(from_city),
-            "arrcity": self._to_iata(to_city)})
+        """查跨城机票（含舱位价格），用 getFlightPriceByCities 返回航班号/时间 + 各舱位票价。"""
+        result = await self._call_tool("getFlightPriceByCities", {
+            "dep_city": self._to_iata(from_city),
+            "arr_city": self._to_iata(to_city),
+            "dep_date": date})
         return self._extract_text(result)

@@ -18,10 +18,11 @@ logger = logging.getLogger(__name__)
 class McpDataSource:
     """MCP 数据源基类：懒加载持久 session + 统一工具调用 + 关闭清理。"""
 
-    def __init__(self, url, token):
-        # 连接参数：MCP 服务地址 + ModelScope 令牌（放入 Authorization 请求头）
+    def __init__(self, url, token=None, headers=None):
+        # 连接参数：MCP 服务地址 + 认证头。
+        # 默认用 ModelScope 令牌（Authorization: Bearer）；子类也可传自定义 headers（如 variflight 官方的 X-API-Key）。
         self.url = url
-        self.headers = {"Authorization": f"Bearer {token}"}
+        self.headers = headers if headers is not None else {"Authorization": f"Bearer {token}"}
         # streamable HTTP 协议：headers 需通过 http_client 传入
         self.http_client = create_mcp_http_client(headers=self.headers)
         # 懒加载的持久 session：首次调用建立连接，后续复用（省去重复握手）

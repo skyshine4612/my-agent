@@ -17,14 +17,18 @@ class Settings(BaseSettings):
     llm_model: str = "qwen-plus"
     # ModelScope 访问令牌（用于调用 ModelScope 上的 MCP 服务）
     modelscope_token: str = ""
-    # 高德地图 MCP 服务地址（用于旅行助手的地理/路径查询）
-    amap_mcp_url: str = ""
     # 12306 火车票 MCP 服务地址（查询跨城火车票/票价）
     train_12306_url: str = ""
-    # variflight 机票 MCP 服务地址（查询跨城航班/票价）
+    # variflight 官方 MCP 服务地址（直连官方，查询跨城航班/票价）
     flight_variflight_url: str = ""
-    # bing 网页搜索 MCP 服务地址（查询实时信息/攻略/价格）
-    bing_mcp_url: str = ""
+    # variflight 官方 API Key（X-API-Key 认证，区别于 ModelScope 的 Bearer 令牌）
+    variflight_api_key: str = ""
+    # UAPIS 令牌（节假日/万年历查询，uapis.cn）
+    uapis_api_key: str = ""
+    # Tavily API Key（网络语义搜索 + 网页正文提取）
+    tavily_api_key: str = ""
+    # 高德 Web 服务 API Key（restapi.amap.com 的路线规划等，区别于 ModelScope 高德 MCP）
+    amap_api_key: str = ""
     # SQLite 数据库文件路径
     db_path: str = "app.db"
 

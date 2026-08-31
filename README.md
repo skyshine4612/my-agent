@@ -1,12 +1,12 @@
 # 个人智能助手
 
-多业务对话式 Agent 平台。后端基于 FastAPI 实现「通用 ReAct agent → 工具调用 → critic 事实校验」链路，前端是 Vue 3 通用对话界面。当前内置旅行助手业务，可自然扩展到更多业务场景。
+多业务对话式 Agent 平台。后端基于 FastAPI 实现「通用 ReAct agent → 工具调用 → critic 事实校验」链路，前端是 Vue 3 通用对话界面。当前内置旅行助手、饮食规划、网页搜索、节假日、天气、翻译、热榜，可通过接入更多工具自然扩展业务场景。
 
 ## 功能特性
 
 - **ReAct 推理-行动循环**：LLM 自主决策调用工具、并行执行、回填结果、再决策。
-- **事实校验回路（critic）**：调用硬数据工具（车票/机票/天气）后，自动比对回答与工具结果，发现编造事实时基于真实结果重写答案。
-- **真实数据源**：通过 ModelScope 托管的 MCP 服务接入高德地图、12306 火车票、variflight 机票、Bing 搜索。
+- **事实校验回路（critic）**：调用硬数据工具（车票/机票/天气/节假日）后，自动比对回答与工具结果，发现编造事实时基于真实结果重写答案。
+- **真实数据源**：高德（POI/天气，Web 服务 API）、节假日/翻译/热榜/菜谱/营养（UAPIS）、搜索（Tavily）经 HTTP 直连；12306 火车票经 ModelScope 托管 MCP；机票直连 variflight 官方 MCP。
 - **标准 skill 两段式**：业务规则（`SKILL.md`）的清单常驻 system prompt，正文按需加载，新增业务无需改装配代码。
 - **会话 + 长期记忆**：SQLite 持久化多轮对话；跨会话提炼用户稳定偏好，按 importance 召回并注入提示词。
 - **SSE 流式对话**：逐字输出答案，实时展示工具调用进度。
@@ -29,12 +29,12 @@ my-agent/
 │   ├── app/
 │   │   ├── api/routes/        # 路由：SSE 对话 + 会话管理
 │   │   ├── core/              # 核心：agent(ReAct)/llm/critic/registry/memory/prompts/skills
-│   │   ├── datasource/        # 数据源：高德/12306/机票/Bing 的 MCP 封装
+│   │   ├── datasource/        # 数据源：MCP（12306/机票）+ HTTP（高德/UAPIS/Tavily）
 │   │   ├── models/            # Pydantic 请求模型
 │   │   ├── prompts/           # 提示词 .md（system/grounding/critic）
 │   │   ├── services/          # AgentService 编排器
-│   │   ├── skills/            # 业务 skill（travel/SKILL.md）
-│   │   ├── tools/             # 工具注册（travel/network/system）
+│   │   ├── skills/            # 业务 skill（travel/meal_planning 等）
+│   │   ├── tools/             # 工具注册（travel/network/common/system）
 │   │   ├── config.py          # 配置（读取 .env）
 │   │   └── main.py            # FastAPI 应用入口
 │   ├── tests/                 # pytest 测试（不依赖真实 LLM/网络）
@@ -101,10 +101,12 @@ docker compose up --build
 | `LLM_BASE_URL` | LLM 接口地址 | `https://dashscope.aliyuncs.com/compatible-mode/v1` |
 | `LLM_MODEL` | 使用的模型 | `qwen-plus` |
 | `MODELSCOPE_TOKEN` | ModelScope 访问令牌（调用 MCP 服务） | 空 |
-| `AMAP_MCP_URL` | 高德地图 MCP 服务地址 | 空 |
 | `TRAIN_12306_URL` | 12306 火车票 MCP 服务地址 | 空 |
-| `FLIGHT_VARIFLIGHT_URL` | variflight 机票 MCP 服务地址 | 空 |
-| `BING_MCP_URL` | Bing 网页搜索 MCP 服务地址 | 空 |
+| `FLIGHT_VARIFLIGHT_URL` | variflight 官方 MCP 服务地址 | 空 |
+| `VARIFLIGHT_API_KEY` | variflight 官方 API Key（X-API-Key 认证） | 空 |
+| `UAPIS_API_KEY` | UAPIS 令牌（节假日/翻译/热榜/菜谱/营养） | 空 |
+| `TAVILY_API_KEY` | Tavily API Key（搜索/网页提取） | 空 |
+| `AMAP_API_KEY` | 高德 Web 服务 Key（POI/天气） | 空 |
 | `DB_PATH` | SQLite 数据库文件路径 | `app.db` |
 
 ## API 概览
@@ -133,6 +135,6 @@ uv run pytest tests/test_llm.py -k stream   # 按关键字筛选
 ## 如何扩展新业务
 
 1. 在 `backend/app/skills/<业务名>/SKILL.md` 写业务规则，frontmatter 声明 `name` + `description`。
-2. 如需新工具，在 `backend/app/tools/` 下用 `registry.register(...)` 注册（数据源继承 `datasource/mcp_base.py` 的 `McpDataSource`）。
+2. 如需新工具，在 `backend/app/tools/` 下用 `registry.register(...)` 注册。数据源可走 MCP（继承 `datasource/mcp_base.py` 的 `McpDataSource`）或 HTTP 直连（参考 `datasource/uapis.py` / `tavily.py` / `amap_web.py` 用 `httpx.AsyncClient`）。
 
 skill 清单会自动注入 system prompt，正文由 `get_skill` 工具按需加载，无需改动 service 装配代码。
