@@ -5,12 +5,20 @@ from app.datasource.train_12306 import Train12306DataSource
 
 
 def make_poi_search(ds):
-    """POI 搜索工具：按关键词搜索景点/酒店/美食，可限定城市。"""
-    async def poi_search(keywords, city=None):
-        """按关键词搜索 POI（景点/酒店/美食），city 可选（不填则全局搜索）；无结果时返回占位条目。"""
-        pois = await ds.search_poi(keywords, city)
-        return pois or [{"name": "未找到结果", "address": "", "location": None, "category": keywords, "price": 0}]
+    """POI 搜索工具：按关键词或分类码搜索景点/酒店/美食，可限定城市。"""
+    async def poi_search(keywords=None, city=None, types=None):
+        """按关键词或分类码搜索 POI（types 为高德分类码，如 110000 风景名胜）；无结果时返回占位条目。"""
+        pois = await ds.search_poi(keywords=keywords, city=city, types=types)
+        return pois or [{"name": "未找到结果", "address": "", "location": None, "category": keywords or types, "price": 0}]
     return poi_search
+
+
+def make_poi_detail(ds):
+    """POI 详情工具：按 id 查地址与推荐菜。"""
+    async def poi_detail(id):
+        """按 POI id 查询详情，返回名称/地址/推荐菜标签（餐饮类 POI 的 tag 含招牌菜）。"""
+        return await ds.get_poi_detail(id)
+    return poi_detail
 
 
 def make_train_ticket_query(train_ds):
@@ -31,9 +39,16 @@ def make_flight_query(flight_ds):
 
 def register_travel_tools(registry, amap_web_ds):
     """把旅行工具注入 ToolRegistry（高德 Web API 工具共用传入的数据源实例）。"""
-    registry.register("poi_search", "按关键词搜索POI(景点/酒店/美食)，可限定城市，返回名称/地址等基本信息",
-        {"type": "object", "properties": {"keywords": {"type": "string", "description": "搜索关键词"}, "city": {"type": "string", "description": "限定城市，可选，不填则全局搜索"}}, "required": ["keywords"]},
-        make_poi_search(amap_web_ds), "搜索景点/酒店")
+    registry.register("poi_search", "按关键词或分类码搜索POI(景点/酒店/美食)，可限定城市，返回名称/地址等基本信息",
+        {"type": "object", "properties": {
+            "keywords": {"type": "string", "description": "搜索关键词（地点名，如 西湖、灵隐寺）"},
+            "types": {"type": "string", "description": "高德分类码（110000风景名胜/140000科教文化/050000餐饮/100000住宿）"},
+            "city": {"type": "string", "description": "限定城市，可选，不填则全局搜索"},
+        }, "required": []},
+        make_poi_search(amap_web_ds), "搜索景点/酒店/美食")
+    registry.register("poi_detail", "按 POI id 查询详情，返回名称/地址/推荐菜标签（餐饮类 POI 的 tag 含招牌菜）",
+        {"type": "object", "properties": {"id": {"type": "string", "description": "POI id，来自 poi_search 返回"}}, "required": ["id"]},
+        make_poi_detail(amap_web_ds), "搜索POI详情")
     # 火车/机票 MCP 数据源内联 new（其 __init__ 会创建从不 close 的连接，只在启动时 new 一次）
     registry.register("train_ticket_query", "查询跨城火车票(车次/时间/票价/余票)",
         {"type": "object", "properties": {"date": {"type": "string"}, "from_city": {"type": "string"}, "to_city": {"type": "string"}}, "required": ["date", "from_city", "to_city"]},

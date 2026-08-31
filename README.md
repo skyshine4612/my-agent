@@ -6,10 +6,10 @@
 
 - **ReAct 推理-行动循环**：LLM 自主决策调用工具、并行执行、回填结果、再决策。
 - **事实校验回路（critic）**：调用硬数据工具（车票/机票/天气/节假日）后，自动比对回答与工具结果，发现编造事实时基于真实结果重写答案。
-- **真实数据源**：高德（POI/天气，Web 服务 API）、节假日/翻译/热榜/菜谱/营养（UAPIS）、搜索（Tavily）经 HTTP 直连；12306 火车票经 ModelScope 托管 MCP；机票直连 variflight 官方 MCP。
+- **真实数据源**：高德（POI/天气/推荐菜，Web 服务 API）、节假日/翻译/热榜/菜谱/营养（UAPIS）、搜索（Tavily）经 HTTP 直连；12306 火车票经 ModelScope 托管 MCP；机票直连 variflight 官方 MCP。
 - **标准 skill 两段式**：业务规则（`SKILL.md`）的清单常驻 system prompt，正文按需加载，新增业务无需改装配代码。
 - **会话 + 长期记忆**：SQLite 持久化多轮对话；跨会话提炼用户稳定偏好，按 importance 召回并注入提示词。
-- **SSE 流式对话**：逐字输出答案，实时展示工具调用进度。
+- **SSE 流式对话**：逐字输出答案，实时展示工具调用进度；完整回复在流式输出前已落库，刷新后自动恢复会话与历史。
 - **用户隔离**：通过 `X-User-Id` 请求头按用户隔离会话与记忆数据。
 
 ## 技术栈
@@ -106,7 +106,7 @@ docker compose up --build
 | `VARIFLIGHT_API_KEY` | variflight 官方 API Key（X-API-Key 认证） | 空 |
 | `UAPIS_API_KEY` | UAPIS 令牌（节假日/翻译/热榜/菜谱/营养） | 空 |
 | `TAVILY_API_KEY` | Tavily API Key（搜索/网页提取） | 空 |
-| `AMAP_API_KEY` | 高德 Web 服务 Key（POI/天气） | 空 |
+| `AMAP_API_KEY` | 高德 Web 服务 Key（POI/天气/推荐菜） | 空 |
 | `DB_PATH` | SQLite 数据库文件路径 | `app.db` |
 
 ## API 概览

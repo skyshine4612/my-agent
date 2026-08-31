@@ -116,9 +116,14 @@ class AmapWebDataSource(HttpDataSource):
         resp.raise_for_status()
         return resp.json()
 
-    async def search_poi(self, keywords: str, city: str | None = None, **kw) -> list[dict]:
-        """按关键字搜索 POI（place/text）。"""
-        params = {"keywords": keywords, "output": "json", "offset": 20, "extensions": "base"}
+    async def search_poi(self, keywords: str | None = None, city: str | None = None,
+                         types: str | None = None, **kw) -> list[dict]:
+        """按关键字或分类码搜索 POI（place/text）。types 为高德分类码（如 110000 风景名胜）。"""
+        params = {"output": "json", "offset": 20, "extensions": "base"}
+        if keywords:
+            params["keywords"] = keywords
+        if types:
+            params["types"] = types
         if city:
             params["city"] = city
         data = await self._get("/v3/place/text", params)
@@ -128,3 +133,20 @@ class AmapWebDataSource(HttpDataSource):
         """查询城市未来天气（weather extensions=all，city 支持中文名或 adcode）。"""
         data = await self._get("/v3/weather/weatherInfo", {"city": city, "extensions": "all"})
         return parse_weather(data, days)
+
+    async def get_poi_detail(self, poi_id: str) -> dict:
+        """按 POI id 查详情，返回名称/地址/推荐菜标签（place/detail 的 tag 字段）。"""
+        data = await self._get("/v3/place/detail", {"id": poi_id})
+        pois = data.get("pois", [])
+        if not pois:
+            return {"error": "未找到该 POI"}
+        p = pois[0]
+        tag = p.get("tag", "")
+        # tag 可能是空数组 []（无推荐菜的 POI），统一兜底成「无推荐菜信息」，避免 Agent 拿到空数组反复重试
+        if not tag or not isinstance(tag, str):
+            tag = "无推荐菜信息"
+        return {
+            "name": p.get("name"),
+            "address": p.get("address"),
+            "tag": tag,
+        }

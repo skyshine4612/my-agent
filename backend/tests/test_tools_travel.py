@@ -3,7 +3,7 @@
 import pytest
 
 from app.tools.travel import (
-    make_poi_search,
+    make_poi_search, make_poi_detail,
     make_train_ticket_query, make_flight_query,
 )
 
@@ -12,6 +12,9 @@ class FakeDS:
     """高德数据源假实现：返回固定 POI。"""
     async def search_poi(self, keywords, city, **kw):
         return [{"name": "宽窄巷子", "location": {"lng": 1, "lat": 1}, "price": 0}]
+
+    async def get_poi_detail(self, poi_id):
+        return {"name": "宽窄巷子", "address": "成都", "tag": "龙井虾仁,脆皮大肠"}
 
 
 class FakeTrainDS:
@@ -39,6 +42,13 @@ async def test_poi_search_without_city():
     fn = make_poi_search(FakeDS())
     pois = await fn(keywords="景点")
     assert pois[0]["name"] == "宽窄巷子"
+
+
+@pytest.mark.asyncio
+async def test_poi_detail():
+    fn = make_poi_detail(FakeDS())
+    r = await fn(id="B001")
+    assert r["tag"] == "龙井虾仁,脆皮大肠"
 
 
 @pytest.mark.asyncio

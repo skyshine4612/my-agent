@@ -112,6 +112,7 @@ class AgentService:
         tools: list[dict] = []
         hard_results: list[str] = []
         pending_calls: list[dict] = []  # 待配对的 tool_call（工具并行执行时按 tool_call_id 匹配回 result）
+        loaded_skill_names: list[str] = []  # 本轮 get_skill 加载过的业务名（供 critic 修正时注入规则正文，保住输出格式）
 
         async def emit(event):
             # 把 run_stream 的内部事件原样塞进队列，供下方循环实时转 SSE
@@ -142,6 +143,11 @@ class AgentService:
                     # label 一并入队，随 tools 持久化，供前端历史气泡还原中文名
                     label = ev.get("label", ev["tool"])
                     pending_calls.append({"tool": ev["tool"], "args": ev["args"], "id": ev["id"], "label": label})
+                    # 记录 get_skill 加载的业务，供 critic 修正时注入规则正文（保住输出格式约束）
+                    if ev["tool"] == "get_skill":
+                        args = ev.get("args") or {}
+                        if isinstance(args, dict) and args.get("name"):
+                            loaded_skill_names.append(args["name"])
                     # id/label 一并下发给前端：同名工具并发时前端也能按 id 精确配对 summary，不串
                     yield {"type": "tool_call", "tool": ev["tool"], "args": ev["args"], "id": ev["id"], "label": label}
                 elif etype == "tool_result":
@@ -186,10 +192,17 @@ class AgentService:
                 # 修正 prompt 只喂 {tool,args,summary} 事实依据，剥离展示用的 label，避免噪音
                 tool_results_text = json.dumps(
                     [{k: v for k, v in t.items() if k != "label"} for t in tools], ensure_ascii=False)
+                # 注入本轮 get_skill 加载过的业务规则正文，保住「输出格式」等约束
+                # （critic 修正走 complete 不重新调 get_skill，正文会丢）
+                skill_guide = "\n\n".join(
+                    f"【{s['name']} 业务规则】\n{s['body']}"
+                    for s in self.skills if s["name"] in loaded_skill_names
+                )
                 correction_prompt = (
                     f"原始问题：{message}\n\n"
                     f"以下是本轮已经查询到的工具结果（事实依据，请严格基于这些，不要编造）：\n{tool_results_text}\n\n"
-                    f"请基于以上工具结果直接输出修正后的最终答案（中文 Markdown）。"
+                    + (f"以下是本业务的规划规则与输出格式，修正后的答案必须同样遵守：\n{skill_guide}\n\n" if skill_guide else "")
+                    + f"请基于以上工具结果直接输出修正后的最终答案（中文 Markdown）。"
                     f"用户明确询问但工具没查到的关键信息，如实说明「该信息未查到」，不要编造；用户没问的字段不要罗列缺失。\n"
                     f"修正要点：\n{json.dumps(issues, ensure_ascii=False)}"
                 )
@@ -200,13 +213,15 @@ class AgentService:
                 ])
                 logger.info("[service] 修正答案完成，耗时 %.1fs，%d 字", time.perf_counter() - t0, len(answer))
 
-        # 8.5 流式输出最终答案：拆小块逐块上发（此时已过 critic 校验，保证只输出一段干净答案）
+        # 8.5 先落库完整答案（流式输出之前）：即使客户端中途刷新、SSE 流被中断，
+        #     历史里也已存有本轮完整回复，刷新后能恢复（与主流对话产品一致，避免「中途刷新回复丢失」）
+        await self.conv.add_message(conv_id, "assistant",
+                                    json.dumps({"content": answer, "tools": tools}, ensure_ascii=False))
+
+        # 9. 流式输出最终答案：拆小块逐块上发（此时已过 critic 校验，保证只输出一段干净答案）
         for j in range(0, len(answer), 40):
             yield {"type": "token", "content": answer[j:j + 40]}
 
-        # 9. 持久化：markdown 内容 + 本轮工具调用记录，作为结构化 JSON 落库 assistant 消息
-        await self.conv.add_message(conv_id, "assistant",
-                                    json.dumps({"content": answer, "tools": tools}, ensure_ascii=False))
         # 10. 异步提炼长期记忆（fire-and-forget，不影响主流程返回）
         asyncio.create_task(self._extract_facts(user_id, conv_id))
         yield {"type": "done"}

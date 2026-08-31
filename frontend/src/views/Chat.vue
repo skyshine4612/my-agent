@@ -78,8 +78,9 @@ async function send(text: string) {
     await chatStream(t, convStore.currentId, (ev: any) => {
       switch (ev.type) {
         case 'conversation_id':
-          // 首次对话拿到会话 id，记住并刷新侧栏
+          // 首次对话拿到会话 id：记住 + 持久化到 localStorage（刷新后能恢复这个会话）+ 刷新侧栏
           convStore.currentId = ev.conversation_id
+          localStorage.setItem('current_conv_id', ev.conversation_id)
           refreshConversations()
           break
         case 'status':

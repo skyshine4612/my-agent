@@ -24,7 +24,7 @@ class Agent:
     system_prompt: str
     tools: list[str] = field(default_factory=list)
     llm: object = None
-    max_iters: int = 10
+    max_iters: int = 20
 
     async def run_stream(self, user_message, history, registry, on_event=None):
         """以流式方式执行一次完整 ReAct 循环，返回最终累积文本答复。
@@ -108,7 +108,8 @@ class Agent:
                 text = full
                 if len(text) > 4000:
                     text = text[:4000] + "[已截断]"
-                logger.info("[Agent:%s] 工具 %s 返回 %.120s", self.name, fn["name"], text)
+                logger.info("[Agent:%s] 工具 %s(%s) 返回 %.120s", self.name, fn["name"],
+                            json.dumps(args, ensure_ascii=False)[:60], text)
                 await emit({"type": "tool_result", "agent": self.name, "tool": fn["name"],
                             "summary": text[:120], "full": full, "id": tc["id"], "label": registry.label(fn["name"])})
                 # 返回带 tool_call_id 的回填项，供上层按原始顺序组装 tool 消息
@@ -118,8 +119,11 @@ class Agent:
             # 5.5 按 tool_calls 原始顺序回填 tool 消息：gather 已保序，这里按序追加即保证 tool_call_id 对齐
             for r in results:
                 messages.append({"role": "tool", "tool_call_id": r["tool_call_id"], "content": r["content"]})
-        # 6. 达到 max_iters 仍未收敛（每轮都在调工具）时，兜底返回累积文本
-        return full_text
+        # 6. 达到 max_iters 仍未收敛（每轮都在调工具）时兜底返回：
+        #    有累积文本就用累积文本，否则给一句非空提示，避免最终输出空串
+        if full_text:
+            return full_text
+        return "抱歉，本轮查询了较多信息但未能整合成完整回答，请换个方式或精简需求后再试。"
 
 
 class WorkingMemory:

@@ -5,7 +5,7 @@ import json
 import logging
 import time
 
-from app.core.prompts import load_prompt
+from app.core.prompts import load_prompt, today_hint
 
 logger = logging.getLogger(__name__)
 
@@ -22,8 +22,9 @@ async def run_critic(llm, tool_results: str, answer: str) -> dict:
         解析失败时兜底 {"ok": True, "issues": []}（宁可放过，不因校验器故障阻塞主流程）。
     """
     system = load_prompt("critic")
-    # 事实依据（工具结果）放前、待校验回答放后，让 critic 逐条比对
-    user = f"工具结果：\n{tool_results}\n\n待校验回答：\n{answer}"
+    # 事实依据（工具结果）放前、待校验回答放后，让 critic 逐条比对；
+    # 注入今天日期，避免 critic 用训练数据里的旧年份误判「当前年份」的数据为「未来/非当前」
+    user = f"{today_hint()}\n工具结果：\n{tool_results}\n\n待校验回答：\n{answer}"
     start = time.perf_counter()
     logger.info("[critic] 开始事实校验：工具结果 %d 字、回答 %d 字", len(tool_results), len(answer))
     try:
@@ -42,8 +43,25 @@ async def run_critic(llm, tool_results: str, answer: str) -> dict:
         logger.info("[critic] 校验完成，耗时 %.1fs，判定结果解析失败，按通过处理", elapsed)
         return {"ok": True, "issues": []}
     result = {"ok": bool(data.get("ok", True)), "issues": data.get("issues", [])}
-    logger.info("[critic] 校验完成，耗时 %.1fs，ok=%s，issue %d 条",
-                elapsed, result["ok"], len(result["issues"]))
+    # 过滤「correction 为空」的 issue：critic 自己都填不出「怎么改」的，大概率是误报
+    # （把一致的声明/格式差异硬凑成问题），不能据此触发修正，否则会把正确答案改坏。
+    raw_issues = result.get("issues", [])
+    valid_issues = [i for i in raw_issues
+                    if isinstance(i, dict) and str(i.get("correction", "")).strip()]
+    if raw_issues and not valid_issues:
+        result = {"ok": True, "issues": []}
+    else:
+        result = {"ok": bool(data.get("ok", True)), "issues": valid_issues}
+    logger.info("[critic] 校验完成，耗时 %.1fs，ok=%s，issue %d 条（过滤无效 %d 条）",
+                elapsed, result["ok"], len(result["issues"]), len(raw_issues) - len(valid_issues))
+    if not result["ok"]:
+        # 逐条打印问题详情，便于排查为什么判定不通过
+        for i, issue in enumerate(result["issues"][:10], 1):
+            logger.info("[critic]   issue #%d: claim=%s | problem=%s | correction=%s",
+                        i,
+                        str(issue.get("claim", ""))[:100],
+                        str(issue.get("problem", ""))[:60],
+                        str(issue.get("correction", ""))[:60])
     return result
 
 
