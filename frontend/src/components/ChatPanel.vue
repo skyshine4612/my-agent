@@ -1,7 +1,7 @@
 <script setup lang="ts">
 // ChatPanel.vue —— 通用对话面板：渲染 markdown 消息流 + 工具气泡 + 底部输入框
 import { ref } from 'vue'
-import { Promotion } from '@element-plus/icons-vue'
+import { Promotion, Collection } from '@element-plus/icons-vue'
 import { marked } from 'marked'
 import DOMPurify from 'dompurify'
 import type { ChatMessage, ToolEvent } from '@/types'
@@ -10,7 +10,7 @@ import type { ChatMessage, ToolEvent } from '@/types'
 // streaming：是否在流式请求中（禁用输入）；thinking：是否在等待助手首字（显示呼吸点）
 // phase：工具调用完成后的阶段文案（整理答案/核对事实/修正答案），空串表示不在这些阶段
 const props = defineProps<{ messages: ChatMessage[]; streaming: boolean; thinking: boolean; phase: string }>()
-const emit = defineEmits<{ send: [text: string] }>()
+const emit = defineEmits<{ send: [text: string]; 'open-memory': [] }>()
 
 // 输入框草稿
 const draft = ref('')
@@ -91,6 +91,13 @@ function toolLabel(t: ToolEvent, done: boolean): string {
         placeholder="描述你的问题，回车发送…"
         :disabled="props.streaming"
         @keydown.enter.exact.prevent="submit"
+      />
+      <el-button
+        class="chat-panel__memory"
+        :icon="Collection"
+        circle
+        title="记忆"
+        @click="emit('open-memory')"
       />
       <el-button
         class="chat-panel__send"
@@ -318,6 +325,9 @@ function toolLabel(t: ToolEvent, done: boolean): string {
   background: var(--bg);
 }
 .chat-panel__send {
+  flex-shrink: 0;
+}
+.chat-panel__memory {
   flex-shrink: 0;
 }
 </style>

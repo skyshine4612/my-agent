@@ -1,7 +1,6 @@
 # app/services/agent_service.py
-# 多业务通用 service：把记忆（会话 + 长期）、LLM、数据源、业务工具
+# 多业务通用 service：把会话历史、短期记忆、长期记忆、LLM、数据源、业务工具
 # 串成一个完整的 AgentService，对外提供 SSE 流式对话 chat_stream 与长期记忆异步提炼。
-# 替代旧的 trip_service（旅行专用「规划 → 澄清/执行 → 三套方案」链路）。
 import asyncio
 import difflib
 import json
@@ -12,13 +11,13 @@ from app.config import settings
 from app.core.agent import Agent
 from app.core.critic import run_critic
 from app.core.llm import get_llm
-from app.core.memory import ConversationStore, LongTermMemory
+from app.core.memory import ConversationStore, LongTermMemory, ShortTermMemory
 from app.core.prompts import load_prompt, render_system_prompt, today_hint
 from app.core.registry import ToolRegistry
 from app.core.skills import load_skills
+from app.datasource.amap_web import AmapWebDataSource
 from app.tools import register_all_tools
 from app.tools.sub_agent import make_call_sub_agent
-from app.datasource.amap_web import AmapWebDataSource
 
 logger = logging.getLogger(__name__)
 
@@ -33,16 +32,17 @@ def _similar(a: str, b: str, threshold: float = 0.7) -> bool:
 
 
 class AgentService:
-    """多业务通用 service：装配会话/长期记忆 + LLM + 数据源，驱动「通用 agent → 工具 → critic 校验」链路。
+    """多业务通用 service：装配会话历史 + 短期/长期记忆 + LLM + 数据源，驱动「通用 agent → 工具 → critic 校验」链路。
 
     单层架构 + 标准 skill 两段式：顶层 agent 直接调用各业务工具（不再委派子 agent）；
     system prompt 只注入「可用业务清单」（name+description），业务规则正文由 get_skill 工具按需加载。
     """
 
     def __init__(self):
-        # 会话 + 长期记忆，共享同一 SQLite（路径可配置，容器内挂载 ./data）
-        self.conv = ConversationStore(settings.db_path)
-        self.ltm = LongTermMemory(settings.db_path)
+        # 会话历史 + 短期记忆 + 长期记忆，共享同一 SQLite（路径可配置，容器内挂载 ./data）
+        self.conversation_store = ConversationStore(settings.db_path)
+        self.short_term_memory = ShortTermMemory(settings.db_path)
+        self.long_term_memory = LongTermMemory(settings.db_path)
         # LLM 客户端
         self.llm = get_llm()
         # 加载 skills 清单（name/description/body）：name+description 进 system prompt，body 由 get_skill 按需加载
@@ -58,10 +58,22 @@ class AgentService:
         registry = ToolRegistry()
         amap_web_ds = AmapWebDataSource()  # 高德数据源只 new 一次，旅行/通用工具共享
         register_all_tools(registry, amap_web_ds, [s["name"] for s in self.skills])
-        # 注册 call_sub_agent（子 Agent 委派，需要 llm + skill 清单，只能在 service 层注册）
-        sub_agent_fn = make_call_sub_agent(self.llm, registry, [s["name"] for s in self.skills])
-        registry.register("call_sub_agent", sub_agent_fn.description, sub_agent_fn.parameters, sub_agent_fn, "委派子任务")
+        # 注册 call_sub_agent（子 Agent 委派，需要 llm + skill 清单 + 短期记忆，只能在 service 层注册）
+        sub_agent_fn = make_call_sub_agent(self.llm, registry, [s["name"] for s in self.skills],
+                                           self.short_term_memory, settings.llm_context_budget)
+        registry.register("call_sub_agent", sub_agent_fn.description, sub_agent_fn.parameters, sub_agent_fn,
+                          "委派子任务")
         return registry
+
+    async def delete_conversation(self, user_id, conv_id):
+        """删除会话及其消息，并清理该会话的短期记忆；归属校验失败返回 False。
+
+        子会话的短期记忆由子任务结束时各自清理，这里只清主会话自身（conversation_id = conv_id）。
+        """
+        ok = await self.conversation_store.delete_conversation(user_id, conv_id)
+        if ok:
+            await self.short_term_memory.clear_conversation(conv_id)
+        return ok
 
     async def chat_stream(self, user_id, conv_id, message):
         """SSE 流式对话主流程，依次产出事件：conversation_id → token/tool_call/tool_result → done。
@@ -71,18 +83,18 @@ class AgentService:
         logger.info("[service] 收到请求，user=%s，消息：%.60s", user_id, message)
         # 1. 无会话则新建（首次对话），并先回传 conversation_id 让前端记住会话。
         #    写路径归属校验：客户端传入他人 conv_id 时当作首次对话重建，杜绝跨用户写入。
-        if conv_id is None or not await self.conv.belongs_to(user_id, conv_id):
-            conv_id = await self.conv.create_conversation(user_id)
-            await self.conv.update_title(conv_id, message[:20])
+        if conv_id is None or not await self.conversation_store.belongs_to(user_id, conv_id):
+            conv_id = await self.conversation_store.create_conversation(user_id)
+            await self.conversation_store.update_title(conv_id, message[:20])
         yield {"type": "conversation_id", "conversation_id": conv_id}
         # 2. 落库本轮用户消息
-        await self.conv.add_message(conv_id, "user", message)
-        # 3. LTM 召回：按 importance 降序取前 20 条，拼成「用户历史偏好」注入 system 上下文
-        facts = await self.ltm.recall(user_id, top_n=20)
-        fact_hint = "用户历史偏好：" + "；".join(f["fact"] for f in facts) if facts else ""
+        await self.conversation_store.add_message(conv_id, "user", message)
+        # 3. 长期记忆召回：按 importance 降序取前 20 条（单条已截断），拼成 long_term_hint 注入 system 上下文
+        facts = await self.long_term_memory.recall(user_id, top_n=20)
+        long_term_hint = "用户历史偏好：" + "；".join(f["fact"] for f in facts) if facts else ""
         # 4. 组装历史：assistant 消息若是落库的 JSON {"content","tools"} 结构则取 content（markdown），
-        #    user 消息原文；压缩交给 run_stream 内的 WorkingMemory，本层不手动压缩。
-        raw_history = await self.conv.get_history(user_id, conv_id)
+        #    user 消息原文；压缩交给 run_stream 内的工作记忆预算淘汰，本层不手动压缩。
+        raw_history = await self.conversation_store.get_history(user_id, conv_id)
         history = []
         for h in raw_history:
             if h["role"] == "user":
@@ -106,8 +118,8 @@ class AgentService:
         skill_directory = "\n".join(f"- {s['name']}：{s['description']}" for s in self.skills)
         system = render_system_prompt(skill_directory, tool_grounding)
         system += "\n" + today_hint()
-        if fact_hint:
-            system += "\n" + fact_hint
+        if long_term_hint:
+            system += "\n" + long_term_hint
         agent = Agent(name="assistant", system_prompt=system, tools=registry.list_names(), llm=self.llm)
 
         # 7. 跑 run_stream：on_event 把事件塞队列，主循环消费队列转 SSE。
@@ -125,7 +137,11 @@ class AgentService:
         async def generate(user_message):
             # 真正执行一轮 agent 生成；结束时放 None 作为队列终止标记
             try:
-                return await agent.run_stream(user_message, history, registry, on_event=emit)
+                return await agent.run_stream(
+                    user_message, history, registry, on_event=emit,
+                    short_term_memory=self.short_term_memory, conversation_id=conv_id,
+                    context_budget=settings.llm_context_budget,
+                )
             finally:
                 await queue.put(None)
 
@@ -203,12 +219,13 @@ class AgentService:
                     for s in self.skills if s["name"] in loaded_skill_names
                 )
                 correction_prompt = (
-                    f"原始问题：{message}\n\n"
-                    f"以下是本轮已经查询到的工具结果（事实依据，请严格基于这些，不要编造）：\n{tool_results_text}\n\n"
-                    + (f"以下是本业务的规划规则与输出格式，修正后的答案必须同样遵守：\n{skill_guide}\n\n" if skill_guide else "")
-                    + f"请基于以上工具结果直接输出修正后的最终答案（中文 Markdown）。"
-                    f"用户明确询问但工具没查到的关键信息，如实说明「该信息未查到」，不要编造；用户没问的字段不要罗列缺失。\n"
-                    f"修正要点：\n{json.dumps(issues, ensure_ascii=False)}"
+                        f"原始问题：{message}\n\n"
+                        f"以下是本轮已经查询到的工具结果（事实依据，请严格基于这些，不要编造）：\n{tool_results_text}\n\n"
+                        + (
+                            f"以下是本业务的规划规则与输出格式，修正后的答案必须同样遵守：\n{skill_guide}\n\n" if skill_guide else "")
+                        + f"请基于以上工具结果直接输出修正后的最终答案（中文 Markdown）。"
+                          f"用户明确询问但工具没查到的关键信息，如实说明「该信息未查到」，不要编造；用户没问的字段不要罗列缺失。\n"
+                          f"修正要点：\n{json.dumps(issues, ensure_ascii=False)}"
                 )
                 t0 = time.perf_counter()
                 answer = await self.llm.complete([
@@ -219,8 +236,8 @@ class AgentService:
 
         # 8.5 先落库完整答案（流式输出之前）：即使客户端中途刷新、SSE 流被中断，
         #     历史里也已存有本轮完整回复，刷新后能恢复（与主流对话产品一致，避免「中途刷新回复丢失」）
-        await self.conv.add_message(conv_id, "assistant",
-                                    json.dumps({"content": answer, "tools": tools}, ensure_ascii=False))
+        await self.conversation_store.add_message(conv_id, "assistant",
+                                                  json.dumps({"content": answer, "tools": tools}, ensure_ascii=False))
 
         # 9. 流式输出最终答案：拆小块逐块上发（此时已过 critic 校验，保证只输出一段干净答案）
         for j in range(0, len(answer), 40):
@@ -237,7 +254,7 @@ class AgentService:
         去重：新 fact 与已有 fact 语义相近时，提升已有 fact 的 importance 而非新增重复条目。
         """
         try:
-            msgs = await self.conv.get_history(user_id, conv_id)
+            msgs = await self.conversation_store.get_history(user_id, conv_id)
             user_msgs = [m for m in msgs if m["role"] == "user"]
             if not user_msgs:
                 return
@@ -249,7 +266,7 @@ class AgentService:
             new_facts = data.get("facts", [])
             if not new_facts:
                 return
-            existing = await self.ltm.get_all(user_id)
+            existing = await self.long_term_memory.get_all(user_id)
             to_add = []
             for nf in new_facts:
                 fact_text = nf.get("fact", "")
@@ -257,12 +274,12 @@ class AgentService:
                 # 语义去重：与已有 fact 相似则更新其 importance（取较大值），否则标记为新增
                 matched = next((ex for ex in existing if _similar(fact_text, ex["fact"])), None)
                 if matched:
-                    await self.ltm.update_importance(user_id, matched["fact"],
-                                                     max(matched["importance"], importance))
+                    await self.long_term_memory.update_importance(user_id, matched["fact"],
+                                                                  max(matched["importance"], importance))
                 else:
                     to_add.append(nf)
             if to_add:
-                await self.ltm.add_facts(user_id, to_add)
+                await self.long_term_memory.add_facts(user_id, to_add)
         except Exception as e:
             # 提炼失败不影响主对话流程，记录 warning 便于发现数据质量回归
             # （如 LLM 返回字符串型 importance 触发 max(float, str) 的 TypeError 也会走到这里）

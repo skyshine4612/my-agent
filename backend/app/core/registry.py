@@ -32,6 +32,7 @@ class ToolRegistry:
         - to_openai_schemas：把指定名字的工具转成 OpenAI function calling schema 列表
         - call：按名字执行工具，兼容同步/异步函数，统一返回字符串
     """
+
     def __init__(self):
         # 内部字典：工具名 → Tool 对象
         self._tools = {}
@@ -60,16 +61,25 @@ class ToolRegistry:
         """把指定名字的工具转成 OpenAI function calling 的 schema 列表。"""
         # 遍历请求的名字，仅保留已注册的工具，逐个转成 {"type":"function","function":{...}} 结构
         return [{"type": "function", "function": {"name": t.name, "description": t.description,
-                "parameters": t.parameters}} for n in names if (t := self._tools.get(n))]
+                                                  "parameters": t.parameters}} for n in names if
+                (t := self._tools.get(n))]
 
-    async def call(self, name, arguments) -> str:
-        """执行工具，支持同步/异步函数，统一返回字符串结果。"""
-        # 按名字取出工具对象
+    async def call_raw(self, name, arguments):
+        """执行工具并返回结构化原始结果（dict/list/str 等），不做 str() 转换。
+
+        供 run_tool 做结构化截断使用：拿到原始结构才能按类型截断（list 前 3 条 / dict 前 10 键），
+        而 `str()` 会把结构信息压平丢失。
+        """
         t = self._tools[name]
         # 解包参数字典调用工具函数，拿到原始结果（可能是普通值，也可能是协程）
         res = t.fn(**arguments)
         # 若结果是可等待对象（协程/异步函数），则 await 取出真实结果
         if inspect.isawaitable(res):
             res = await res
+        return res
+
+    async def call(self, name, arguments) -> str:
+        """执行工具，支持同步/异步函数，统一返回字符串结果（委托 call_raw 后 str()）。"""
+        res = await self.call_raw(name, arguments)
         # 统一转成字符串返回，方便 LLM 后续把观察结果回填进对话
         return str(res)

@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 多业务对话式 Agent 平台，前后端分离：
 
-- **backend/**：FastAPI 应用，实现「通用 ReAct agent → 工具调用 → critic 事实校验」链路。真实数据：高德（POI/天气/推荐菜，Web 服务 API）、节假日/翻译/热榜/菜谱/营养（UAPIS）、搜索（Tavily）经 HTTP 直连；12306 火车票经 ModelScope 托管 MCP；机票直连 variflight 官方 MCP，LLM 默认接阿里云百炼 DashScope（`qwen-plus`）。
+- **backend/**：FastAPI 应用，实现「通用 ReAct agent → 工具调用 → critic 事实校验」链路。真实数据：高德（POI/推荐菜，Web 服务 API）、天气/节假日/翻译/热榜/菜谱/营养（UAPIS，天气最多 7 天预报）、搜索（Tavily）经 HTTP 直连；12306 火车票经 ModelScope 托管 MCP；机票直连 variflight 官方 MCP，LLM 默认接阿里云百炼 DashScope（`qwen-plus`）。
 - **frontend/**：Vue 3 + Vite + Element Plus + Pinia 的单页应用，通用对话界面（会话列表 + 流式聊天 + 工具调用气泡）。
 
 架构已从「旅行专用」链路收敛为「通用 agent + 标准 skill」两段式（见下）。
@@ -49,12 +49,12 @@ docker compose up --build   # 前端 nginx 对外 :80，反代 /api → backend:
 路由层                    service 编排层                    核心执行层
 api/routes/chat.py  →  services/agent_service.py  →  core/agent.py (ReAct 循环)
   POST /api/agent/chat    AgentService.chat_stream         Agent.run_stream
-  (SSE 流)                装配记忆/LLM/工具/技能              → core/registry.py (工具执行)
+  (SSE 流)                装配会话历史/短期·长期记忆/LLM/工具/技能  → core/registry.py (工具执行)
                           + critic 校验 + LTM 提炼            → core/llm.py (LLM 客户端)
 ```
 
 - **`app/services/agent_service.py`**：核心编排器，进程级单例 `service`（路由层直接 `import` 复用）。`chat_stream` 依次做：会话归属校验/新建 → 落库用户消息 → LTM 召回偏好 → 组装历史 → 注入 system prompt（含可用业务清单 + 事实规范 + 今天日期）→ 驱动 `Agent.run_stream` → critic 校验 → 落库结构化 assistant 消息 → 流式输出答案 → fire-and-forget 提炼长期记忆。
-- **`app/core/agent.py`**：`Agent.run_stream` 实现 ReAct 循环（LLM 决策 → 工具调用 → 回填结果 → 再决策，最多 `max_iters=20` 轮）。同一轮多个 tool_calls 用 `asyncio.gather` 并行执行；工具结果按 4000 字符截断并加 `[已截断]` 标记（`full` 字段保留截断前完整结果供 critic 用）。`WorkingMemory` 在上下文超预算时把最早一批消息蒸馏成摘要（非简单丢弃）。
+- **`app/core/agent.py`**：`Agent.run_stream` 实现 ReAct 循环（LLM 决策 → 工具调用 → 回填结果 → 再决策，最多 `max_iters=20` 轮）。同一轮多个 tool_calls 用 `asyncio.gather` 并行执行；工具结果用 `call_raw` 拿结构化原始结果后做结构化截断（list 前 3 / dict 前 10 键 / str 2000，`full` 字段保留完整结果供 critic 用），同时写短期记忆。工作记忆的 token 预算淘汰委托给 `core/memory/working.py` 的 `WorkingMemory`。
 - **`app/core/registry.py`**：`ToolRegistry` 统一管理工具元信息（name/description/parameters/fn/label），转成 OpenAI function-calling schema 供 LLM 决策，并执行同步/异步工具函数。
 - **`app/core/llm.py`**：`LLMClient` 抽象（`chat`/`complete`/`stream_chat` 三方法）+ `OpenAICompatLLM`（DashScope）+ `FallbackLLM`（无 key 兜底）+ `get_llm()` 单例工厂。
 - **`app/core/critic.py`**：`run_critic` 事实校验专家——用 LLM（`response_format={"type":"json_object"}`）比对「工具结果 vs 回答」，输出 `{ok, issues}`；注入当天日期避免年份误判，并过滤「correction 为空」的误报 issue（critic 填不出怎么改的，视为误报）。
@@ -77,11 +77,14 @@ api/routes/chat.py  →  services/agent_service.py  →  core/agent.py (ReAct �
 
 8. **配置**：`app/config.py` 用 pydantic-settings 从 `backend/.env` 读取（`LLM_*`、`MODELSCOPE_TOKEN`、各 `*_MCP_URL`、`UAPIS_API_KEY`、`TAVILY_API_KEY`、`AMAP_API_KEY`、`VARIFLIGHT_API_KEY`、`DB_PATH`）。容器内通过 compose 挂载 `./backend/.env` 到 `/app/.env`，密钥类参数不写进 compose。
 
-9. **子 Agent 委派（上下文隔离）**（`tools/sub_agent.py`）：顶层 agent 可用 `call_sub_agent` 工具把复杂子任务（如查交通、查景点）委派给独立上下文的子 Agent——子 Agent 历史为空、只吃 `task`，业务规则由它按需 `get_skill` 加载，跑完只回传最终答案摘要，主 agent 的上下文不被大量工具结果淹没。子 Agent 内部工具调用不上报前端（`on_event=None`），前端只显示「委派子任务」一个气泡。当前为单层委派（子 Agent 工具集不含 `call_sub_agent`，避免无限下钻）。
+9. **子 Agent 委派（上下文隔离）**（`tools/sub_agent.py`）：顶层 agent 可用 `call_sub_agent` 工具把复杂子任务（如查交通、查景点）委派给独立上下文的子 Agent——子 Agent 历史为空、只吃 `task`，业务规则由它按需 `get_skill` 加载，跑完只回传最终答案摘要，主 agent 的上下文不被大量工具结果淹没。子 Agent 内部工具调用不上报前端（`on_event=None`），前端只显示「委派子任务」一个气泡。当前为单层委派（子 Agent 工具集不含 `call_sub_agent`，避免无限下钻）。子 Agent 分配独立 `sub_conversation_id`（uuid）隔离短期记忆，任务结束（含异常）即清理，不与主会话/其他子 Agent 串扰。
+
+10. **三层记忆 + token 预算 + 三层压缩**（`core/memory/` 包）：工作记忆（上下文窗口，内存，每次问答即丢）+ 短期记忆（`short_term_memory` 表，按 `conversation_id` 隔离，存已查工具摘要防重查）+ 长期记忆（`long_term_memory` 表，按 `user_id` 跨会话）+ 会话历史（`conversation.py`）。工作记忆超 token 预算（`llm_context_budget`）时三层压缩：① 工具结果结构化截断；② 成对淘汰最老 assistant+tool 交互；③ 被淘汰单元批量 LLM 蒸馏成 `[早期交互摘要]` 兜底（不裸删）。短期记忆写入 UPSERT 去重（同 `tool_name+args` 覆盖）、summary 一句话级（结构化截断为主，大结果 LLM 精炼），注入 `short_term_hint` 全量极简清单。命名约定：工作/短期/长期记忆用 `working`/`short_term`/`long_term`，会话历史用 `conversation`，禁止 `session` 等混用。
 
 ### 前端结构
 
 - `views/Chat.vue`：主界面，负责 SSE 事件分发（`conversation_id`/`token`/`tool_call`/`tool_result`/`status`/`done`）与会话管理。
+- 记忆以弹窗形式内置于 `views/Chat.vue`：输入框旁「记忆」入口，`el-tabs` 切换长期记忆（跨会话偏好）与短期记忆（当前会话已查工具清单）。
 - `components/ChatPanel.vue`：渲染 markdown（`marked` + `DOMPurify` 防 XSS）+ 工具气泡 + 输入框。
 - `services/sse.ts`：手写 `fetch` 流式解析 SSE（规范化换行后按 `\n\n` 分帧，处理多字节字符切断）。
 - `services/api.ts`：axios 封装，统一注入 `X-User-Id`。

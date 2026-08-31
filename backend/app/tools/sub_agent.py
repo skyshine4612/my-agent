@@ -3,18 +3,24 @@
 
 核心价值是「上下文隔离」：子 Agent 历史为空、只吃 task，跑完只回传摘要，
 主 Agent 的上下文不被几十万字的原始工具结果淹没。
+
+短期记忆按子任务隔离：每个子 Agent 分配独立的 sub_conversation_id（uuid），
+子任务内的工具摘要全写在这个子会话下，不与主会话、其他子 Agent 串扰；任务结束即清理。
 """
+import uuid
+
 from app.core.agent import Agent
 from app.core.prompts import load_prompt, today_hint
 
 
-def make_call_sub_agent(llm, registry, skill_names):
+def make_call_sub_agent(llm, registry, skill_names, short_term_memory, context_budget):
     """构造 call_sub_agent 工具函数。
 
     子 Agent = 通用子助手：system prompt 含职责 + 可用业务清单 + 事实规范 + 日期；
     工具 = get_skill + 业务工具（排除 call_sub_agent 自己，避免递归委派）；
     规则由子 Agent 按需 get_skill 加载，主 Agent 委派时不指定 skill。
     """
+
     async def call_sub_agent(task: str) -> dict:
         """把复杂子任务交给独立上下文的子助手，返回其最终答案摘要。"""
         skill_directory = "\n".join(f"- {n}" for n in skill_names)
@@ -27,10 +33,19 @@ def make_call_sub_agent(llm, registry, skill_names):
         )
         # 子 Agent 的工具：全部工具排除 call_sub_agent 自身（一层委派，避免无限下钻）
         sub_tools = [t for t in registry.list_names() if t != "call_sub_agent"]
-        sub = Agent(name="sub", system_prompt=sub_system, tools=sub_tools, llm=llm)
-        # 隔离上下文：历史为空，只传 task；on_event=None 子 Agent 内部工具调用不上报前端
-        answer = await sub.run_stream(task, [], registry, on_event=None)
-        return {"answer": answer}
+        # 子会话 id：独立 uuid，短期记忆按子任务隔离，不混入主会话、不与其他子 Agent 冲突
+        sub_conversation_id = uuid.uuid4().hex
+        try:
+            sub = Agent(name="sub", system_prompt=sub_system, tools=sub_tools, llm=llm)
+            # 隔离上下文：历史为空，只传 task；on_event=None 子 Agent 内部工具调用不上报前端
+            answer = await sub.run_stream(task, [], registry, on_event=None,
+                                          short_term_memory=short_term_memory,
+                                          conversation_id=sub_conversation_id,
+                                          context_budget=context_budget)
+            return {"answer": answer}
+        finally:
+            # 子任务结束（含异常）清理子会话短期记忆，不留垃圾记录
+            await short_term_memory.clear_conversation(sub_conversation_id)
 
     call_sub_agent.__name__ = "call_sub_agent"
     call_sub_agent.description = (

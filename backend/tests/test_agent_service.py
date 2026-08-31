@@ -6,13 +6,14 @@ import json
 
 import pytest
 
-from app.tools import travel as travel_tools
 from app.config import settings
 from app.services.agent_service import AgentService
+from app.tools import travel as travel_tools
 
 
 class FakeStreamingLLM:
     """流式 LLM 假实现：stream_chat 固定吐一段文本后收尾（不调工具），chat/complete 兜底。"""
+
     async def stream_chat(self, messages, tools=None):
         yield {"type": "content", "text": "你好，成都"}
         yield {"type": "end", "tool_calls": None}
@@ -25,11 +26,12 @@ class FakeStreamingLLM:
 
 
 def test_service_assembles_and_tools_non_empty(tmp_path, monkeypatch):
-    """AgentService 装配成功（conv/ltm/llm/ds 就位），扁平工具注册表非空。"""
+    """AgentService 装配成功（会话历史/短期/长期记忆/llm/ds 就位），扁平工具注册表非空。"""
     monkeypatch.setattr(settings, "db_path", str(tmp_path / "svc.db"))
     svc = AgentService()
-    assert svc.conv is not None
-    assert svc.ltm is not None
+    assert svc.conversation_store is not None
+    assert svc.short_term_memory is not None
+    assert svc.long_term_memory is not None
     assert svc.llm is not None
     names = svc.registry.list_names()
     assert names, "工具注册表不应为空"
@@ -47,7 +49,8 @@ async def test_chat_stream_flow(tmp_path, monkeypatch):
 
     async def noop(user_id, conv_id):
         pass
-    svc._extract_facts = noop   # 摘掉异步 LTM 提炼，避免 fire-and-forget task 悬挂
+
+    svc._extract_facts = noop  # 摘掉异步 LTM 提炼，避免 fire-and-forget task 悬挂
 
     events = [e async for e in svc.chat_stream("u1", None, "成都三日游")]
     types = [e["type"] for e in events]
@@ -56,7 +59,7 @@ async def test_chat_stream_flow(tmp_path, monkeypatch):
     assert types[-1] == "done"
 
     conv_id = next(e["conversation_id"] for e in events if e["type"] == "conversation_id")
-    history = await svc.conv.get_history("u1", conv_id)
+    history = await svc.conversation_store.get_history("u1", conv_id)
     assert [h["role"] for h in history] == ["user", "assistant"]
     saved = json.loads(history[-1]["content"])
     assert saved["content"] == "你好，成都"
@@ -80,23 +83,25 @@ async def test_registry_built_once_and_reused_across_requests(tmp_path, monkeypa
 
     monkeypatch.setattr(travel_tools, "register_travel_tools", spy)
     svc = AgentService()
-    assert len(register_calls) == 1          # __init__ 只装配一次（数据源只 new 一次）
+    assert len(register_calls) == 1  # __init__ 只装配一次（数据源只 new 一次）
     cached = svc.registry
 
     svc.llm = FakeStreamingLLM()
 
     async def noop(user_id, conv_id):
         pass
+
     svc._extract_facts = noop
 
     [e async for e in svc.chat_stream("u1", None, "第一次请求")]
     [e async for e in svc.chat_stream("u1", None, "第二次请求")]
-    assert len(register_calls) == 1          # 两次 chat_stream 不再触发 register_tools
-    assert svc.registry is cached            # 复用同一个 registry 实例
+    assert len(register_calls) == 1  # 两次 chat_stream 不再触发 register_tools
+    assert svc.registry is cached  # 复用同一个 registry 实例
 
 
 class SameNameStreamLLM:
     """同名工具并行的流式 LLM 假实现：第一轮同时调用两个同名 poi_search（参数不同）。"""
+
     def __init__(self):
         self.i = 0
         self.turns = [
@@ -126,6 +131,7 @@ class SlowFastRegistry:
     并行执行时 tool_result 按「完成先后」返回：后调用（B）先完成。若按名或按队列
     顺序配对，会把 B 的结果错配到先调用的 A；只有按 tool_call_id 配对才不串。
     """
+
     def list_names(self):
         return ["poi_search"]
 
@@ -135,12 +141,12 @@ class SlowFastRegistry:
     def label(self, name):
         return name
 
-    async def call(self, name, args):
+    async def call_raw(self, name, args):
         kw = args.get("keywords", "")
         if kw == "景点A":
-            await asyncio.sleep(0.05)   # 先调用的工具慢，稍后才返回
+            await asyncio.sleep(0.05)  # 先调用的工具慢，稍后才返回
             return "结果A"
-        await asyncio.sleep(0.01)       # 后调用的工具快，先返回
+        await asyncio.sleep(0.01)  # 后调用的工具快，先返回
         return "结果B"
 
 
@@ -154,11 +160,12 @@ async def test_tool_result_pairs_by_call_id_same_name_parallel(tmp_path, monkeyp
 
     async def noop(user_id, conv_id):
         pass
+
     svc._extract_facts = noop
 
     events = [e async for e in svc.chat_stream("u1", None, "帮我搜两个景点")]
     conv_id = next(e["conversation_id"] for e in events if e["type"] == "conversation_id")
-    history = await svc.conv.get_history("u1", conv_id)
+    history = await svc.conversation_store.get_history("u1", conv_id)
     saved = json.loads(history[-1]["content"])
     tools = saved["tools"]
     # 两条同名工具都落库，且各自 summary 与入参一一对应（不被并发乱序串配）

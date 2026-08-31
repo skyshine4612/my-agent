@@ -10,6 +10,7 @@ def register_system_tools(registry, skill_names):
         registry:    ToolRegistry，工具注册表
         skill_names: 业务名列表（get_skill 的 name 参数 enum，约束 LLM 只能取已注册业务）
     """
+
     async def get_skill(name: str) -> str:
         """按业务名返回对应 skill 的规划规则正文；未知业务返回提示。"""
         body = get_skill_body(name)

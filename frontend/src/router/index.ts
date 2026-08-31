@@ -1,4 +1,4 @@
-// router/index.ts —— 前端路由：直接进入对话主界面（无需落地页）
+// router/index.ts —— 前端路由：直接进入对话主界面（记忆以弹窗形式内置，无需独立页面）
 import { createRouter, createWebHistory } from 'vue-router'
 import Chat from '@/views/Chat.vue'
 

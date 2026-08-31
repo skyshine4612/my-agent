@@ -6,10 +6,11 @@
 
 - **ReAct 推理-行动循环**：LLM 自主决策调用工具、并行执行、回填结果、再决策。
 - **事实校验回路（critic）**：调用硬数据工具（车票/机票/天气/节假日）后，自动比对回答与工具结果，发现编造事实时基于真实结果重写答案。
-- **真实数据源**：高德（POI/天气/推荐菜，Web 服务 API）、节假日/翻译/热榜/菜谱/营养（UAPIS）、搜索（Tavily）经 HTTP 直连；12306 火车票经 ModelScope 托管 MCP；机票直连 variflight 官方 MCP。
+- **真实数据源**：高德（POI/推荐菜，Web 服务 API）、天气/节假日/翻译/热榜/菜谱/营养（UAPIS，天气最多 7 天预报）、搜索（Tavily）经 HTTP 直连；12306 火车票经 ModelScope 托管 MCP；机票直连 variflight 官方 MCP。
 - **标准 skill 两段式**：业务规则（`SKILL.md`）的清单常驻 system prompt，正文按需加载，新增业务无需改装配代码。
 - **子 Agent 委派**：复杂子任务可委派给独立上下文的子 Agent 处理、只返回摘要，避免主上下文被大量工具结果淹没。
-- **会话 + 长期记忆**：SQLite 持久化多轮对话；跨会话提炼用户稳定偏好，按 importance 召回并注入提示词。
+- **三层记忆**：工作记忆（上下文窗口）+ 短期记忆（会话内已查工具摘要，防重查）+ 长期记忆（跨会话偏好），短期/长期记忆与会话历史由 SQLite 持久化；工作记忆超 token 预算时三层压缩（结构化截断 → 成对淘汰最老 → LLM 摘要兜底），并支持子 Agent 按子会话隔离短期记忆。
+- **记忆查看**：输入框旁「记忆」入口，弹窗内 tab 切换长期偏好与当前会话已查工具清单。
 - **SSE 流式对话**：逐字输出答案，实时展示工具调用进度；完整回复在流式输出前已落库，刷新后自动恢复会话与历史。
 - **用户隔离**：通过 `X-User-Id` 请求头按用户隔离会话与记忆数据。
 
@@ -29,7 +30,7 @@ my-agent/
 ├── backend/
 │   ├── app/
 │   │   ├── api/routes/        # 路由：SSE 对话 + 会话管理
-│   │   ├── core/              # 核心：agent(ReAct)/llm/critic/registry/memory/prompts/skills
+│   │   ├── core/              # 核心：agent(ReAct)/llm/critic/registry/memory(三层记忆)/prompts/skills
 │   │   ├── datasource/        # 数据源：MCP（12306/机票）+ HTTP（高德/UAPIS/Tavily）
 │   │   ├── models/            # Pydantic 请求模型
 │   │   ├── prompts/           # 提示词 .md（system/grounding/critic）
@@ -43,7 +44,7 @@ my-agent/
 │   └── run.py                 # 开发启动入口
 ├── frontend/
 │   └── src/
-│       ├── views/Chat.vue     # 主界面（SSE 事件分发 + 会话管理）
+│       ├── views/Chat.vue     # 主界面（SSE 事件分发 + 会话管理 + 记忆弹窗）
 │       ├── components/        # ChatPanel（markdown + 工具气泡）
 │       ├── services/          # api.ts / sse.ts
 │       ├── stores/            # Pinia
@@ -105,10 +106,11 @@ docker compose up --build
 | `TRAIN_12306_URL` | 12306 火车票 MCP 服务地址 | 空 |
 | `FLIGHT_VARIFLIGHT_URL` | variflight 官方 MCP 服务地址 | 空 |
 | `VARIFLIGHT_API_KEY` | variflight 官方 API Key（X-API-Key 认证） | 空 |
-| `UAPIS_API_KEY` | UAPIS 令牌（节假日/翻译/热榜/菜谱/营养） | 空 |
+| `UAPIS_API_KEY` | UAPIS 令牌（节假日/翻译/热榜/菜谱/营养；天气接口免费无需 key） | 空 |
 | `TAVILY_API_KEY` | Tavily API Key（搜索/网页提取） | 空 |
-| `AMAP_API_KEY` | 高德 Web 服务 Key（POI/天气/推荐菜） | 空 |
+| `AMAP_API_KEY` | 高德 Web 服务 Key（POI/推荐菜） | 空 |
 | `DB_PATH` | SQLite 数据库文件路径 | `app.db` |
+| `LLM_CONTEXT_BUDGET` | 工作记忆 token 预算上限（超限淘汰最老 + LLM 摘要兜底） | `32000` |
 
 ## API 概览
 
@@ -121,6 +123,8 @@ docker compose up --build
 | `POST` | `/api/conversations` | 新建会话 |
 | `GET` | `/api/conversations/{id}` | 获取会话历史消息 |
 | `DELETE` | `/api/conversations/{id}` | 删除会话 |
+| `GET` | `/api/memory/long-term` | 当前用户长期记忆（跨会话偏好） |
+| `GET` | `/api/memory/short-term/{conversation_id}` | 某会话短期记忆（已查工具清单） |
 | `GET` | `/api/health` | 健康检查 |
 
 ## 测试

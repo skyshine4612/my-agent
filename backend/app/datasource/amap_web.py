@@ -71,7 +71,7 @@ def parse_poi_list(payload):
             "name": p.get("name", ""),
             "address": p.get("address", ""),
             "location": _coerce_location(p.get("location")),
-            "category": p.get("type", ""),   # 高德官方用 type 字段表示分类文本
+            "category": p.get("type", ""),  # 高德官方用 type 字段表示分类文本
             "price": price,
             "photo": _extract_photo(p),
         })

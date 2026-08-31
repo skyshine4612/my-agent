@@ -30,8 +30,8 @@ def setup_logging():
 
     file_handler = RotatingFileHandler(
         os.path.join(log_dir, "app.log"),
-        maxBytes=10 * 1024 * 1024,   # 单文件 10MB
-        backupCount=5,               # 保留 5 份历史
+        maxBytes=10 * 1024 * 1024,  # 单文件 10MB
+        backupCount=5,  # 保留 5 份历史
         encoding="utf-8",
     )
     file_handler.setFormatter(fmt)

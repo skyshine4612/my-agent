@@ -5,9 +5,9 @@ import { computed, onMounted, ref } from 'vue'
 import { Plus } from '@element-plus/icons-vue'
 import { useConversationStore } from '@/stores/conversation'
 import { chatStream } from '@/services/sse'
-import { listConversations, getConversation, deleteConversation } from '@/services/api'
+import { listConversations, getConversation, deleteConversation, getLongTermMemory, getShortTermMemory } from '@/services/api'
 import ChatPanel from '@/components/ChatPanel.vue'
-import type { ChatMessage, ToolEvent } from '@/types'
+import type { ChatMessage, ToolEvent, LongTermMemory, ShortTermMemory } from '@/types'
 
 const convStore = useConversationStore()
 
@@ -204,6 +204,27 @@ function shortDate(iso: string): string {
   return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`
 }
 
+// —— 记忆弹窗（长期/短期 tab 切换）——
+// 入口在 ChatPanel 的发送按钮左侧；短期记忆跟随当前会话，长期记忆为全局偏好
+const memoryVisible = ref(false)
+const activeMemoryTab = ref('long')
+const longTerm = ref<LongTermMemory[]>([])
+const shortTerm = ref<ShortTermMemory[]>([])
+
+// 打开记忆弹窗并加载长期 + 当前会话短期记忆
+function openMemory() {
+  memoryVisible.value = true
+  loadLongTerm()
+  loadShortTerm()
+}
+async function loadLongTerm() {
+  try { longTerm.value = await getLongTermMemory() } catch { longTerm.value = [] }
+}
+async function loadShortTerm() {
+  if (!convStore.currentId) { shortTerm.value = []; return }
+  try { shortTerm.value = await getShortTermMemory(convStore.currentId) } catch { shortTerm.value = [] }
+}
+
 onMounted(async () => {
   await refreshConversations()
   // 刷新后恢复上次会话：从 localStorage 读取当前会话 id 并加载历史消息
@@ -238,12 +259,37 @@ onMounted(async () => {
         </div>
         <p v-if="!convStore.conversations.length" class="conv__empty">暂无会话</p>
       </nav>
+
     </aside>
 
     <!-- 中间对话区：核心，占主导 -->
     <section class="chat__main">
-      <ChatPanel :messages="messages" :streaming="streaming" :thinking="thinking" :phase="phase" @send="send" />
+      <ChatPanel :messages="messages" :streaming="streaming" :thinking="thinking" :phase="phase" @send="send" @open-memory="openMemory" />
     </section>
+
+    <!-- 记忆弹窗：长期（全局偏好）/短期（当前会话已查工具）tab 切换 -->
+    <el-dialog v-model="memoryVisible" title="记忆" width="640px">
+      <el-tabs v-model="activeMemoryTab">
+        <el-tab-pane label="长期记忆" name="long">
+          <p v-if="!longTerm.length" class="memory-empty">暂无长期记忆（跨会话偏好）</p>
+          <div v-else class="memory-fact-list">
+            <div v-for="(f, i) in longTerm" :key="i" class="memory-fact">
+              <span class="memory-fact__text">{{ f.fact }}</span>
+              <el-tag size="small" type="info">重要度 {{ (f.importance * 100).toFixed(0) }}%</el-tag>
+            </div>
+          </div>
+        </el-tab-pane>
+        <el-tab-pane label="短期记忆" name="short">
+          <p v-if="!convStore.currentId" class="memory-empty">请先开始一个会话，短期记忆跟随当前会话</p>
+          <el-table v-else-if="shortTerm.length" :data="shortTerm" size="small" border>
+            <el-table-column prop="tool_name" label="工具" width="160" />
+            <el-table-column prop="args" label="参数" min-width="180" />
+            <el-table-column prop="summary" label="摘要" min-width="180" />
+          </el-table>
+          <p v-else class="memory-empty">当前会话还没有已查记录</p>
+        </el-tab-pane>
+      </el-tabs>
+    </el-dialog>
   </div>
 </template>
 
@@ -342,6 +388,29 @@ onMounted(async () => {
   color: var(--text-secondary);
   font-size: 13px;
   padding: 8px;
+}
+.memory-empty {
+  color: var(--text-secondary);
+  font-size: 14px;
+  padding: 16px 0;
+}
+.memory-fact-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.memory-fact {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 14px;
+  border-radius: 10px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+}
+.memory-fact__text {
+  font-size: 14px;
 }
 /* 中间对话区：占满剩余空间 */
 .chat__main {

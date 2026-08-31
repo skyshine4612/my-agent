@@ -2,8 +2,8 @@
 # FastAPI 应用入口：创建应用实例、注册中间件与路由
 from fastapi import FastAPI
 
+from app.api.routes import chat, conversation, memory
 from app.core.logging import setup_logging
-from app.api.routes import chat, conversation
 
 # 应用启动时初始化日志系统（控制台 + 文件 logs/app.log）
 setup_logging()
@@ -11,9 +11,10 @@ setup_logging()
 # 创建 FastAPI 应用实例
 app = FastAPI(title="可扩展业务 Agent 平台")
 
-# 挂载业务路由：SSE 流式对话 + 会话管理（统一挂到 /api 前缀下）
+# 挂载业务路由：SSE 流式对话 + 会话管理 + 记忆查询（统一挂到 /api 前缀下）
 app.include_router(chat.router, prefix="/api")
 app.include_router(conversation.router, prefix="/api")
+app.include_router(memory.router, prefix="/api")
 
 
 @app.get("/api/health")

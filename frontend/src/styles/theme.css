@@ -1,24 +1,24 @@
 /* 设计规范的配色 token：全局 CSS 变量 */
 :root {
-  --bg: #faf9f7;             /* 暖白背景 */
-  --surface: #ffffff;        /* 卡片表面 */
-  --text: #1a1a1a;           /* 主文字 */
-  --text-secondary: #71717a; /* 次要文字 */
-  --text-tertiary: #a8a29e;  /* 暖灰：更弱的次级信息（如时间线餐食节点） */
-  --border: #e7e5e4;         /* 暖灰边框 */
-  --accent: #d97706;         /* 琥珀色点缀 */
-  --accent-strong: #b45309;  /* 深琥珀：更强的强调（如时间线酒店节点） */
-  --accent-soft: #fef3c7;    /* 琥珀浅底 */
+    --bg: #faf9f7; /* 暖白背景 */
+    --surface: #ffffff; /* 卡片表面 */
+    --text: #1a1a1a; /* 主文字 */
+    --text-secondary: #71717a; /* 次要文字 */
+    --text-tertiary: #a8a29e; /* 暖灰：更弱的次级信息（如时间线餐食节点） */
+    --border: #e7e5e4; /* 暖灰边框 */
+    --accent: #d97706; /* 琥珀色点缀 */
+    --accent-strong: #b45309; /* 深琥珀：更强的强调（如时间线酒店节点） */
+    --accent-soft: #fef3c7; /* 琥珀浅底 */
 }
 
 /* Element Plus 主色对齐到琥珀：把 --el-color-primary 系列集中在此定义，
    避免默认蓝色破坏暖色基调；--el-color-primary 直接引用 --accent 保持单一来源 */
 :root {
-  --el-color-primary: var(--accent);
-  --el-color-primary-light-3: #e9a23b;
-  --el-color-primary-light-5: #f1bb6e;
-  --el-color-primary-light-7: #f8d4a1;
-  --el-color-primary-light-8: #fbe0bd;
-  --el-color-primary-light-9: #fdf0dc;
-  --el-color-primary-dark-2: #b45f06;
+    --el-color-primary: var(--accent);
+    --el-color-primary-light-3: #e9a23b;
+    --el-color-primary-light-5: #f1bb6e;
+    --el-color-primary-light-7: #f8d4a1;
+    --el-color-primary-light-8: #fbe0bd;
+    --el-color-primary-light-9: #fdf0dc;
+    --el-color-primary-dark-2: #b45f06;
 }

@@ -17,15 +17,15 @@ class TavilyDataSource(HttpDataSource):
         self._api_key = settings.tavily_api_key
 
     async def search(
-        self,
-        query: str,
-        max_results: int = 5,
-        search_depth: str = "basic",
-        time_range: str | None = None,
-        include_domains: list[str] | None = None,
-        exclude_domains: list[str] | None = None,
-        include_answer: bool = False,
-        include_raw_content: bool = False,
+            self,
+            query: str,
+            max_results: int = 5,
+            search_depth: str = "basic",
+            time_range: str | None = None,
+            include_domains: list[str] | None = None,
+            exclude_domains: list[str] | None = None,
+            include_answer: bool = False,
+            include_raw_content: bool = False,
     ) -> dict:
         """网络搜索，返回结构化结果（标题/URL/摘要/相关度分数）。"""
         body: dict = {
@@ -47,11 +47,11 @@ class TavilyDataSource(HttpDataSource):
         return resp.json()
 
     async def extract(
-        self,
-        urls: list[str],
-        extract_depth: str = "basic",
-        query: str | None = None,
-        chunks_per_source: int | None = None,
+            self,
+            urls: list[str],
+            extract_depth: str = "basic",
+            query: str | None = None,
+            chunks_per_source: int | None = None,
     ) -> dict:
         """从 URL 列表提取网页正文（Markdown 格式）。"""
         body: dict = {

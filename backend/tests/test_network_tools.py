@@ -7,6 +7,7 @@ from app.tools.network import make_tavily_search, make_tavily_extract
 
 class FakeTavilyDS:
     """Tavily 假数据源：返回固定搜索结果与网页正文。"""
+
     async def search(self, query, max_results=5, search_depth="basic", **kw):
         return {
             "query": query, "answer": None,

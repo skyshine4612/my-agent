@@ -10,6 +10,7 @@ from app.tools.common import (
 
 class FakeHolidayDS:
     """节假日假数据源：返回固定节假日/农历数据。"""
+
     async def get_holiday_calendar(self, date="", month="", year="", **kw):
         return {
             "summary": {"total_days": 1},
@@ -20,6 +21,7 @@ class FakeHolidayDS:
 
 class FakeWeatherDS:
     """天气假数据源：返回固定天气。"""
+
     async def get_weather(self, city, days):
         return [{"date": "2026-08-30", "day_weather": "晴"}]
 
@@ -49,6 +51,7 @@ async def test_weather_query_default_days():
 
 class FakeUapisDS:
     """UAPIS 假数据源：返回固定翻译与热榜。"""
+
     async def translate(self, text, to_lang="en"):
         return {"text": text, "translate": "HELLO"}
 
@@ -72,6 +75,7 @@ async def test_hotboard():
 
 class FakeRecipeDS:
     """菜谱假数据源：返回固定菜谱与营养。"""
+
     async def search_recipe(self, keyword):
         return {"keyword": keyword, "items": [{"id": "333", "title": "宫保鸡丁"}]}
 

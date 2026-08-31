@@ -14,4 +14,4 @@ def register_all_tools(registry, amap_web_ds, skill_names):
     travel.register_travel_tools(registry, amap_web_ds)
     system.register_system_tools(registry, skill_names)
     network.register_network_tools(registry)
-    common.register_common_tools(registry, amap_web_ds)
+    common.register_common_tools(registry)

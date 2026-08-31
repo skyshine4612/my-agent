@@ -61,20 +61,24 @@ def _chunk(content=None, tool_calls=None):
 
 class StubCompletions:
     """模拟 client.chat.completions.create：返回预设 chunk 序列的异步迭代器"""
+
     def __init__(self, chunks):
         self.chunks = chunks
 
     async def create(self, **kw):
         # 校验 stream=True 已开启，并返回异步生成器供 async for 消费
         assert kw.get("stream") is True
+
         async def gen():
             for c in self.chunks:
                 yield c
+
         return gen()
 
 
 class StubClient:
     """模拟 OpenAI 客户端：chat.completions 指向 StubCompletions"""
+
     def __init__(self, chunks):
         self.chat = SimpleNamespace(completions=StubCompletions(chunks))
 

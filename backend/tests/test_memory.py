@@ -1,6 +1,7 @@
 # tests/test_memory.py
 # 记忆 + 会话存储的契约测试：使用 tmp_path 临时 SQLite，验证会话、长期记忆两层及用户隔离
 import pytest
+
 from app.core.memory import ConversationStore, LongTermMemory
 
 
@@ -27,17 +28,18 @@ async def test_long_term_recall(tmp_path):
                              {"fact": "c", "importance": 0.5}])
     top = await l.recall("u1", top_n=2)
     assert [f["fact"] for f in top] == ["b", "c"]
-    assert await l.recall("u2") == []   # 用户隔离
+    assert await l.recall("u2") == []  # 用户隔离
 
 
 @pytest.mark.asyncio
 async def test_long_term_prune(tmp_path):
     """验证长期记忆的 importance 淘汰与用户隔离"""
     l = LongTermMemory(str(tmp_path / "m.db"), max_facts=2)
-    await l.add_facts("u1", [{"fact": "a", "importance": 0.9}, {"fact": "b", "importance": 0.3}, {"fact": "c", "importance": 0.5}])
+    await l.add_facts("u1", [{"fact": "a", "importance": 0.9}, {"fact": "b", "importance": 0.3},
+                             {"fact": "c", "importance": 0.5}])
     facts = await l.get_all("u1")
     assert len(facts) == 2 and "b" not in [f["fact"] for f in facts]
-    assert await l.get_all("u2") == []   # 用户隔离
+    assert await l.get_all("u2") == []  # 用户隔离
 
 
 @pytest.mark.asyncio

@@ -10,6 +10,7 @@ from app.tools.travel import (
 
 class FakeDS:
     """高德数据源假实现：返回固定 POI。"""
+
     async def search_poi(self, keywords, city, **kw):
         return [{"name": "宽窄巷子", "location": {"lng": 1, "lat": 1}, "price": 0}]
 
@@ -19,12 +20,14 @@ class FakeDS:
 
 class FakeTrainDS:
     """12306 假数据源：返回固定票务文本。"""
+
     async def search_tickets(self, date, from_city, to_city):
         return f"{date} {from_city}->{to_city} G101 二等座 553元"
 
 
 class FakeFlightDS:
     """机票假数据源：返回固定航班文本。"""
+
     async def search_flights(self, date, from_city, to_city):
         return f"{date} {from_city}->{to_city} CA123 经济舱 1200元"
 
