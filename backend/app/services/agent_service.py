@@ -9,14 +9,16 @@ import time
 
 from app.config import settings
 from app.core.agent import Agent
+from app.core.context import current_user_id
 from app.core.critic import run_critic
 from app.core.llm import get_llm
-from app.core.memory import ConversationStore, LongTermMemory, ShortTermMemory
+from app.core.memory import ConversationStore, LongTermMemory, ShortTermMemory, ToolResultStore
 from app.core.prompts import load_prompt, render_system_prompt, today_hint
 from app.core.registry import ToolRegistry
 from app.core.skills import load_skills
 from app.datasource.amap_web import AmapWebDataSource
 from app.tools import register_all_tools
+from app.tools.file import register_file_tools
 from app.tools.sub_agent import make_call_sub_agent
 
 logger = logging.getLogger(__name__)
@@ -43,6 +45,8 @@ class AgentService:
         self.conversation_store = ConversationStore(settings.db_path)
         self.short_term_memory = ShortTermMemory(settings.db_path)
         self.long_term_memory = LongTermMemory(settings.db_path)
+        # 工具结果地址索引：超长结果写临时文件，read_file/grep 按需读；本轮结束即清，避免堆积
+        self.tool_result_store = ToolResultStore(settings.result_dir)
         # LLM 客户端
         self.llm = get_llm()
         # 加载 skills 清单（name/description/body）：name+description 进 system prompt，body 由 get_skill 按需加载
@@ -54,25 +58,49 @@ class AgentService:
         self.registry = self._build_registry()
 
     def _build_registry(self) -> ToolRegistry:
-        """装配扁平 ToolRegistry：统一注册所有工具（旅行 + 系统 + 网络），只在启动时调用一次。"""
+        """装配扁平 ToolRegistry：统一注册所有工具（旅行 + 系统 + 网络），只在启动时调用一次。
+
+        同时收集所有「内联 new 的数据源」到 self._datasources，供 close() 统一关闭
+        （httpx 客户端 / MCP session 都是进程级长连接，进程退出前应显式关闭）。
+        """
         registry = ToolRegistry()
         amap_web_ds = AmapWebDataSource()  # 高德数据源只 new 一次，旅行/通用工具共享
-        register_all_tools(registry, amap_web_ds, [s["name"] for s in self.skills])
+        self._datasources = [amap_web_ds]
+        # register_all_tools 内部会再 new UAPIS/Tavily/12306/机票数据源，返回它们供统一 close
+        self._datasources.extend(register_all_tools(registry, amap_web_ds, [s["name"] for s in self.skills]))
+        # read_file/grep 工具：地址索引的按需读出口（需要 tool_result_store，故在 service 层注册）
+        register_file_tools(registry, self.tool_result_store)
         # 注册 call_sub_agent（子 Agent 委派，需要 llm + skill 清单 + 短期记忆，只能在 service 层注册）
         sub_agent_fn = make_call_sub_agent(self.llm, registry, [s["name"] for s in self.skills],
-                                           self.short_term_memory, settings.llm_context_budget)
+                                           self.short_term_memory, settings.llm_context_budget,
+                                           self.tool_result_store)
         registry.register("call_sub_agent", sub_agent_fn.description, sub_agent_fn.parameters, sub_agent_fn,
                           "委派子任务")
         return registry
 
+    async def close(self):
+        """优雅关闭所有数据源与 LLM 客户端（进程退出前由 lifespan 调用）。
+
+        数据源持有从不显式关闭的 httpx 客户端 / MCP session，统一在这里关闭，
+        避免热重载/测试时留下未关闭连接。LLM 客户端若无 close 方法（Fake/Fallback）则跳过。
+        """
+        for ds in self._datasources:
+            ds_close = getattr(ds, "close", None)
+            if ds_close is not None:
+                await ds_close()
+        llm_close = getattr(self.llm, "close", None)
+        if llm_close is not None:
+            await llm_close()
+
     async def delete_conversation(self, user_id, conv_id):
-        """删除会话及其消息，并清理该会话的短期记忆；归属校验失败返回 False。
+        """删除会话及其消息，并清理该会话的短期记忆与工具结果地址索引；归属校验失败返回 False。
 
         子会话的短期记忆由子任务结束时各自清理，这里只清主会话自身（conversation_id = conv_id）。
         """
         ok = await self.conversation_store.delete_conversation(user_id, conv_id)
         if ok:
             await self.short_term_memory.clear_conversation(conv_id)
+            await self.tool_result_store.delete_conversation(conv_id, user_id)
         return ok
 
     async def chat_stream(self, user_id, conv_id, message):
@@ -80,6 +108,8 @@ class AgentService:
 
         返回 AsyncIterator[dict]，每个 dict 的 "type" 字段标识事件类型。
         """
+        # 设置请求级 user_id contextvar，供工具层（read_file/grep 按用户隔离读）与 run_tool 写文件使用
+        current_user_id.set(user_id)
         logger.info("[service] 收到请求，user=%s，消息：%.60s", user_id, message)
         # 1. 无会话则新建（首次对话），并先回传 conversation_id 让前端记住会话。
         #    写路径归属校验：客户端传入他人 conv_id 时当作首次对话重建，杜绝跨用户写入。
@@ -92,22 +122,43 @@ class AgentService:
         # 3. 长期记忆召回：按 importance 降序取前 20 条（单条已截断），拼成 long_term_hint 注入 system 上下文
         facts = await self.long_term_memory.recall(user_id, top_n=20)
         long_term_hint = "用户历史偏好：" + "；".join(f["fact"] for f in facts) if facts else ""
-        # 4. 组装历史：assistant 消息若是落库的 JSON {"content","tools"} 结构则取 content（markdown），
-        #    user 消息原文；压缩交给 run_stream 内的工作记忆预算淘汰，本层不手动压缩。
+        # 4. 组装历史（running summary）：user 消息原文；assistant 答案预算内原文、超预算的早期答案压缩。
         raw_history = await self.conversation_store.get_history(user_id, conv_id)
-        history = []
-        for h in raw_history:
+        summary, history_path = await self.conversation_store.get_summary(conv_id)
+        budget = int(settings.llm_context_budget * settings.history_budget_ratio)
+        used = 0
+        recent = []  # 从最近往最老收集（预算内原文）
+        to_compress = []  # 超预算的早期答案原文（待压缩）
+        for h in reversed(raw_history):
             if h["role"] == "user":
-                history.append({"role": "user", "content": h["content"]})
+                recent.append({"role": "user", "content": h["content"]})
+                used += len(h["content"]) // 4
             else:
-                content = h["content"]
+                data = None
                 try:
-                    data = json.loads(content)
-                    if isinstance(data, dict) and isinstance(data.get("content"), str):
-                        content = data["content"]
+                    data = json.loads(h["content"])
                 except (json.JSONDecodeError, TypeError):
-                    pass  # 非 JSON 的 assistant 消息原样保留
-                history.append({"role": "assistant", "content": content})
+                    pass
+                if isinstance(data, dict) and isinstance(data.get("content"), str):
+                    if used <= budget:
+                        recent.append({"role": "assistant", "content": data["content"]})
+                        used += len(data["content"]) // 4
+                    else:
+                        to_compress.append(data["content"])
+                else:
+                    recent.append({"role": "assistant", "content": h["content"]})
+                    used += len(h["content"]) // 4
+        history = list(reversed(recent))
+        # 触发压缩：超预算的早期答案追加到历史文件 + 浓缩进累积摘要（替换旧摘要）
+        if to_compress:
+            logger.info("[service] 历史超预算，触发 running summary 压缩：压缩 %d 条早期答案", len(to_compress))
+            compressed_text = "\n\n".join(reversed(to_compress))
+            history_path = await self.tool_result_store.append_history(conv_id, user_id, compressed_text)
+            summary = await self._update_summary(summary, compressed_text)
+            await self.conversation_store.set_summary(conv_id, summary, history_path)
+        if summary:
+            history.insert(0, {"role": "assistant",
+                               "content": f"[摘要] {summary}\n[完整历史存到 {history_path}，可用 read_file 读]"})
         # 末尾一条是本轮刚落库的用户消息，run_stream 会再追加一次，这里剔除避免重复
         if history and history[-1]["role"] == "user":
             history = history[:-1]
@@ -141,6 +192,7 @@ class AgentService:
                     user_message, history, registry, on_event=emit,
                     short_term_memory=self.short_term_memory, conversation_id=conv_id,
                     context_budget=settings.llm_context_budget,
+                    tool_result_store=self.tool_result_store,
                 )
             finally:
                 await queue.put(None)
@@ -178,14 +230,17 @@ class AgentService:
                     entry = next((p for p in pending_calls if p["id"] == ev["id"]), None)
                     if entry is not None:
                         pending_calls.remove(entry)
-                        entry["summary"] = ev["summary"]
-                        entry.pop("id", None)  # id 仅用于配对，持久化 tools 保持 {tool,args,summary} 结构
+                        entry["status"] = True
+                        # result = 模型工作记忆里的截断版结果（模型所见语料），
+                        # 供 critic 校验、修正重写与前端展示复用，保证前端展示与模型所见一致；持久化保留
+                        entry["result"] = ev.get("result", "")
+                        entry.pop("id", None)  # id 仅用于配对，持久化 tools 保持 {tool,args,status,result} 结构
                         tools.append(entry)
                     if name in HARD_DATA_TOOLS:
-                        # 硬数据工具记完整结果（ev["full"]），供 critic 校验回答
-                        hard_results.append(ev.get("full", ev["summary"]))
-                    yield {"type": "tool_result", "tool": name, "summary": ev["summary"], "id": ev["id"],
-                           "label": ev.get("label", name)}
+                        # 硬数据工具记模型所见语料（ev["result"]），保证 critic 与模型生成答案时语料一致
+                        hard_results.append(ev.get("result", ""))
+                    yield {"type": "tool_result", "tool": name, "status": ev.get("status", True),
+                           "result": ev.get("result", ""), "id": ev["id"], "label": ev.get("label", name)}
 
         # 第一轮生成
         gen_task = asyncio.create_task(generate(message))
@@ -202,16 +257,26 @@ class AgentService:
 
         # 8. critic 回路：仅当本轮调用了硬数据工具才校验（否则无事实依据可核对）
         if hard_results:
-            verdict = await run_critic(self.llm, json.dumps(hard_results, ensure_ascii=False), answer)
+            # read_file_fn / grep_fn：绑定当前 user_id 的完整结果读取，供 critic 多轮用 read_file/grep 定向读文件
+            async def read_file_fn(path, offset, limit):
+                return await self.tool_result_store.read(path, offset, limit, user_id=user_id)
+
+            async def grep_fn(pattern, path):
+                return await self.tool_result_store.search(path, pattern, user_id=user_id)
+
+            verdict = await run_critic(self.llm, json.dumps(hard_results, ensure_ascii=False), answer,
+                                       read_file_fn=read_file_fn, grep_fn=grep_fn)
             if not verdict.get("ok", True):
                 # ok=false：第一轮工具结果本身是准的，问题只在模型生成答案时编造了价格。
                 # 修正时复用第一轮的工具结果（tools），直接让模型重新生成答案——不重新调工具、不重新走 ReAct。
                 issues = verdict.get("issues", [])
                 logger.info("[service] critic 判定不通过（%d 条问题），进入修正答案", len(issues))
                 yield {"type": "status", "status": "correcting"}
-                # 修正 prompt 只喂 {tool,args,summary} 事实依据，剥离展示用的 label，避免噪音
+                # 修正 prompt 只喂 {tool,args,result} 事实依据，result 取模型所见语料（visible）而非展示用 summary，
+                # 剥离 label/visible 等内部字段，避免噪音，并保证与第一轮生成时语料一致
                 tool_results_text = json.dumps(
-                    [{k: v for k, v in t.items() if k != "label"} for t in tools], ensure_ascii=False)
+                    [{"tool": t["tool"], "args": t["args"], "result": t.get("result", "")}
+                     for t in tools], ensure_ascii=False)
                 # 注入本轮 get_skill 加载过的业务规则正文，保住「输出格式」等约束
                 # （critic 修正走 complete 不重新调 get_skill，正文会丢）
                 skill_guide = "\n\n".join(
@@ -243,9 +308,24 @@ class AgentService:
         for j in range(0, len(answer), 40):
             yield {"type": "token", "content": answer[j:j + 40]}
 
-        # 10. 异步提炼长期记忆（fire-and-forget，不影响主流程返回）
+        # 10. 清理本轮工具结果地址索引（完整结果 read 完即弃，避免 DB 堆积）；
+        #     异步提炼长期记忆（fire-and-forget，不影响主流程返回）
+        await self.tool_result_store.delete_conversation(conv_id, user_id)
         asyncio.create_task(self._extract_facts(user_id, conv_id))
         yield {"type": "done"}
+
+    async def _update_summary(self, old_summary, compressed_text):
+        """LLM 把「旧摘要 + 新被压缩答案」浓缩成新的累积摘要；失败回退字符串拼接。"""
+        try:
+            return await self.llm.complete([
+                {"role": "system",
+                 "content": "把下面的「旧摘要 + 新答案」浓缩成一个新的累积摘要（100-300 字），保留核心结论、关键数据（菜名/价格/时间/结构要点）。"},
+                {"role": "user",
+                 "content": f"旧摘要：{old_summary or '（无）'}\n\n新答案：\n{compressed_text[:4000]}"},
+            ])
+        except Exception:
+            logger.warning("[service] 摘要浓缩失败，回退拼接")
+            return (old_summary or "") + "\n" + compressed_text[:500]
 
     async def _extract_facts(self, user_id, conv_id):
         """异步提炼长期记忆：只从用户发言提取跨会话可复用偏好，并做语义去重。
@@ -254,6 +334,7 @@ class AgentService:
         去重：新 fact 与已有 fact 语义相近时，提升已有 fact 的 importance 而非新增重复条目。
         """
         try:
+            logger.info("[service] 开始提炼长期记忆 user=%s conv=%s", user_id, conv_id)
             msgs = await self.conversation_store.get_history(user_id, conv_id)
             user_msgs = [m for m in msgs if m["role"] == "user"]
             if not user_msgs:
@@ -280,6 +361,7 @@ class AgentService:
                     to_add.append(nf)
             if to_add:
                 await self.long_term_memory.add_facts(user_id, to_add)
+            logger.info("[service] 长期记忆提炼完成：新增 %d 条", len(to_add))
         except Exception as e:
             # 提炼失败不影响主对话流程，记录 warning 便于发现数据质量回归
             # （如 LLM 返回字符串型 importance 触发 max(float, str) 的 TypeError 也会走到这里）

@@ -170,7 +170,7 @@ async def test_tool_result_pairs_by_call_id_same_name_parallel(tmp_path, monkeyp
     tools = saved["tools"]
     # 两条同名工具都落库，且各自 summary 与入参一一对应（不被并发乱序串配）
     assert [t["tool"] for t in tools] == ["poi_search", "poi_search"]
-    by_kw = {t["args"]["keywords"]: t["summary"] for t in tools}
+    by_kw = {t["args"]["keywords"]: t["result"] for t in tools}
     assert by_kw == {"景点A": "结果A", "景点B": "结果B"}
     # SSE 事件透传 tool_call_id：前端据此按 id 精确回填 summary（同名工具并发也不串）
     tool_calls = [e for e in events if e["type"] == "tool_call"]

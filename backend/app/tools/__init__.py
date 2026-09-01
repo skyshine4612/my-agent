@@ -10,8 +10,12 @@ def register_all_tools(registry, amap_web_ds, skill_names):
         registry:     ToolRegistry，工具注册表
         amap_web_ds:  高德 Web API 数据源（旅行/通用工具共享）
         skill_names: 业务名列表（get_skill 的 enum）
+
+    返回：各注册函数内联 new 的数据源列表（供上层统一 close）。
     """
-    travel.register_travel_tools(registry, amap_web_ds)
+    datasources = []
+    datasources.extend(travel.register_travel_tools(registry, amap_web_ds))
     system.register_system_tools(registry, skill_names)
-    network.register_network_tools(registry)
-    common.register_common_tools(registry)
+    datasources.extend(network.register_network_tools(registry))
+    datasources.extend(common.register_common_tools(registry))
+    return datasources

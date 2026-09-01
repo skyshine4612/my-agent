@@ -114,6 +114,10 @@ class OpenAICompatLLM(LLMClient):
         tool_calls = [acc[k] for k in sorted(acc)] or None
         yield {"type": "end", "tool_calls": tool_calls}
 
+    async def close(self):
+        """关闭底层 AsyncOpenAI 客户端（释放其持有的 httpx 连接）。"""
+        await self.client.close()
+
 
 class FallbackLLM(LLMClient):
     """无 API Key 时的兜底 LLM：直接返回空结果。

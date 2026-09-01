@@ -117,8 +117,11 @@ class AmapWebDataSource(HttpDataSource):
         return resp.json()
 
     async def search_poi(self, keywords: str | None = None, city: str | None = None,
-                         types: str | None = None, **kw) -> list[dict]:
-        """按关键字或分类码搜索 POI（place/text）。types 为高德分类码（如 110000 风景名胜）。"""
+                         types: str | None = None, sortrule: str | None = None, **kw) -> list[dict]:
+        """按关键字或分类码搜索 POI（place/text）。types 为高德分类码（如 110000 风景名胜）。
+
+        sortrule：排序规则（高德 place/text），如 distance（距离）/ weight（综合权重）/ rating（评分）。
+        """
         params = {"output": "json", "offset": 20, "extensions": "base"}
         if keywords:
             params["keywords"] = keywords
@@ -126,6 +129,8 @@ class AmapWebDataSource(HttpDataSource):
             params["types"] = types
         if city:
             params["city"] = city
+        if sortrule:
+            params["sortrule"] = sortrule
         data = await self._get("/v3/place/text", params)
         return parse_poi_list(data)
 

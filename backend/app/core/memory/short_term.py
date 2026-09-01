@@ -4,7 +4,10 @@
 import asyncio
 import json
 import sqlite3
+import logging
 from datetime import datetime
+
+logger = logging.getLogger(__name__)
 
 
 class ShortTermMemory:
@@ -85,6 +88,7 @@ class ShortTermMemory:
 
         def r():
             with self._conn() as c:
-                c.execute("DELETE FROM short_term_memory WHERE conversation_id=?", (conversation_id,))
+                return c.execute("DELETE FROM short_term_memory WHERE conversation_id=?", (conversation_id,)).rowcount
 
-        await asyncio.to_thread(r)
+        deleted = await asyncio.to_thread(r)
+        logger.info("[记忆:short_term] 清理会话短期记忆：%s（%d 条）", conversation_id, deleted)

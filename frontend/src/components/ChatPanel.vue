@@ -1,7 +1,7 @@
 <script setup lang="ts">
 // ChatPanel.vue —— 通用对话面板：渲染 markdown 消息流 + 工具气泡 + 底部输入框
 import { ref } from 'vue'
-import { Promotion, Collection } from '@element-plus/icons-vue'
+import { Promotion, Collection, ArrowDown } from '@element-plus/icons-vue'
 import { marked } from 'marked'
 import DOMPurify from 'dompurify'
 import type { ChatMessage, ToolEvent } from '@/types'
@@ -35,6 +35,14 @@ function toolLabel(t: ToolEvent, done: boolean): string {
   const name = t.label || t.tool
   return done ? `已${name}` : `正在${name}…`
 }
+
+// 展开的工具气泡 key 集合（`消息id-工具索引`），点击气泡切换展开/收起 result
+const expanded = ref<Set<string>>(new Set())
+function toggleTool(key: string) {
+  const next = new Set(expanded.value)
+  next.has(key) ? next.delete(key) : next.add(key)
+  expanded.value = next
+}
 </script>
 
 <template>
@@ -57,10 +65,19 @@ function toolLabel(t: ToolEvent, done: boolean): string {
           <!-- 助手消息：工具进度（上）+ markdown 正文（下），按时间顺序「先查询、后回答」 -->
           <div v-else class="msg msg--assistant">
             <div class="msg__label">助手</div>
-            <!-- 工具进度：显示在答案之前，一行简洁中文文案 + 状态点（执行中闪烁 / 完成变绿） -->
-            <div v-for="(t, i) in m.tools ?? []" :key="i" class="tool">
-              <span class="tool__status" :class="t.summary ? 'tool__status--done' : 'tool__status--run'"></span>
-              <span class="tool__name">{{ toolLabel(t, !!t.summary) }}</span>
+            <!-- 工具进度：显示在答案之前，一行简洁中文文案 + 状态点（执行中闪烁 / 完成变绿）；
+                 完成态可点击展开查看完整（截断版）结果 result -->
+            <div v-for="(t, i) in m.tools ?? []" :key="i" class="tool-wrap">
+              <div class="tool" @click="toggleTool(`${m.id}-${i}`)">
+                <span class="tool__status" :class="t.status ? 'tool__status--done' : 'tool__status--run'"></span>
+                <span class="tool__name">{{ toolLabel(t, !!t.status) }}</span>
+                <span v-if="t.status && t.result" class="tool__caret" :class="{ 'tool__caret--open': expanded.has(`${m.id}-${i}`) }">
+                  <el-icon><ArrowDown /></el-icon>
+                </span>
+              </div>
+              <div v-if="expanded.has(`${m.id}-${i}`) && t.result" class="tool__result">
+                <pre>{{ t.result }}</pre>
+              </div>
             </div>
             <!-- markdown 正文（token 流式累积） -->
             <div v-if="m.content" class="msg__markdown" v-html="renderMarkdown(m.content)"></div>
@@ -248,10 +265,12 @@ function toolLabel(t: ToolEvent, done: boolean): string {
   border: 1px solid var(--border);
   padding: 6px 10px;
 }
-/* 工具进度：一行简洁文案 + 状态点（执行中闪烁 / 完成变绿），不暴露参数与摘要 */
-.tool {
+/* 工具进度：一行简洁文案 + 状态点（执行中闪烁 / 完成变绿），完成态可点击展开 result */
+.tool-wrap {
   max-width: 82%;
   margin-top: 8px;
+}
+.tool {
   display: flex;
   align-items: center;
   gap: 8px;
@@ -259,6 +278,34 @@ function toolLabel(t: ToolEvent, done: boolean): string {
   border: 1px solid var(--border);
   border-radius: 10px;
   background: var(--surface);
+  cursor: pointer;
+}
+.tool__caret {
+  margin-left: auto;
+  color: var(--text-secondary);
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  transition: transform 0.2s;
+}
+.tool__caret--open {
+  transform: rotate(180deg);
+}
+.tool__result {
+  margin-top: 4px;
+  padding: 8px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg);
+  overflow-x: auto;
+}
+.tool__result pre {
+  margin: 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 .tool__status {
   width: 8px;

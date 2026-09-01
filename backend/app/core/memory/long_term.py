@@ -2,7 +2,10 @@
 # 长期记忆存储：long_term_memory 表，跨会话持久偏好，按 user_id 隔离，超容量按 importance 淘汰。
 import asyncio
 import sqlite3
+import logging
 from datetime import datetime
+
+logger = logging.getLogger(__name__)
 
 # 注入 long_term_hint 时单条 fact 的字符上限，防止历史偏好把提示词撑爆
 FACT_HINT_CHAR_LIMIT = 100
@@ -40,11 +43,16 @@ class LongTermMemory:
                               (user_id, f["fact"], f.get("importance", 0.5), datetime.now().isoformat()))
                 # 容量淘汰：仅当「当前用户自己」的 facts 超过 max_facts 时，删除该用户 importance 最低（importance 相同时最早创建）的多余条目。
                 # 三重 user_id 过滤实现按用户隔离淘汰，绝不触碰其他用户的数据、不挤占他人配额。
-                c.execute(
+                cur = c.execute(
                     "DELETE FROM long_term_memory WHERE user_id=? AND id IN (SELECT id FROM long_term_memory WHERE user_id=? ORDER BY importance ASC, created_at ASC LIMIT max(0,(SELECT COUNT(*) FROM long_term_memory WHERE user_id=?)-?))",
                     (user_id, user_id, user_id, self.max_facts))
+                return len(facts), cur.rowcount
 
-        await asyncio.to_thread(r)
+        inserted, deleted = await asyncio.to_thread(r)
+        if deleted:
+            logger.info("[记忆:long_term] 写入 %d 条长期记忆，容量淘汰 %d 条（importance 最低）", inserted, deleted)
+        else:
+            logger.info("[记忆:long_term] 写入 %d 条长期记忆", inserted)
 
     async def get_all(self, user_id):
         """返回某用户的全部事实（按 importance 降序，fact 原样不截断，供语义去重匹配）。"""
@@ -72,7 +80,9 @@ class LongTermMemory:
             # 单条 fact 截断：只保留前 FACT_HINT_CHAR_LIMIT 字符，控制 long_term_hint 体积
             return [{"fact": x["fact"][:FACT_HINT_CHAR_LIMIT], "importance": x["importance"]} for x in rows]
 
-        return await asyncio.to_thread(r)
+        result = await asyncio.to_thread(r)
+        logger.info("[记忆:long_term] 召回长期记忆 %d 条（top_n=%d）", len(result), top_n)
+        return result
 
     async def update_importance(self, user_id, fact, importance):
         """更新某条已存在事实的 importance（语义去重时提升其权重而非新增重复条目）。"""
@@ -83,3 +93,4 @@ class LongTermMemory:
                           (importance, user_id, fact))
 
         await asyncio.to_thread(r)
+        logger.info("[记忆:long_term] 语义去重：提升已有 fact importance=%.2f（%.50s）", importance, fact)

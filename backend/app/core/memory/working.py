@@ -3,6 +3,9 @@
 # 可变窗口（历史对话 + ReAct 工具交互）超预算时，成对淘汰最老的 assistant+tool 交互单元，
 # 被淘汰单元批量 LLM 蒸馏成摘要放回，保留语义、不裸删。固定头（system/user）由调用方单独维护。
 import json
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 class WorkingMemory:
@@ -93,9 +96,12 @@ class WorkingMemory:
         参数 window 是「可变窗口」（历史对话 + ReAct 工具交互），不含 system/user 固定头，
         故可放心从最老开始淘汰。返回处理后的新窗口（不改动入参列表）。
         """
+        current = self._estimate(window)
         # 未超预算，原样返回
-        if self._estimate(window) <= self.budget_tokens:
+        if current <= self.budget_tokens:
             return window
+        logger.info("[记忆:working] 工作记忆超预算触发淘汰：约 %d token > 预算 %d（共 %d 条消息）",
+                    current, self.budget_tokens, len(window))
         units = self._units(window)
         removed = []
         kept = units
@@ -107,4 +113,7 @@ class WorkingMemory:
             return window
         # 被淘汰单元批量 LLM 蒸馏成一段摘要，替代原始交互放回窗口最前（保留语义、不裸删）
         summary = await self._distill(removed)
-        return [{"role": "system", "content": "[早期交互摘要] " + summary}] + self._flatten(kept)
+        result = [{"role": "system", "content": "[早期交互摘要] " + summary}] + self._flatten(kept)
+        logger.info("[记忆:working] 淘汰完成：移除 %d 条消息蒸馏成摘要，窗口降至约 %d token",
+                    len(removed), self._estimate(result))
+        return result

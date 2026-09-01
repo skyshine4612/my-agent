@@ -1,6 +1,6 @@
 # tests/test_critic.py
-# critic 回路的契约测试：run_critic 的 ok=true/ok=false 两分支，以及 service 层的触发条件
-# （仅硬数据工具 train_ticket_query/flight_query/weather_query 才触发校验）。
+# critic 回路契约测试：run_critic 的 ok=true/ok=false、多轮带工具（read_file/grep）、限轮 fail-open，
+# 以及 service 层的触发条件（仅硬数据工具触发）与修正答案流程。
 import json
 
 import pytest
@@ -12,7 +12,7 @@ from app.services.agent_service import AgentService
 
 
 class FixedLLM:
-    """固定返回预设 critic JSON 的 LLM 假实现，并记录 chat（critic）调用。"""
+    """固定返回预设 critic JSON 的 LLM 假实现（单次 critic 测试用）。"""
 
     def __init__(self, content):
         self.content = content
@@ -27,6 +27,28 @@ class FixedLLM:
 
     async def stream_chat(self, messages, tools=None):
         yield {"type": "end", "tool_calls": None}
+
+
+class ScriptedChatLLM:
+    """按脚本逐次返回 chat 结果的 LLM 假实现（critic 多轮测试用），记录 messages 与 tools。"""
+
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.i = 0
+        self.calls = []
+
+    async def chat(self, messages, tools=None, response_format=None):
+        self.calls.append({"messages": messages, "tools": tools})
+        r = self.responses[self.i]
+        self.i += 1
+        return r
+
+    async def complete(self, messages):
+        return ""
+
+
+def _tool_call(call_id, name, args):
+    return {"id": call_id, "type": "function", "function": {"name": name, "arguments": args}}
 
 
 @pytest.mark.asyncio
@@ -44,6 +66,61 @@ async def test_run_critic_ok_false():
     r = await run_critic(llm, "天气：晴", "成都明天晴，票价100元")
     assert r["ok"] is False
     assert r["issues"][0]["claim"] == "票价100元"
+
+
+@pytest.mark.asyncio
+async def test_critic_multi_turn_reads_file():
+    """critic 多轮：第一轮调用 read_file 读完整结果，第二轮下结论 ok=false + issue。"""
+    llm = ScriptedChatLLM([
+        {"content": None, "tool_calls": [_tool_call("c1", "read_file", '{"path":"conv1/a.txt","offset":0,"limit":3500}')]},
+        {"content": '{"ok":false,"issues":[{"claim":"票价100元","problem":"工具结果是70元","correction":"改为70元"}]}',
+         "tool_calls": None},
+    ])
+    reads = []
+
+    async def read_file(path, offset, limit):
+        reads.append((path, offset, limit))
+        return {"content": "70元", "next_offset": 3, "total": 3, "eof": True}
+
+    async def grep(pattern, path):
+        return {"matches": [], "count": 0}
+
+    verdict = await run_critic(llm, "工具结果：票价70元", "票价100元",
+                               read_file_fn=read_file, grep_fn=grep, max_iter=3)
+    assert verdict["ok"] is False
+    assert len(verdict["issues"]) == 1
+    assert reads == [("conv1/a.txt", 0, 3500)]  # critic 确实调用了 read_file 读完整结果
+    assert llm.calls[0]["tools"] is not None  # 附了 read_file/grep 工具 schema
+
+
+@pytest.mark.asyncio
+async def test_critic_single_call_without_read_fn():
+    """无 read_file_fn 时退化为单次调用，不附工具。"""
+    llm = ScriptedChatLLM([
+        {"content": '{"ok":true,"issues":[]}', "tool_calls": None},
+    ])
+    verdict = await run_critic(llm, "工具结果：晴", "天气晴")
+    assert verdict == {"ok": True, "issues": []}
+    assert llm.calls[0]["tools"] is None
+
+
+@pytest.mark.asyncio
+async def test_critic_fail_open_on_max_iter():
+    """critic 每轮都在读、不收敛时，达到 max_iter 上限 fail-open（ok=True）。"""
+    llm = ScriptedChatLLM([
+        {"content": None, "tool_calls": [_tool_call("c1", "read_file", '{"path":"a.txt"}')]},
+        {"content": None, "tool_calls": [_tool_call("c2", "read_file", '{"path":"a.txt"}')]},
+        {"content": None, "tool_calls": [_tool_call("c3", "read_file", '{"path":"a.txt"}')]},
+    ])
+
+    async def read_file(path, offset, limit):
+        return {"content": "x", "next_offset": 1, "total": 1, "eof": True}
+
+    async def grep(pattern, path):
+        return {"matches": [], "count": 0}
+
+    verdict = await run_critic(llm, "工具结果：x", "答案", read_file_fn=read_file, grep_fn=grep, max_iter=3)
+    assert verdict == {"ok": True, "issues": []}
 
 
 class ScriptedStreamLLM:
@@ -77,6 +154,7 @@ class ScriptedStreamLLM:
 def _make_svc(tmp_path, monkeypatch, llm):
     """构造带假 LLM 的 service，并摘掉异步 LTM 提炼、mock 天气数据源避免真实网络。"""
     monkeypatch.setattr(settings, "db_path", str(tmp_path / "svc.db"))
+    monkeypatch.setattr(settings, "result_dir", str(tmp_path / "results"))
     # mock 天气数据源：返回短数据，避免真实 UAPIS 网络调用，也避免大结果触发短期记忆的 LLM 精炼
     async def fake_weather(self, city, days=7):
         return [{"date": "2026-09-01", "day_weather": "晴", "night_weather": "晴", "day_temp": 30, "night_temp": 20}]

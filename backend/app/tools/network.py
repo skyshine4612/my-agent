@@ -61,3 +61,5 @@ def register_network_tools(registry):
                                             "description": "提取深度：basic / advanced（JS 渲染页用 advanced）"},
                       }, "required": ["urls"]},
                       make_tavily_extract(tavily_ds), "网页正文提取")
+    # 返回内联 new 的数据源（供上层统一 close）
+    return [tavily_ds]

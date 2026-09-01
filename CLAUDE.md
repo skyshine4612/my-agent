@@ -57,11 +57,11 @@ api/routes/chat.py  →  services/agent_service.py  →  core/agent.py (ReAct �
 - **`app/core/agent.py`**：`Agent.run_stream` 实现 ReAct 循环（LLM 决策 → 工具调用 → 回填结果 → 再决策，最多 `max_iters=20` 轮）。同一轮多个 tool_calls 用 `asyncio.gather` 并行执行；工具结果用 `call_raw` 拿结构化原始结果后做结构化截断（list 前 3 / dict 前 10 键 / str 2000，`full` 字段保留完整结果供 critic 用），同时写短期记忆。工作记忆的 token 预算淘汰委托给 `core/memory/working.py` 的 `WorkingMemory`。
 - **`app/core/registry.py`**：`ToolRegistry` 统一管理工具元信息（name/description/parameters/fn/label），转成 OpenAI function-calling schema 供 LLM 决策，并执行同步/异步工具函数。
 - **`app/core/llm.py`**：`LLMClient` 抽象（`chat`/`complete`/`stream_chat` 三方法）+ `OpenAICompatLLM`（DashScope）+ `FallbackLLM`（无 key 兜底）+ `get_llm()` 单例工厂。
-- **`app/core/critic.py`**：`run_critic` 事实校验专家——用 LLM（`response_format={"type":"json_object"}`）比对「工具结果 vs 回答」，输出 `{ok, issues}`；注入当天日期避免年份误判，并过滤「correction 为空」的误报 issue（critic 填不出怎么改的，视为误报）。
+- **`app/core/critic.py`**：`run_critic` 事实校验专家——多轮带工具（`read_result` 定向读完整落库结果做 grounded 校验），比对「工具结果 vs 回答」，输出 `{ok, issues}`；注入当天日期避免年份误判，过滤「correction 为空」的误报 issue，限轮数 + fail-open（失败/超限按通过处理，不阻塞主流程）。
 
 ### 关键机制 / 不变量
 
-1. **critic 事实校验回路**（`agent_service.py` + `critic.py`）：仅当本轮调用了「硬数据工具」（`HARD_DATA_TOOLS = {train_ticket_query, flight_query, weather_query, holiday_calendar}`）才触发。第一轮答案先在 `consume()` 里被缓存、不直接下发；critic 判不通过时，**复用已查到的工具结果**让 LLM 直接重写答案（不重新调工具、不走 ReAct）。最终答案才拆成 40 字符块流式下发。所以 `token` 事件不是真正的逐 token 流式，而是「校验通过后分块补发」。
+1. **critic 事实校验回路**（`agent_service.py` + `critic.py`）：仅当本轮调用了「硬数据工具」（`HARD_DATA_TOOLS = {train_ticket_query, flight_query, weather_query, holiday_calendar}`）才触发。第一轮答案先在 `consume()` 里被缓存、不直接下发；critic 判不通过时，**复用已查到的工具结果**让 LLM 直接重写答案（不重新调工具、不走 ReAct）。最终答案才拆成 40 字符块流式下发。所以 `token` 事件不是真正的逐 token 流式，而是「校验通过后分块补发」。critic 本体是「多轮带工具」：可用 `read_result` 定向读回完整落库结果做事实比对（对齐 CRITIC/CoV），限 `max_iter=3` + fail-open；校验语料与模型生成时所见一致（`visible` 截断版）。
 
 2. **ToolRegistry 只在启动时装配一次**：`AgentService.__init__` 里 `_build_registry()` 一次性 `new` 所有数据源并缓存到 `self.registry`。原因：`Train12306DataSource` / `FlightVariflightDataSource` 及各 HTTP 数据源（UAPIS/Tavily/高德 Web）的 `__init__` 会创建从不 `close()` 的 httpx 客户端，若每请求重建会导致连接泄漏。**新增工具时注意保持这个「启动时装配一次」的模式**。
 
@@ -80,6 +80,10 @@ api/routes/chat.py  →  services/agent_service.py  →  core/agent.py (ReAct �
 9. **子 Agent 委派（上下文隔离）**（`tools/sub_agent.py`）：顶层 agent 可用 `call_sub_agent` 工具把复杂子任务（如查交通、查景点）委派给独立上下文的子 Agent——子 Agent 历史为空、只吃 `task`，业务规则由它按需 `get_skill` 加载，跑完只回传最终答案摘要，主 agent 的上下文不被大量工具结果淹没。子 Agent 内部工具调用不上报前端（`on_event=None`），前端只显示「委派子任务」一个气泡。当前为单层委派（子 Agent 工具集不含 `call_sub_agent`，避免无限下钻）。子 Agent 分配独立 `sub_conversation_id`（uuid）隔离短期记忆，任务结束（含异常）即清理，不与主会话/其他子 Agent 串扰。
 
 10. **三层记忆 + token 预算 + 三层压缩**（`core/memory/` 包）：工作记忆（上下文窗口，内存，每次问答即丢）+ 短期记忆（`short_term_memory` 表，按 `conversation_id` 隔离，存已查工具摘要防重查）+ 长期记忆（`long_term_memory` 表，按 `user_id` 跨会话）+ 会话历史（`conversation.py`）。工作记忆超 token 预算（`llm_context_budget`）时三层压缩：① 工具结果结构化截断；② 成对淘汰最老 assistant+tool 交互；③ 被淘汰单元批量 LLM 蒸馏成 `[早期交互摘要]` 兜底（不裸删）。短期记忆写入 UPSERT 去重（同 `tool_name+args` 覆盖）、summary 一句话级（结构化截断为主，大结果 LLM 精炼），注入 `short_term_hint` 全量极简清单。命名约定：工作/短期/长期记忆用 `working`/`short_term`/`long_term`，会话历史用 `conversation`，禁止 `session` 等混用。
+
+11. **工具结果地址索引（spill-to-file）**（`core/memory/tool_result.py` + `tools/file.py`）：工具结果超 `truncate_limit`（默认 4000 字符）时，完整结果写临时文件 `result_dir/<user_id>/<conversation_id>/<uuid>.txt`，窗口只放「预览 + 文件路径提示」，模型用 `read_file(path, offset, limit)`（顺序读 + 未读完进度提示）与 `grep(pattern, path)`（正则搜 + 位置/上下文片段）两个**写死的安全工具**按需读回被省略的部分。path 经路径白名单校验（拒绝 `..`/绝对路径穿越），按 `current_user_id`（`core/context.py` 的 contextvar）隔离目录。生命周期：本轮结束（`done` 前）与 `delete_conversation` 删该会话目录；子 Agent 同样写文件、子任务结束即清。这是对「纯截断」的升级——被截掉的部分不再是永久丢失，而是可读回。
+
+12. **历史会话压缩（running summary，一个会话一个累积摘要）**（`agent_service.py` + `conversation.py`）：一个会话维护一个累积摘要（存 `conversations` 表的 `summary`/`path` 字段）+ 一个完整历史文件（`result_dir/<user_id>/<conv_id>/_history.txt`）。组装 history 时预算驱动（`llm_context_budget * history_budget_ratio`，默认 50%）：最近的答案注入原文，超预算的早期答案追加到历史文件 + LLM 浓缩进累积摘要（替换旧摘要），拼上下文 = 最近原文 + 「`[摘要] {summary}\n[完整历史存到 {path}，可用 read_file 读]`」。这样「压缩把跨轮编排结果（如『第8天=什锦烫饭』）蒸馏丢」的幻觉，被「完整历史落盘 + read_file 读回」兜住。
 
 ### 前端结构
 

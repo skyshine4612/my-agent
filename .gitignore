@@ -17,6 +17,9 @@ dist/
 *.db
 *.db-journal
 
+# 工具结果地址索引的临时文件（本轮用完即删）
+results/
+
 # 测试与缓存
 .pytest_cache/
 .mypy_cache/

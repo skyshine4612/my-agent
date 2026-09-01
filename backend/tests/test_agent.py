@@ -113,7 +113,7 @@ async def test_run_stream_tool_call_and_accumulated_text():
     assert "查" not in "".join(e["content"] for e in events if e["type"] == "token")
     assert reg.called == [("w", {"c": "成都"})]
     assert any(e["type"] == "tool_call" and e["tool"] == "w" and e["args"] == {"c": "成都"} for e in events)
-    assert any(e["type"] == "tool_result" and e["tool"] == "w" and e["summary"] == "晴" for e in events)
+    assert any(e["type"] == "tool_result" and e["tool"] == "w" and e["status"] is True and e["result"] == "晴" for e in events)
 
 
 @pytest.mark.asyncio

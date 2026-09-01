@@ -13,12 +13,14 @@ from app.core.agent import Agent
 from app.core.prompts import load_prompt, today_hint
 
 
-def make_call_sub_agent(llm, registry, skill_names, short_term_memory, context_budget):
+def make_call_sub_agent(llm, registry, skill_names, short_term_memory, context_budget, tool_result_store=None):
     """构造 call_sub_agent 工具函数。
 
     子 Agent = 通用子助手：system prompt 含职责 + 可用业务清单 + 事实规范 + 日期；
     工具 = get_skill + 业务工具（排除 call_sub_agent 自己，避免递归委派）；
     规则由子 Agent 按需 get_skill 加载，主 Agent 委派时不指定 skill。
+    tool_result_store：工具结果地址索引存储，子 Agent 超长结果同样落库（与主 Agent 统一）；
+    为 None 时不落库（保持向后兼容）。
     """
 
     async def call_sub_agent(task: str) -> dict:
@@ -41,11 +43,14 @@ def make_call_sub_agent(llm, registry, skill_names, short_term_memory, context_b
             answer = await sub.run_stream(task, [], registry, on_event=None,
                                           short_term_memory=short_term_memory,
                                           conversation_id=sub_conversation_id,
-                                          context_budget=context_budget)
+                                          context_budget=context_budget,
+                                          tool_result_store=tool_result_store)
             return {"answer": answer}
         finally:
-            # 子任务结束（含异常）清理子会话短期记忆，不留垃圾记录
+            # 子任务结束（含异常）清理子会话短期记忆与工具结果地址索引，不留垃圾记录
             await short_term_memory.clear_conversation(sub_conversation_id)
+            if tool_result_store is not None:
+                await tool_result_store.delete_conversation(sub_conversation_id)
 
     call_sub_agent.__name__ = "call_sub_agent"
     call_sub_agent.description = (

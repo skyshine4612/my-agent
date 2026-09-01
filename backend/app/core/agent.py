@@ -6,6 +6,8 @@ import json
 import logging
 from dataclasses import dataclass, field
 
+from app.config import settings
+from app.core.context import current_user_id
 from app.core.memory.working import WorkingMemory
 
 logger = logging.getLogger(__name__)
@@ -13,29 +15,51 @@ logger = logging.getLogger(__name__)
 # 不写短期记忆的工具：get_skill 返回「规则正文」而非查询结果，call_sub_agent 返回委派摘要
 # （子任务内部已按子会话隔离写短期记忆）。它们不需要「防重查」，写进去反而产生无意义摘要。
 NON_SHORT_TERM_TOOLS = {"get_skill", "call_sub_agent"}
+# 非查询结果工具：返回「读回片段/规则正文/委派摘要」而非「查询结果」。
+# 它们的返回原样回填窗口（不结构化截断），也不触发地址索引（不写文件）——
+# 否则 read_file 读回的片段又被截断/写文件，会形成 read→截断/spill→read 的循环。
+NON_QUERY_TOOLS = {"read_file", "grep", "get_skill", "call_sub_agent"}
 
 
-def _struct_truncate_to_str(raw, list_limit=15, dict_limit=20, str_limit=4000) -> str:
-    """结构化截断：list 取前 list_limit 条 / dict 取前 dict_limit 键 / str 截断 str_limit，统一转字符串。
+def _struct_truncate_to_str(raw, list_limit=15, dict_limit=20, str_limit=4000):
+    """结构化截断：list 取前 list_limit 条 / dict 取前 dict_limit 键 / str 截断 str_limit。
 
-    相比旧的 4000 字符硬截断，结构化截断保留 dict/list 的完整键与条目，不会在字符中间切断；
-    截断发生时追加提示标记（如「仅展示前3条」），提示 LLM 结果不全、可带更精确入参重查。
+    返回 (截断文本, 截断描述)：截断描述如「仅展示前15条（共20条）」或「已截断」，未截断时为空串。
+    由调用方决定如何拼提示（spill 时合并成一句话，无 spill 时单独加标记）。
     """
+    note = ""
     if isinstance(raw, list):
         kept = raw[:list_limit]
-        s = str(kept)
-        note = f"[共{len(raw)}条，仅展示前{list_limit}条]" if len(raw) > list_limit else ""
-        s = s + note
+        s = json.dumps(kept, ensure_ascii=False, default=str)
+        if len(raw) > list_limit:
+            note = f"仅展示前{list_limit}条（共{len(raw)}条）"
     elif isinstance(raw, dict):
         keys = list(raw.keys())
         kept = {k: raw[k] for k in keys[:dict_limit]}
-        s = str(kept)
-        note = f"[共{len(keys)}键，仅展示前{dict_limit}键]" if len(keys) > dict_limit else ""
-        s = s + note
+        s = json.dumps(kept, ensure_ascii=False, default=str)
+        if len(keys) > dict_limit:
+            note = f"仅展示前{dict_limit}键（共{len(keys)}键）"
     else:
         s = str(raw)
     # 最终仍超过 str_limit 则硬截断兜底（dict/list 展开后可能超长）
-    return s if len(s) <= str_limit else s[:str_limit] + "[已截断]"
+    if len(s) > str_limit:
+        s = s[:str_limit]
+        if not note:
+            note = "已截断"
+    return s, note
+
+
+def _needs_spill(raw, list_limit=15, dict_limit=20, str_limit=4000) -> bool:
+    """判断完整结果是否被结构化截断（触发地址索引落库的条件）。
+
+    与 _struct_truncate_to_str 的截断维度对齐：list 超 list_limit / dict 超 dict_limit 键 /
+    str 超 str_limit 都算「被截断」，需要写文件保存完整结果供 read_file/grep 读回。
+    """
+    if isinstance(raw, list):
+        return len(raw) > list_limit or len(str(raw)) > str_limit
+    if isinstance(raw, dict):
+        return len(raw) > dict_limit or len(str(raw)) > str_limit
+    return len(str(raw)) > str_limit
 
 
 @dataclass
@@ -56,21 +80,24 @@ class Agent:
     max_iters: int = 20
 
     async def run_stream(self, user_message, history, registry, on_event=None,
-                         short_term_memory=None, conversation_id=None, context_budget=None):
+                         short_term_memory=None, conversation_id=None, context_budget=None,
+                         tool_result_store=None):
         """以流式方式执行一次完整 ReAct 循环，返回最终累积文本答复。
 
         流程：
             - 通过 llm.stream_chat 逐 token 产出；调工具轮次的 content 是内部思考（thought），不上发前端；
             - 仅最终答案（不调工具的轮次）经 on_event 发为 token 事件；
             - 同一轮多个 tool_calls 用 asyncio.gather 并行执行，结果按原始顺序回填 tool 消息；
-            - 工具结果回填前做结构化截断（list 前3 / dict 前10键 / str 2000），
-              但 tool_result 事件额外携带 full（截断前的完整结果），供上层 critic 校验；
+            - 工具结果回填前做结构化截断（list 前15 / dict 前20键 / str 4000），
+              tool_result 事件额外携带 visible（模型工作记忆里的截断版结果），供上层 critic 校验，
+              保证 critic 校验所用语料与模型生成答案时所见一致；
             - 每轮前查短期记忆拼 short_term_hint 注入，防止重复查询已查过的工具；
             - 每轮后工作记忆按 token 预算淘汰最老交互（超预算时 LLM 蒸馏成摘要兜底）。
 
         short_term_memory：短期记忆对象（ShortTermMemory），为 None 时不写/不注入。
         conversation_id：  短期记忆隔离维度（主会话或子会话 id）。
         context_budget：   工作记忆 token 预算，为 None 时不淘汰（保持原有无限累积行为）。
+        tool_result_store：工具结果地址索引存储（ToolResultStore），为 None 时不落库（不启用地址索引）。
 
         on_event：可选异步回调，接收流式事件（token / tool_call / tool_result）；为 None 时静默。
         """
@@ -118,11 +145,12 @@ class Agent:
                 full_text += round_text
                 for j in range(0, len(round_text), 40):
                     await emit({"type": "token", "content": round_text[j:j + 40]})
-                logger.info("[Agent:%s] 完成，返回文本（%d 字）", self.name, len(full_text))
+                logger.info("[Agent:%s] 本轮完成，返回最终答案（%d 字）", self.name, len(full_text))
                 return full_text
             # 有工具调用：把本轮 assistant 回复（含 tool_calls）写入窗口，让后续轮次能看见完整上下文
             window.append({"role": "assistant", "content": round_text, "tool_calls": calls})
-            logger.info("[Agent:%s] 第 %d 轮决定调用 %d 个工具", self.name, i + 1, len(calls))
+            logger.info("[Agent:%s] 第 %d 轮决定调用 %d 个工具：%s", self.name, i + 1, len(calls),
+                        ", ".join(tc["function"]["name"] for tc in calls))
 
             # 并行执行本轮所有无依赖工具调用；gather 保持与 calls 相同的返回顺序
             async def run_tool(tc):
@@ -135,7 +163,8 @@ class Agent:
                 fn = tc["function"]
                 # 解析工具入参（JSON 字符串 → dict），入参缺失时兜底为空对象
                 args = json.loads(fn["arguments"] or "{}")
-                logger.info("[Agent:%s] 调工具 %s，参数 %s", self.name, fn["name"], json.dumps(args, ensure_ascii=False))
+                logger.info("[Agent:%s] 第 %d 轮 调工具 %s（id=%s），参数 %s", self.name, i + 1, fn["name"], tc["id"],
+                            json.dumps(args, ensure_ascii=False))
                 await emit({"type": "tool_call", "agent": self.name, "tool": fn["name"], "args": args, "id": tc["id"],
                             "label": registry.label(fn["name"])})
                 # 通过 registry 真正执行工具，拿到结构化原始结果（call_raw 不做 str() 转换）；
@@ -145,20 +174,33 @@ class Agent:
                 except Exception as e:
                     logger.warning("[Agent:%s] 工具 %s 执行失败：%s", self.name, fn["name"], e)
                     raw = f"工具执行失败：{e}"
-                # full 保留完整结果（str），供上层的 critic 回路校验回答是否与工具结果矛盾
-                full = str(raw)
-                # 回填工作记忆：结构化截断（list 前15 / dict 前20键 / str 4000）。
+                # 回填工作记忆：结构化截断（list 前15 / dict 前20键 / str truncate_limit），
+                # 这份截断版结果就是模型所见语料；critic 校验与修正重写都复用它，保证语料一致。
                 # 放宽截断避免丢数据（天气 7 天、POI 前 15 个都保留），超长由 token 预算淘汰兜底
-                text = _struct_truncate_to_str(raw, 15, 20, 4000)
+                if fn["name"] in NON_QUERY_TOOLS:
+                    # 非查询结果工具（read_file/grep/get_skill/call_sub_agent）：返回内容原样回填，
+                    # 不做结构化截断（读回片段/规则正文本身就是有界且需要完整的），也不触发地址索引
+                    text = str(raw)
+                else:
+                    text, note = _struct_truncate_to_str(raw, 15, 20, settings.truncate_limit)
+                    # 地址索引：完整结果被截断（list 超15 / dict 超20键 / str 超阈值）时写临时文件，
+                    # 窗口只放预览 + 文件路径，模型可 read_file/grep 读回被省略部分
+                    if (tool_result_store is not None and conversation_id is not None
+                            and _needs_spill(raw, str_limit=settings.truncate_limit)):
+                        path = await tool_result_store.write(conversation_id, current_user_id.get(), str(raw))
+                        parts = [note, f"完整结果存到 {path}"] if note else [f"完整结果存到 {path}"]
+                        text = f"{text}\n[{'; '.join(parts)}，可用 read_file/grep 读回剩余]"
+                    elif note:
+                        text = f"{text}[{note}]"
                 # 写短期记忆：一句话级 summary（结构化截断为主，大结果 LLM 精炼），供后续轮次防重查。
                 # get_skill / call_sub_agent 这类「非查询结果」工具不写，避免把规则正文/委派摘要误当已查结果
                 if short_term_memory is not None and conversation_id is not None and fn["name"] not in NON_SHORT_TERM_TOOLS:
                     summary = await self._summarize_for_short_term(raw)
                     await short_term_memory.write(conversation_id, fn["name"], args, summary)
-                logger.info("[Agent:%s] 工具 %s(%s) 返回 %.120s", self.name, fn["name"],
-                            json.dumps(args, ensure_ascii=False)[:60], text)
+                    logger.info("[Agent:%s] 写短期记忆：%s(%s)", self.name, fn["name"], json.dumps(args, ensure_ascii=False))
+                logger.info("[Agent:%s] 第 %d 轮 工具 %s 完成（id=%s），返回 %.120s", self.name, i + 1, fn["name"], tc["id"], text)
                 await emit({"type": "tool_result", "agent": self.name, "tool": fn["name"],
-                            "summary": text[:120], "full": full, "id": tc["id"], "label": registry.label(fn["name"])})
+                            "status": True, "result": text, "id": tc["id"], "label": registry.label(fn["name"])})
                 # 返回带 tool_call_id 的回填项，供上层按原始顺序组装 tool 消息
                 return {"tool_call_id": tc["id"], "content": text}
 
@@ -185,9 +227,10 @@ class Agent:
         rows = await short_term_memory.get_all(conversation_id)
         if not rows:
             return []
-        # 拼极简清单：tool_name(args) → 一句话结果
+        logger.info("[Agent:%s] 注入短期记忆 hint：%d 条已查工具", self.name, len(rows))
+        # 拼极简清单：tool_name(args) → 一句话结果（明确标注为摘要，避免模型误当完整结果直接引用）
         items = [f"{r['tool_name']}({r['args']}) → {r['summary']}" for r in rows]
-        return [{"role": "system", "content": "已查：" + "；".join(items)}]
+        return [{"role": "system", "content": "已查（以下仅为摘要、非完整结果；追问具体内容或询问新的具体实体都需重新查）：" + "；".join(items)}]
 
     async def _summarize_for_short_term(self, raw):
         """生成短期记忆的一句话级 summary：结构化截断为主，大结果（>500 字符）LLM 精炼成一句话。
@@ -198,7 +241,7 @@ class Agent:
         raw_str = json.dumps(raw, ensure_ascii=False) if not isinstance(raw, str) else raw
         # 小结果：直接结构化截断（list 前2 / dict 前3键 / str 100）
         if len(raw_str) <= 500:
-            return _struct_truncate_to_str(raw, 2, 3, 100)
+            return _struct_truncate_to_str(raw, 2, 3, 100)[0]
         # 大结果：LLM 精炼成一句话，失败退回结构化截断（不影响主流程）
         try:
             return await self.llm.complete([
@@ -208,4 +251,4 @@ class Agent:
             ])
         except Exception:
             logger.warning("[Agent:%s] LLM 精炼短期记忆摘要失败，退回结构化截断", self.name)
-            return _struct_truncate_to_str(raw, 2, 3, 100)
+            return _struct_truncate_to_str(raw, 2, 3, 100)[0]

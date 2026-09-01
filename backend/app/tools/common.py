@@ -115,15 +115,17 @@ def register_common_tools(registry):
                       {"type": "object",
                        "properties": {"id": {"type": "string", "description": "菜谱 id，来自 recipe_search 返回"}},
                        "required": ["id"]},
-                      make_recipe_detail(uapis_ds), "菜谱做法")
+                      make_recipe_detail(uapis_ds), "搜菜谱做法")
     registry.register("ingredient_nutrition", "查询食材的营养成分（热量/蛋白质/脂肪/碳水/膳食纤维）",
                       {"type": "object",
                        "properties": {"keyword": {"type": "string", "description": "食材名称，如 鸡胸肉、白菜"}},
                        "required": ["keyword"]},
-                      make_ingredient_nutrition(uapis_ds), "食材营养")
+                      make_ingredient_nutrition(uapis_ds), "搜食材营养")
     registry.register("weather_query", "查询城市未来天气（最多 7 天预报），city 支持中文名/英文名/adcode",
                       {"type": "object", "properties": {
                           "city": {"type": "string", "description": "城市名（中文/英文）或 adcode"},
                           "days": {"type": "integer", "description": "预报天数，最多 7 天"}},
                        "required": ["city"]},
                       make_weather_query(uapis_ds), "查询天气")
+    # 返回内联 new 的数据源（供上层统一 close）
+    return [uapis_ds]

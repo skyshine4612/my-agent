@@ -100,16 +100,17 @@ async function send(text: string) {
           phase.value = ''
           break
         case 'tool_result': {
-          // 回填摘要：优先按 id 精确匹配（同名工具并发也不串），id 缺失时回退按工具名。
+          // 回填结果：优先按 id 精确匹配（同名工具并发也不串），id 缺失时回退按工具名。
           // （不调用 ensureAssistant，避免无匹配时新建 content/tools 全空的气泡）
           if (!current) break
           const list = current.tools!
           for (let i = list.length - 1; i >= 0; i--) {
             const t = list[i]!
-            if (t.summary) continue
+            if (t.status) continue
             const matched = ev.id ? t.id === ev.id : t.tool === ev.tool
             if (matched) {
-              t.summary = ev.summary
+              t.status = ev.status
+              t.result = ev.result
               assistantOutput.value = true
               break
             }

@@ -34,6 +34,13 @@ class Settings(BaseSettings):
     # 工作记忆 token 预算上限：每次 LLM 调用前估算上下文，超预算淘汰最老交互 + LLM 摘要兜底
     # 应 ≤ 模型上下文上限并预留输出余量（qwen-plus 默认留一半）
     llm_context_budget: int = 32000
+    # 工具结果字符串截断阈值：超过该字符数时，完整结果写临时文件，
+    # 窗口只放预览 + 文件路径提示，模型用 read_file/grep 按需读回被截掉的部分
+    truncate_limit: int = 4000
+    # 工具结果地址索引的落盘目录（超长结果写临时文件，本轮结束即删）
+    result_dir: str = "results"
+    # 历史答案原文占 llm_context_budget 的比例（历史会话压缩：超预算的早期答案落盘+摘要，剩余的留给工具交互）
+    history_budget_ratio: float = 0.5
 
 
 # 全局配置实例，供各模块导入使用
