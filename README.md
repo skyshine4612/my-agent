@@ -17,12 +17,12 @@
 
 ## 技术栈
 
-| 层 | 技术 |
-|---|---|
+| 层 | 技术                                                                                    |
+|---|-----------------------------------------------------------------------------------------|
 | 后端 | Python 3.11+ · FastAPI · pydantic-settings · openai SDK · mcp · sse-starlette · sqlite3 |
-| 前端 | Vue 3 · Vite · TypeScript · Element Plus · Pinia · marked + DOMPurify |
-| LLM | 阿里云百炼 DashScope（`qwen-plus`，OpenAI 兼容协议） |
-| 部署 | Docker + docker-compose · nginx |
+| 前端 | Vue 3 · Vite · TypeScript · Element Plus · Pinia · marked + DOMPurify                   |
+| LLM | 阿里云百炼 DashScope（`qwen3.7-plus`，OpenAI 兼容协议）                                 |
+| 部署 | Docker + docker-compose · nginx                                                         |
 
 ## 目录结构
 
@@ -98,22 +98,33 @@ docker compose up --build
 
 `backend/.env` 支持的配置项：
 
-| 变量 | 说明 | 默认值 |
-|---|---|---|
-| `LLM_API_KEY` | LLM 服务 API Key | 空 |
+| 变量 | 说明 | 默认值                                              |
+|---|---|-----------------------------------------------------|
+| `LLM_API_KEY` | LLM 服务 API Key | 空                                                  |
 | `LLM_BASE_URL` | LLM 接口地址 | `https://dashscope.aliyuncs.com/compatible-mode/v1` |
-| `LLM_MODEL` | 使用的模型 | `qwen-plus` |
-| `MODELSCOPE_TOKEN` | ModelScope 访问令牌（调用 MCP 服务） | 空 |
-| `TRAIN_12306_URL` | 12306 火车票 MCP 服务地址 | 空 |
-| `FLIGHT_VARIFLIGHT_URL` | variflight 官方 MCP 服务地址 | 空 |
-| `VARIFLIGHT_API_KEY` | variflight 官方 API Key（X-API-Key 认证） | 空 |
-| `UAPIS_API_KEY` | UAPIS 令牌（节假日/翻译/热榜/菜谱/营养；天气接口免费无需 key） | 空 |
-| `TAVILY_API_KEY` | Tavily API Key（搜索/网页提取） | 空 |
-| `AMAP_API_KEY` | 高德 Web 服务 Key（POI/推荐菜） | 空 |
-| `DB_PATH` | SQLite 数据库文件路径 | `app.db` |
-| `LLM_CONTEXT_BUDGET` | 工作记忆 token 预算上限（超限淘汰最老 + LLM 摘要兜底） | `32000` |
-| `TRUNCATE_LIMIT` | 工具结果字符串截断阈值（超限完整结果写文件，read_file/grep 按需读） | `4000` |
-| `RESULT_DIR` | 工具结果地址索引的落盘目录（本轮用完即删） | `results` |
+| `LLM_MODEL` | 使用的模型 | `qwen3.7-plus`                                      |
+| `MODELSCOPE_TOKEN` | ModelScope 访问令牌（调用 MCP 服务） | 空                                                  |
+| `TRAIN_12306_URL` | 12306 火车票 MCP 服务地址 | 空                                                  |
+| `FLIGHT_VARIFLIGHT_URL` | variflight 官方 MCP 服务地址 | 空                                                  |
+| `VARIFLIGHT_API_KEY` | variflight 官方 API Key（X-API-Key 认证） | 空                                                  |
+| `UAPIS_API_KEY` | UAPIS 令牌（节假日/翻译/热榜/菜谱/营养；天气接口免费无需 key） | 空                                                  |
+| `TAVILY_API_KEY` | Tavily API Key（搜索/网页提取） | 空                                                  |
+| `AMAP_API_KEY` | 高德 Web 服务 Key（POI/推荐菜） | 空                                                  |
+| `DB_PATH` | SQLite 数据库文件路径 | `app.db`                                            |
+| `LLM_CONTEXT_BUDGET` | 工作记忆 token 预算上限（超限淘汰最老 + LLM 摘要兜底） | `32000`                                             |
+| `TRUNCATE_LIMIT` | 工具结果字符串截断阈值（超限完整结果写文件，read_file/grep 按需读） | `4000`                                              |
+| `RESULT_DIR` | 工具结果地址索引的落盘目录（本轮用完即删） | `results`                                           |
+
+### 密钥获取来源
+
+| 变量 | 获取网站 / 路径 |
+|---|---|
+| `LLM_API_KEY` | [阿里云百炼控制台](https://bailian.console.aliyun.com) → API-KEY 管理 |
+| `MODELSCOPE_TOKEN` | [ModelScope 魔搭社区](https://modelscope.cn) → 个人中心 → 访问令牌（Access Token） |
+| `VARIFLIGHT_API_KEY` | [飞常准飞友 AI 开放平台](https://ai.variflight.com) → 注册后「API Keys」页（[ai.variflight.com/keys](https://ai.variflight.com/keys)） |
+| `UAPIS_API_KEY` | [UAPIS 开放接口平台](https://uapis.cn) → 注册后控制台（[uapis.cn/console](https://uapis.cn/console)）「API keys」标签页 |
+| `TAVILY_API_KEY` | [Tavily](https://app.tavily.com) → 注册登录后「API Keys」页 |
+| `AMAP_API_KEY` | [高德开放平台](https://lbs.amap.com) → 控制台 → 应用管理 → 创建应用添加 Key（Web 服务） |
 
 ## API 概览
 
@@ -142,7 +153,11 @@ uv run pytest tests/test_llm.py -k stream   # 按关键字筛选
 
 ## 如何扩展新业务
 
-1. 在 `backend/app/skills/<业务名>/SKILL.md` 写业务规则，frontmatter 声明 `name` + `description`。
-2. 如需新工具，在 `backend/app/tools/` 下用 `registry.register(...)` 注册。数据源可走 MCP（继承 `datasource/mcp_base.py` 的 `McpDataSource`）或 HTTP 直连（参考 `datasource/uapis.py` / `tavily.py` / `amap_web.py` 用 `httpx.AsyncClient`）。
+1. **业务规则（skill）**：在 `backend/app/skills/<业务名>/SKILL.md` 写业务规则，frontmatter 声明 `name` + `description`。清单会自动注入 system prompt，正文由 `get_skill` 工具按需加载——此步无需改动任何装配代码。
 
-skill 清单会自动注入 system prompt，正文由 `get_skill` 工具按需加载，无需改动 service 装配代码。
+2. **工具（三步，缺一不可）**：
+   1. **写数据源**：走 MCP 继承 `datasource/mcp_base.py` 的 `McpDataSource`（子类传 `url` + 认证头，实现查询方法）；走 HTTP 继承 `datasource/http_base.py` 的 `HttpDataSource`（基类封装了 `httpx.AsyncClient`）。
+   2. **写注册函数**：在 `app/tools/` 下写 `register_xxx_tools(registry, ...)`，内部用 `registry.register(name, description, parameters, fn, label)` 逐个注册，并返回内联 `new` 的数据源（供上层统一 `close`）。
+   3. **登记**：在 `app/tools/__init__.py` 的 `register_all_tools()` 里加一行 `datasources.extend(xxx.register_xxx_tools(registry, ...))`。
+
+   service 的 `_build_registry()` 只在启动时装配一次（数据源 `__init__` 会创建从不 `close` 的 httpx 客户端），新工具接入 `register_all_tools` 后即自动生效，无需改 service 装配代码。
