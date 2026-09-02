@@ -25,7 +25,8 @@ function submit() {
 
 // 把 markdown 文本渲染为安全的 HTML：先 marked 转 HTML，再 DOMPurify 清洗防 XSS
 function renderMarkdown(text: string): string {
-  const raw = marked.parse(text, { async: false }) as string
+  // breaks: true 让单换行也渲染成 <br>：否则 LLM 输出里的单换行（如逐日安排、逐餐厅）会被吞掉挤成一行
+  const raw = marked.parse(text, { async: false, breaks: true }) as string
   return DOMPurify.sanitize(raw)
 }
 

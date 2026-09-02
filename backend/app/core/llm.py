@@ -51,7 +51,9 @@ class OpenAICompatLLM(LLMClient):
 
     async def chat(self, messages, tools=None, response_format=None):
         # 组装请求参数：模型名 + 消息列表，仅在提供 tools 时附带工具定义
-        kw = {"model": self.model, "messages": messages}
+        # extra_body 传 Qwen 的 enable_thinking（非标准字段，openai 库通过 extra_body 合并到请求体顶层）
+        kw = {"model": self.model, "messages": messages,
+              "extra_body": {"enable_thinking": settings.enable_thinking}}
         if tools:
             kw["tools"] = tools
         # 提供 response_format（如 {"type":"json_object"}）时，要求模型强制输出合法 JSON
@@ -79,7 +81,8 @@ class OpenAICompatLLM(LLMClient):
         最后按 index 升序组装成与 chat() 同形状的 tool_calls（无工具调用时为 None）。
         """
         # 组装请求参数，stream=True 开启 SSE 流式返回
-        kw = {"model": self.model, "messages": messages, "stream": True}
+        kw = {"model": self.model, "messages": messages, "stream": True,
+              "extra_body": {"enable_thinking": settings.enable_thinking}}
         if tools:
             kw["tools"] = tools
         stream = await self.client.chat.completions.create(**kw)
