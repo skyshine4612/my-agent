@@ -174,19 +174,19 @@ class Agent:
                 except Exception as e:
                     logger.warning("[Agent:%s] 工具 %s 执行失败：%s", self.name, fn["name"], e)
                     raw = f"工具执行失败：{e}"
-                # 回填工作记忆：结构化截断（list 前15 / dict 前20键 / str truncate_limit），
+                # 回填工作记忆：结构化截断（list 前20 / dict 前20键 / str truncate_limit），
                 # 这份截断版结果就是模型所见语料；critic 校验与修正重写都复用它，保证语料一致。
-                # 放宽截断避免丢数据（天气 7 天、POI 前 15 个都保留），超长由 token 预算淘汰兜底
+                # 放宽截断避免丢数据（天气 7 天、POI 前 20 个都保留），超长由 token 预算淘汰兜底
                 if fn["name"] in NON_QUERY_TOOLS:
                     # 非查询结果工具（read_file/grep/get_skill/call_sub_agent）：返回内容原样回填，
                     # 不做结构化截断（读回片段/规则正文本身就是有界且需要完整的），也不触发地址索引
                     text = str(raw)
                 else:
-                    text, note = _struct_truncate_to_str(raw, 15, 20, settings.truncate_limit)
-                    # 地址索引：完整结果被截断（list 超15 / dict 超20键 / str 超阈值）时写临时文件，
+                    text, note = _struct_truncate_to_str(raw, 20, 20, settings.truncate_limit)
+                    # 地址索引：完整结果被截断（list 超20 / dict 超20键 / str 超阈值）时写临时文件，
                     # 窗口只放预览 + 文件路径，模型可 read_file/grep 读回被省略部分
                     if (tool_result_store is not None and conversation_id is not None
-                            and _needs_spill(raw, str_limit=settings.truncate_limit)):
+                            and _needs_spill(raw, list_limit=20, str_limit=settings.truncate_limit)):
                         path = await tool_result_store.write(conversation_id, current_user_id.get(), str(raw))
                         parts = [note, f"完整结果存到 {path}"] if note else [f"完整结果存到 {path}"]
                         text = f"{text}\n[{'; '.join(parts)}，可用 read_file/grep 读回剩余]"

@@ -7,10 +7,6 @@ from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
-# 注入 long_term_hint 时单条 fact 的字符上限，防止历史偏好把提示词撑爆
-FACT_HINT_CHAR_LIMIT = 100
-
-
 class LongTermMemory:
     """长期记忆：存储从对话中提炼出的偏好/事实（long_term_memory），超过容量上限时按 importance 淘汰。"""
 
@@ -66,19 +62,17 @@ class LongTermMemory:
         return await asyncio.to_thread(r)
 
     async def recall(self, user_id, top_n=20):
-        """按 importance 降序取前 top_n 条事实，每条 fact 截断到 FACT_HINT_CHAR_LIMIT 字符，返回 [{"fact","importance"}]。
+        """按 importance 降序取前 top_n 条事实，返回 [{"fact","importance"}]。
 
-        与 get_all 的区别：recall 供组装 long_term_hint 使用，有数量上限 + 单条截断，避免提示词被历史偏好撑爆；
+        与 get_all 的区别：recall 供组装 long_term_hint 使用，有数量上限（top_n），避免提示词被历史偏好撑爆；
         无硬阈值，importance 仅用于 add_facts 内的容量淘汰与这里的排序。
         """
 
         def r():
             with self._conn() as c:
-                rows = c.execute(
+                return [dict(x) for x in c.execute(
                     "SELECT fact,importance FROM long_term_memory WHERE user_id=? ORDER BY importance DESC LIMIT ?",
-                    (user_id, top_n)).fetchall()
-            # 单条 fact 截断：只保留前 FACT_HINT_CHAR_LIMIT 字符，控制 long_term_hint 体积
-            return [{"fact": x["fact"][:FACT_HINT_CHAR_LIMIT], "importance": x["importance"]} for x in rows]
+                    (user_id, top_n)).fetchall()]
 
         result = await asyncio.to_thread(r)
         logger.info("[记忆:long_term] 召回长期记忆 %d 条（top_n=%d）", len(result), top_n)

@@ -16,6 +16,7 @@ from app.core.memory import ConversationStore, LongTermMemory, ShortTermMemory, 
 from app.core.prompts import load_prompt, render_system_prompt, today_hint
 from app.core.registry import ToolRegistry
 from app.core.skills import load_skills
+from app.core.token_utils import estimate_tokens
 from app.datasource.amap_web import AmapWebDataSource
 from app.tools import register_all_tools
 from app.tools.file import register_file_tools
@@ -122,46 +123,8 @@ class AgentService:
         # 3. 长期记忆召回：按 importance 降序取前 20 条（单条已截断），拼成 long_term_hint 注入 system 上下文
         facts = await self.long_term_memory.recall(user_id, top_n=20)
         long_term_hint = "用户历史偏好：" + "；".join(f["fact"] for f in facts) if facts else ""
-        # 4. 组装历史（running summary）：user 消息原文；assistant 答案预算内原文、超预算的早期答案压缩。
-        raw_history = await self.conversation_store.get_history(user_id, conv_id)
-        summary, history_path = await self.conversation_store.get_summary(conv_id)
-        budget = int(settings.llm_context_budget * settings.history_budget_ratio)
-        used = 0
-        recent = []  # 从最近往最老收集（预算内原文）
-        to_compress = []  # 超预算的早期答案原文（待压缩）
-        for h in reversed(raw_history):
-            if h["role"] == "user":
-                recent.append({"role": "user", "content": h["content"]})
-                used += len(h["content"]) // 4
-            else:
-                data = None
-                try:
-                    data = json.loads(h["content"])
-                except (json.JSONDecodeError, TypeError):
-                    pass
-                if isinstance(data, dict) and isinstance(data.get("content"), str):
-                    if used <= budget:
-                        recent.append({"role": "assistant", "content": data["content"]})
-                        used += len(data["content"]) // 4
-                    else:
-                        to_compress.append(data["content"])
-                else:
-                    recent.append({"role": "assistant", "content": h["content"]})
-                    used += len(h["content"]) // 4
-        history = list(reversed(recent))
-        # 触发压缩：超预算的早期答案追加到历史文件 + 浓缩进累积摘要（替换旧摘要）
-        if to_compress:
-            logger.info("[service] 历史超预算，触发 running summary 压缩：压缩 %d 条早期答案", len(to_compress))
-            compressed_text = "\n\n".join(reversed(to_compress))
-            history_path = await self.tool_result_store.append_history(conv_id, user_id, compressed_text)
-            summary = await self._update_summary(summary, compressed_text)
-            await self.conversation_store.set_summary(conv_id, summary, history_path)
-        if summary:
-            history.insert(0, {"role": "assistant",
-                               "content": f"[摘要] {summary}\n[完整历史存到 {history_path}，可用 read_file 读]"})
-        # 末尾一条是本轮刚落库的用户消息，run_stream 会再追加一次，这里剔除避免重复
-        if history and history[-1]["role"] == "user":
-            history = history[:-1]
+        # 4. 组装历史（running summary）：预算内保留最近回合原文，超预算的早期回合压缩。
+        history = await self._assemble_history(user_id, conv_id)
         # 5. 顶层 agent：复用 __init__ 缓存的 registry（不在每请求重建，避免泄漏 MCP 数据源）
         registry = self.registry
         tool_grounding = load_prompt("grounding")
@@ -314,14 +277,72 @@ class AgentService:
         asyncio.create_task(self._extract_facts(user_id, conv_id))
         yield {"type": "done"}
 
+    async def _assemble_history(self, user_id, conv_id):
+        """组装会话历史（running summary 压缩）：预算内保留最近回合原文，超预算的早期回合压缩。
+
+        返回时间正序的 [{"role","content"}] 列表，已剔除本轮刚落库的 user 消息（run_stream 会再追加）。
+        压缩副作用：超预算的早期消息落盘历史文件 + LLM 浓缩进累积摘要（存回 conversations 表）。
+        """
+        raw_history = await self.conversation_store.get_history(user_id, conv_id)
+        summary, history_path = await self.conversation_store.get_summary(conv_id)
+        budget = int(settings.llm_context_budget * settings.history_budget_ratio)
+        # 还原纯文本并按「回合」分组：一个 user 消息 + 其后连续的 assistant 回复算一个回合。
+        # 与工作记忆的「单元淘汰」同理——预算边界只落在回合之间，不把一问一答从中间切开。
+        turns = []
+        for h in raw_history:
+            # 统一还原纯文本 content：assistant 落库是 JSON（{"content","tools"}），user 是纯文本
+            content = h["content"]
+            if h["role"] == "assistant":
+                data = None
+                try:
+                    data = json.loads(content)
+                except (json.JSONDecodeError, TypeError):
+                    pass
+                if isinstance(data, dict) and isinstance(data.get("content"), str):
+                    content = data["content"]
+            # user 消息开启新回合（首个消息若为 assistant 也归入第一个回合）
+            if h["role"] == "user" or not turns:
+                turns.append([])
+            turns[-1].append({"role": h["role"], "content": content})
+        # 反序遍历回合（最新→最老），按整回合累积预算：预算内整回合保留，超预算整回合压缩；至少保留最新一个回合。
+        used = 0
+        keep_from = len(turns)
+        for i in range(len(turns) - 1, -1, -1):
+            cost = sum(estimate_tokens(m["content"]) for m in turns[i])
+            if used + cost <= budget or i == len(turns) - 1:
+                used += cost
+                keep_from = i
+            else:
+                break
+        history = [m for turn in turns[keep_from:] for m in turn]
+        to_compress = [m for turn in turns[:keep_from] for m in turn]
+        # 触发压缩：超预算的早期消息追加到历史文件 + 浓缩进累积摘要（替换旧摘要）
+        if to_compress:
+            logger.info("[service] 历史超预算，触发 running summary 压缩：压缩 %d 条早期消息", len(to_compress))
+            # to_compress 已按时间正序，带角色前缀拼接，供摘要与历史文件可读
+            compressed_text = "\n\n".join(
+                f"[{'用户' if x['role'] == 'user' else '助手'}] {x['content']}"
+                for x in to_compress
+            )
+            history_path = await self.tool_result_store.append_history(conv_id, user_id, compressed_text)
+            summary = await self._update_summary(summary, compressed_text)
+            await self.conversation_store.set_summary(conv_id, summary, history_path)
+        if summary:
+            history.insert(0, {"role": "assistant",
+                               "content": f"[摘要] {summary}\n[完整历史存到 {history_path}，可用 read_file 读]"})
+        # 末尾一条是本轮刚落库的用户消息，run_stream 会再追加一次，这里剔除避免重复
+        if history and history[-1]["role"] == "user":
+            history = history[:-1]
+        return history
+
     async def _update_summary(self, old_summary, compressed_text):
-        """LLM 把「旧摘要 + 新被压缩答案」浓缩成新的累积摘要；失败回退字符串拼接。"""
+        """LLM 把「旧摘要 + 更早对话」浓缩成新的累积摘要；失败回退字符串拼接。"""
         try:
             return await self.llm.complete([
                 {"role": "system",
-                 "content": "把下面的「旧摘要 + 新答案」浓缩成一个新的累积摘要（100-300 字），保留核心结论、关键数据（菜名/价格/时间/结构要点）。"},
+                 "content": "把下面的「旧摘要 + 更早对话」浓缩成一个新的累积摘要（100-300 字），保留核心结论、关键数据（菜名/价格/时间/结构要点）。"},
                 {"role": "user",
-                 "content": f"旧摘要：{old_summary or '（无）'}\n\n新答案：\n{compressed_text[:4000]}"},
+                 "content": f"旧摘要：{old_summary or '（无）'}\n\n更早对话：\n{compressed_text[:4000]}"},
             ])
         except Exception:
             logger.warning("[service] 摘要浓缩失败，回退拼接")
@@ -341,7 +362,7 @@ class AgentService:
                 return
             resp = await self.llm.complete([
                 {"role": "system",
-                 "content": "从下面的用户发言里，只提取【稳定的、跨会话可复用的】偏好或事实（如常住城市、长期的兴趣偏好、习惯性要求，例：'偏好经济型酒店'、'喜欢自然风光'）。不要提取一次性的行程请求参数（如'去成都玩2天预算2000'这种某次旅行的具体目的地/天数/预算），也不要提取助手推荐的内容。没有稳定偏好就输出空列表。每条打 importance(0~1)。输出 JSON:{\"facts\":[{\"fact\":\"...\",\"importance\":0.8}]}"},
+                 "content": "从下面的用户发言里，只提取【稳定的、跨会话可复用的】偏好或事实（如常住城市、长期的兴趣偏好、习惯性要求，例：'偏好经济型酒店'、'喜欢自然风光'）。不要提取一次性的行程请求参数（如'去成都玩2天预算2000'这种某次旅行的具体目的地/天数/预算），也不要提取助手推荐的内容。没有稳定偏好就输出空列表。每条 fact 不超过 100 个字。每条打 importance(0~1)。输出 JSON:{\"facts\":[{\"fact\":\"...\",\"importance\":0.8}]}"},
                 {"role": "user", "content": json.dumps(user_msgs, ensure_ascii=False)}])
             data = json.loads(resp[resp.index("{"):resp.rindex("}") + 1])
             new_facts = data.get("facts", [])

@@ -5,6 +5,8 @@
 import json
 import logging
 
+from app.core.token_utils import estimate_tokens
+
 logger = logging.getLogger(__name__)
 
 
@@ -21,16 +23,10 @@ class WorkingMemory:
         self.budget_tokens = budget_tokens
 
     def _estimate(self, messages):
-        """估算消息列表的 token 数：中文按约 1 字符/token、英文按约 4 字符/token 统计。
-
-        中文（CJK 汉字）tokenizer 的压缩率远低于英文（1 个汉字≈1 个 token），
-        若统一按「4 字符/token」会严重低估中文、导致淘汰触发过晚、预算控制失效，故区分中英分别估算。
-        """
+        """估算消息列表的 token 数：复用 estimate_tokens 的中英分别估算（中文 1 字符/token，其余 4 字符/token）。"""
         total = 0
         for m in messages:
-            s = json.dumps(m, ensure_ascii=False)
-            cjk = sum(1 for ch in s if '一' <= ch <= '鿿')
-            total += cjk + (len(s) - cjk) // 4
+            total += estimate_tokens(json.dumps(m, ensure_ascii=False))
         return total
 
     @staticmethod

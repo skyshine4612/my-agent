@@ -16,11 +16,15 @@ def register_system_tools(registry, skill_names):
         body = get_skill_body(name)
         return body if body else f"未知业务：{name}"
 
-    get_skill.__name__ = "get_skill"
-    get_skill.description = "获取指定业务的规划规则正文（如旅行规划规则）。处理某业务任务前只需调用一次，规则正文加载后会保留在上下文中，不要重复调用。"
-    get_skill.parameters = {
-        "type": "object",
-        "properties": {"name": {"type": "string", "enum": skill_names, "description": "业务名"}},
-        "required": ["name"],
-    }
-    registry.register("get_skill", get_skill.description, get_skill.parameters, get_skill, "读取业务规则")
+    # description（何时调）与 parameters（入参 schema，name 用 enum 约束只能取已注册业务）直接传给 register
+    registry.register(
+        "get_skill",
+        "获取指定业务的规划规则正文（如旅行规划规则）。处理某业务任务前只需调用一次，规则正文加载后会保留在上下文中，不要重复调用。",
+        {
+            "type": "object",
+            "properties": {"name": {"type": "string", "enum": skill_names, "description": "业务名"}},
+            "required": ["name"],
+        },
+        get_skill,
+        "读取业务规则",
+    )
