@@ -7,7 +7,7 @@ import { useConversationStore } from '@/stores/conversation'
 import { chatStream } from '@/services/sse'
 import { listConversations, getConversation, deleteConversation, getLongTermMemory, getShortTermMemory } from '@/services/api'
 import ChatPanel from '@/components/ChatPanel.vue'
-import type { ChatMessage, ToolEvent, LongTermMemory, ShortTermMemory } from '@/types'
+import type { ChatMessage, ToolEvent, LongTermMemory, ShortTermMemoryRecord } from '@/types'
 
 const convStore = useConversationStore()
 
@@ -210,7 +210,7 @@ function shortDate(iso: string): string {
 const memoryVisible = ref(false)
 const activeMemoryTab = ref('long')
 const longTerm = ref<LongTermMemory[]>([])
-const shortTerm = ref<ShortTermMemory[]>([])
+const shortTerm = ref<ShortTermMemoryRecord[]>([])
 
 // 打开记忆弹窗并加载长期 + 当前会话短期记忆
 function openMemory() {
@@ -223,7 +223,7 @@ async function loadLongTerm() {
 }
 async function loadShortTerm() {
   if (!convStore.currentId) { shortTerm.value = []; return }
-  try { shortTerm.value = await getShortTermMemory(convStore.currentId) } catch { shortTerm.value = [] }
+  try { const res = await getShortTermMemory(convStore.currentId); shortTerm.value = res.records || [] } catch { shortTerm.value = [] }
 }
 
 onMounted(async () => {
@@ -268,7 +268,7 @@ onMounted(async () => {
       <ChatPanel :messages="messages" :streaming="streaming" :thinking="thinking" :phase="phase" @send="send" @open-memory="openMemory" />
     </section>
 
-    <!-- 记忆弹窗：长期（全局偏好）/短期（当前会话已查工具）tab 切换 -->
+    <!-- 记忆弹窗：长期（全局偏好）/短期（当前会话 running summary）tab 切换 -->
     <el-dialog v-model="memoryVisible" title="记忆" width="640px">
       <el-tabs v-model="activeMemoryTab">
         <el-tab-pane label="长期记忆" name="long">
@@ -282,12 +282,13 @@ onMounted(async () => {
         </el-tab-pane>
         <el-tab-pane label="短期记忆" name="short">
           <p v-if="!convStore.currentId" class="memory-empty">请先开始一个会话，短期记忆跟随当前会话</p>
-          <el-table v-else-if="shortTerm.length" :data="shortTerm" size="small" border>
-            <el-table-column prop="tool_name" label="工具" width="160" />
-            <el-table-column prop="args" label="参数" min-width="180" />
-            <el-table-column prop="summary" label="摘要" min-width="180" />
-          </el-table>
-          <p v-else class="memory-empty">当前会话还没有已查记录</p>
+          <div v-else-if="shortTerm.length" class="memory-records">
+            <div v-for="(r, i) in shortTerm" :key="i" class="memory-record" :class="`memory-record--${r.role}`">
+              <span class="memory-record__role">{{ r.role === 'summary' ? '摘要' : r.role === 'user' ? '用户' : '助手' }}</span>
+              <span class="memory-record__content">{{ r.content }}</span>
+            </div>
+          </div>
+          <p v-else class="memory-empty">当前会话还没有短期记忆（running summary）</p>
         </el-tab-pane>
       </el-tabs>
     </el-dialog>

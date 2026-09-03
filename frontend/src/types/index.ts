@@ -27,10 +27,8 @@ export interface LongTermMemory {
     importance: number
 }
 
-// 短期记忆条目：某会话已查工具的一条摘要
-export interface ShortTermMemory {
-    tool_name: string
-    args: string
-    summary: string
-    created_at: string
+// 短期记忆记录：一条 summary 摘要 或 一条对话原文
+export interface ShortTermMemoryRecord {
+    role: 'summary' | 'user' | 'assistant'
+    content: string
 }

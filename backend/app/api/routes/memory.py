@@ -1,6 +1,6 @@
 # app/api/routes/memory.py
 # 记忆查询路由：GET /api/memory/long-term、GET /api/memory/short-term/{conversation_id}，
-# 供前端「记忆」页展示长期偏好与某会话的已查工具清单；均按 X-User-Id 做用户隔离。
+# 供前端「记忆」页展示长期偏好与某会话的短期记忆（摘要 + 最近几轮对话）；均按 X-User-Id 做用户隔离。
 from fastapi import APIRouter, Header
 
 from app.services.agent_service import service
@@ -16,8 +16,9 @@ async def get_long_term_memory(x_user_id: str = Header(default="anonymous")):
 
 @router.get("/memory/short-term/{conversation_id}")
 async def get_short_term_memory(conversation_id: str, x_user_id: str = Header(default="anonymous")):
-    """返回某会话的短期记忆（已查工具清单）；会话归属校验失败返回空列表。"""
+    """返回某会话的短期记忆（summary 摘要 + 最近几轮对话原文）；会话归属校验失败返回空列表。"""
     # 用户隔离：会话必须归属当前用户，防止跨用户读取他人会话的短期记忆
     if not await service.conversation_store.belongs_to(x_user_id, conversation_id):
-        return []
-    return await service.short_term_memory.get_all(conversation_id)
+        return {"records": []}
+    records = await service.short_term_memory.get_records(conversation_id)
+    return {"records": records}

@@ -1,12 +1,11 @@
 # tests/test_agent.py
-# Agent ReAct 循环契约测试：最终答案累积、工具调用并行、结构化截断、短期记忆写入。
+# Agent ReAct 循环契约测试：最终答案累积、工具调用并行、结构化截断。
 # 用 ScriptedLLM 预设 tool_calls 序列、FakeRegistry 模拟工具执行，不依赖真实 API。
 import asyncio
 
 import pytest
 
 from app.core.agent import Agent
-from app.core.memory import ShortTermMemory
 
 
 class FakeRegistry:
@@ -153,36 +152,3 @@ async def test_run_stream_struct_truncates_tool_result():
     tool_msgs = [m for m in llm.calls[1] if m["role"] == "tool"]
     assert len(tool_msgs[0]["content"]) == 4000 + len("[已截断]")
     assert tool_msgs[0]["content"].endswith("[已截断]")
-
-
-@pytest.mark.asyncio
-async def test_run_stream_writes_short_term(tmp_path):
-    """验证 run_stream 调工具时写短期记忆（一句话级 summary），供后续轮次防重查。"""
-    llm = StreamingLLM([
-        [{"type": "end", "tool_calls": [{"id": "1", "function": {"name": "w", "arguments": "{\"c\":\"成都\"}"}}]}],
-        [{"type": "content", "text": "成都晴"}, {"type": "end", "tool_calls": None}],
-    ])
-    reg = FakeRegistry({"w": "晴"})
-    stm = ShortTermMemory(str(tmp_path / "st.db"))
-    a = Agent(name="t", system_prompt="s", tools=["w"], llm=llm)
-    out = await a.run_stream("查天气", [], reg, on_event=None,
-                             short_term_memory=stm, conversation_id="conv1")
-    assert out == "成都晴"
-    rows = await stm.get_all("conv1")
-    assert len(rows) == 1
-    assert rows[0]["tool_name"] == "w"
-    assert rows[0]["summary"] == "晴"  # 小结果结构化截断，str("晴") 原样
-
-
-@pytest.mark.asyncio
-async def test_run_stream_skips_non_query_tools_for_short_term(tmp_path):
-    """get_skill（规则加载）这类非查询结果工具不写短期记忆，避免规则正文被误摘要。"""
-    llm = StreamingLLM([
-        [{"type": "end", "tool_calls": [{"id": "1", "function": {"name": "get_skill", "arguments": "{\"name\":\"travel\"}"}}]}],
-        [{"type": "content", "text": "ok"}, {"type": "end", "tool_calls": None}],
-    ])
-    reg = FakeRegistry({"get_skill": "旅行规划规则正文"})
-    stm = ShortTermMemory(str(tmp_path / "st.db"))
-    a = Agent(name="t", system_prompt="s", tools=["get_skill"], llm=llm)
-    await a.run_stream("规划", [], reg, on_event=None, short_term_memory=stm, conversation_id="conv1")
-    assert await stm.get_all("conv1") == []  # get_skill 不写短期记忆

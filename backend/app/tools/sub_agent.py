@@ -4,8 +4,8 @@
 核心价值是「上下文隔离」：子 Agent 历史为空、只吃 task，跑完只回传摘要，
 主 Agent 的上下文不被几十万字的原始工具结果淹没。
 
-短期记忆按子任务隔离：每个子 Agent 分配独立的 sub_conversation_id（uuid），
-子任务内的工具摘要全写在这个子会话下，不与主会话、其他子 Agent 串扰；任务结束即清理。
+工具结果地址索引按子任务隔离：每个子 Agent 分配独立的 sub_conversation_id（uuid），
+子任务的超长结果写在这个子会话目录下，不与主会话、其他子 Agent 串扰；任务结束即清理。
 """
 import uuid
 
@@ -13,7 +13,7 @@ from app.core.agent import Agent
 from app.core.prompts import load_prompt, today_hint
 
 
-def make_call_sub_agent(llm, registry, skill_names, short_term_memory, context_budget, tool_result_store=None):
+def make_call_sub_agent(llm, registry, skill_names, context_budget, tool_result_store=None):
     """构造 call_sub_agent 工具函数。
 
     子 Agent = 通用子助手：system prompt 含职责 + 可用业务清单 + 事实规范 + 日期；
@@ -35,20 +35,18 @@ def make_call_sub_agent(llm, registry, skill_names, short_term_memory, context_b
         )
         # 子 Agent 的工具：全部工具排除 call_sub_agent 自身（一层委派，避免无限下钻）
         sub_tools = [t for t in registry.list_names() if t != "call_sub_agent"]
-        # 子会话 id：独立 uuid，短期记忆按子任务隔离，不混入主会话、不与其他子 Agent 冲突
+        # 子会话 id：独立 uuid，工具结果地址索引按子任务隔离，不混入主会话、不与其他子 Agent 冲突
         sub_conversation_id = uuid.uuid4().hex
         try:
             sub = Agent(name="sub", system_prompt=sub_system, tools=sub_tools, llm=llm)
             # 隔离上下文：历史为空，只传 task；on_event=None 子 Agent 内部工具调用不上报前端
             answer = await sub.run_stream(task, [], registry, on_event=None,
-                                          short_term_memory=short_term_memory,
                                           conversation_id=sub_conversation_id,
                                           context_budget=context_budget,
                                           tool_result_store=tool_result_store)
             return {"answer": answer}
         finally:
-            # 子任务结束（含异常）清理子会话短期记忆与工具结果地址索引，不留垃圾记录
-            await short_term_memory.clear_conversation(sub_conversation_id)
+            # 子任务结束（含异常）清理子会话工具结果地址索引，不留垃圾记录
             if tool_result_store is not None:
                 await tool_result_store.delete_conversation(sub_conversation_id)
 

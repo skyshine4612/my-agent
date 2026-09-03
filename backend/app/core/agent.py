@@ -12,9 +12,6 @@ from app.core.memory.working import WorkingMemory
 
 logger = logging.getLogger(__name__)
 
-# 不写短期记忆的工具：get_skill 返回「规则正文」而非查询结果，call_sub_agent 返回委派摘要
-# （子任务内部已按子会话隔离写短期记忆）。它们不需要「防重查」，写进去反而产生无意义摘要。
-NON_SHORT_TERM_TOOLS = {"get_skill", "call_sub_agent"}
 # 非查询结果工具：返回「读回片段/规则正文/委派摘要」而非「查询结果」。
 # 它们的返回原样回填窗口（不结构化截断），也不触发地址索引（不写文件）——
 # 否则 read_file 读回的片段又被截断/写文件，会形成 read→截断/spill→read 的循环。
@@ -80,7 +77,7 @@ class Agent:
     max_iters: int = 20
 
     async def run_stream(self, user_message, history, registry, on_event=None,
-                         short_term_memory=None, conversation_id=None, context_budget=None,
+                         conversation_id=None, context_budget=None,
                          tool_result_store=None):
         """以流式方式执行一次完整 ReAct 循环，返回最终累积文本答复。
 
@@ -91,11 +88,9 @@ class Agent:
             - 工具结果回填前做结构化截断（list 前15 / dict 前20键 / str 4000），
               tool_result 事件额外携带 visible（模型工作记忆里的截断版结果），供上层 critic 校验，
               保证 critic 校验所用语料与模型生成答案时所见一致；
-            - 每轮前查短期记忆拼 short_term_hint 注入，防止重复查询已查过的工具；
             - 每轮后工作记忆按 token 预算淘汰最老交互（超预算时 LLM 蒸馏成摘要兜底）。
 
-        short_term_memory：短期记忆对象（ShortTermMemory），为 None 时不写/不注入。
-        conversation_id：  短期记忆隔离维度（主会话或子会话 id）。
+        conversation_id：  工具结果地址索引的隔离维度（主会话或子会话 id）。
         context_budget：   工作记忆 token 预算，为 None 时不淘汰（保持原有无限累积行为）。
         tool_result_store：工具结果地址索引存储（ToolResultStore），为 None 时不落库（不启用地址索引）。
 
@@ -110,10 +105,12 @@ class Agent:
         logger.info("[Agent:%s] 开始执行（流式），输入：%.60s", self.name, user_message)
         # 工作记忆（预算淘汰器）：传入 llm 与预算时启用，否则禁用（不淘汰）
         wm = WorkingMemory(self.llm, context_budget) if context_budget else None
-        # 固定头：system 提示词（已含 long_term_hint），永不淘汰
+        # 固定头：system 提示词（已含 long_term_hint + 短期记忆摘要），永不淘汰
         fixed = [{"role": "system", "content": self.system_prompt}]
-        # 可变窗口：历史对话 + ReAct 工具交互，超预算淘汰最老
-        window = list(history)
+        # 短期记忆：最近几轮对话原文（持久，来自 messages 表，不参与工作记忆淘汰）
+        short_term = list(history)
+        # 工作记忆：本轮工具交互（易失，超预算时 WorkingMemory 淘汰最老交互）
+        working = []
         # 当前用户指令：每轮拼在窗口之后，保持最新、不被淘汰
         user_msg = {"role": "user", "content": user_message}
         # 若本 Agent 声明了工具，则把工具名列表转成 OpenAI 工具 schema，供 LLM 决策是否调用
@@ -123,9 +120,7 @@ class Agent:
         full_text = ""
         # 进入 ReAct 循环：最多迭代 max_iters 轮，每轮完成一次「思考 → 行动 → 观察」
         for i in range(self.max_iters):
-            # 每轮前：查短期记忆拼 short_term_hint（system 消息，每轮重建、不累积）
-            short_term_hint = await self._build_short_term_hint(short_term_memory, conversation_id)
-            messages = fixed + short_term_hint + window + [user_msg]
+            messages = fixed + short_term + working + [user_msg]
             round_text = ""
             calls = None
             status_sent = False
@@ -147,8 +142,8 @@ class Agent:
                     await emit({"type": "token", "content": round_text[j:j + 40]})
                 logger.info("[Agent:%s] 本轮完成，返回最终答案（%d 字）", self.name, len(full_text))
                 return full_text
-            # 有工具调用：把本轮 assistant 回复（含 tool_calls）写入窗口，让后续轮次能看见完整上下文
-            window.append({"role": "assistant", "content": round_text, "tool_calls": calls})
+            # 有工具调用：把本轮 assistant 回复（含 tool_calls）写入工作记忆，让后续轮次能看见完整上下文
+            working.append({"role": "assistant", "content": round_text, "tool_calls": calls})
             logger.info("[Agent:%s] 第 %d 轮决定调用 %d 个工具：%s", self.name, i + 1, len(calls),
                         ", ".join(tc["function"]["name"] for tc in calls))
 
@@ -192,12 +187,6 @@ class Agent:
                         text = f"{text}\n[{'; '.join(parts)}，可用 read_file/grep 读回剩余]"
                     elif note:
                         text = f"{text}[{note}]"
-                # 写短期记忆：一句话级 summary（结构化截断为主，大结果 LLM 精炼），供后续轮次防重查。
-                # get_skill / call_sub_agent 这类「非查询结果」工具不写，避免把规则正文/委派摘要误当已查结果
-                if short_term_memory is not None and conversation_id is not None and fn["name"] not in NON_SHORT_TERM_TOOLS:
-                    summary = await self._summarize_for_short_term(raw)
-                    await short_term_memory.write(conversation_id, fn["name"], args, summary)
-                    logger.info("[Agent:%s] 写短期记忆：%s(%s)", self.name, fn["name"], json.dumps(args, ensure_ascii=False))
                 logger.info("[Agent:%s] 第 %d 轮 工具 %s 完成（id=%s），返回 %.120s", self.name, i + 1, fn["name"], tc["id"], text)
                 await emit({"type": "tool_result", "agent": self.name, "tool": fn["name"],
                             "status": True, "result": text, "id": tc["id"], "label": registry.label(fn["name"])})
@@ -207,48 +196,12 @@ class Agent:
             results = await asyncio.gather(*(run_tool(tc) for tc in calls))
             # 按 tool_calls 原始顺序回填 tool 消息：gather 已保序，这里按序追加即保证 tool_call_id 对齐
             for r in results:
-                window.append({"role": "tool", "tool_call_id": r["tool_call_id"], "content": r["content"]})
-            # 每轮后：工作记忆按 token 预算淘汰最老交互（超预算时成对淘汰 + LLM 摘要兜底）
+                working.append({"role": "tool", "tool_call_id": r["tool_call_id"], "content": r["content"]})
+            # 每轮后：工作记忆按 token 预算淘汰最老交互（超预算时成对淘汰 + LLM 摘要兜底）；短期记忆不参与淘汰
             if wm is not None:
-                window = await wm.fit(window)
+                working = await wm.fit(working)
         # 达到 max_iters 仍未收敛（每轮都在调工具）时兜底返回：
         # 有累积文本就用累积文本，否则给一句非空提示，避免最终输出空串
         if full_text:
             return full_text
         return "抱歉，本轮查询了较多信息但未能整合成完整回答，请换个方式或精简需求后再试。"
-
-    async def _build_short_term_hint(self, short_term_memory, conversation_id):
-        """查短期记忆拼 short_term_hint（极简清单 system 消息）；无短期记忆/会话/记录时返回空列表。
-
-        每轮重建、不累积：只反映「当前已查清单」，防止 LLM 反复重查已查过的工具。
-        """
-        if short_term_memory is None or conversation_id is None:
-            return []
-        rows = await short_term_memory.get_all(conversation_id)
-        if not rows:
-            return []
-        logger.info("[Agent:%s] 注入短期记忆 hint：%d 条已查工具", self.name, len(rows))
-        # 拼极简清单：tool_name(args) → 一句话结果（明确标注为摘要，避免模型误当完整结果直接引用）
-        items = [f"{r['tool_name']}({r['args']}) → {r['summary']}" for r in rows]
-        return [{"role": "system", "content": "已查（以下仅为摘要、非完整结果；追问具体内容或询问新的具体实体都需重新查）：" + "；".join(items)}]
-
-    async def _summarize_for_short_term(self, raw):
-        """生成短期记忆的一句话级 summary：结构化截断为主，大结果（>500 字符）LLM 精炼成一句话。
-
-        防重查的核心是 tool_name+args（write 时完整保留），summary 只做「结果要点」补充，
-        故小结果直接用结构化截断省成本，只有多班次/多航班等大结果才花一次 LLM 精炼。
-        """
-        raw_str = json.dumps(raw, ensure_ascii=False) if not isinstance(raw, str) else raw
-        # 小结果：直接结构化截断（list 前2 / dict 前3键 / str 100）
-        if len(raw_str) <= 500:
-            return _struct_truncate_to_str(raw, 2, 3, 100)[0]
-        # 大结果：LLM 精炼成一句话，失败退回结构化截断（不影响主流程）
-        try:
-            return await self.llm.complete([
-                {"role": "system",
-                 "content": "把下面的工具返回结果精炼成一句话摘要，保留关键信息（班次/时间/价格、天气/温度、名称等）。"},
-                {"role": "user", "content": raw_str[:2000]},
-            ])
-        except Exception:
-            logger.warning("[Agent:%s] LLM 精炼短期记忆摘要失败，退回结构化截断", self.name)
-            return _struct_truncate_to_str(raw, 2, 3, 100)[0]

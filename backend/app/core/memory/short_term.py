@@ -1,8 +1,7 @@
 # app/core/memory/short_term.py
-# 短期记忆存储：short_term_memory 表，任务周期内已查工具摘要，按 conversation_id 隔离，UPSERT 去重。
-# 目的：Agent 每轮 ReAct 前取回「本会话已查清单」注入工作记忆，防止反复重查同一工具。
+# 短期记忆存储：short_term_memory 表，多行记录——1 条 summary（早期对话压缩摘要）+ 最近几轮对话原文（每条一条）。
+# 目的：让「短期记忆 = 摘要 + 最近几轮原文」自包含、边界清晰（role=summary 区分摘要），跨轮持久，供上下文注入与「记忆」页查询。
 import asyncio
-import json
 import sqlite3
 import logging
 from datetime import datetime
@@ -11,10 +10,10 @@ logger = logging.getLogger(__name__)
 
 
 class ShortTermMemory:
-    """短期记忆：存储会话内已查工具的摘要（tool_name + args + summary），按 conversation_id 隔离。
+    """短期记忆：一个会话存「1 条 summary + 最近几轮对话原文」，多行记录，按 id 排序（summary 最前）。
 
-    唯一约束 (conversation_id, tool_name, args) 保证「重复查同一工具+参数」时覆盖旧行而非新增，
-    使记录数 = 会话内查过的不同工具组合数，有界、不随轮次膨胀。
+    replace_records 全量替换该会话的短期记忆（清空 + 重写），保证边界每次切分后持久、清晰。
+    完整历史正文由 ToolResultStore 落盘到 _history.txt，供 read_file 读回细节。
     """
 
     def __init__(self, db_path):
@@ -27,68 +26,54 @@ class ShortTermMemory:
         return c
 
     def _init(self):
-        # 建表 + 去重唯一索引（IF NOT EXISTS 保证幂等）
+        # 建表（IF NOT EXISTS 保证幂等）；每条记录存 role（summary/user/assistant）+ content
         with self._conn() as c:
-            c.executescript("""
-            CREATE TABLE IF NOT EXISTS short_term_memory(
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                conversation_id TEXT,
-                tool_name TEXT,
-                args TEXT,
-                summary TEXT,
-                created_at TEXT
-            );
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_short_term_dedup
-                ON short_term_memory(conversation_id, tool_name, args);
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS short_term_memory(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    conversation_id TEXT,
+                    role TEXT,
+                    content TEXT,
+                    created_at TEXT
+                )
             """)
 
-    @staticmethod
-    def _normalize_args(args) -> str:
-        """把工具入参规范化为稳定字符串，作为去重 key（相同参数生成相同字符串）。"""
-        if isinstance(args, dict):
-            return json.dumps(args, sort_keys=True, ensure_ascii=False)
-        return json.dumps(args, ensure_ascii=False) if args is not None else "{}"
-
-    async def write(self, conversation_id, tool_name, args, summary):
-        """写入（UPSERT）一条已查摘要：同 (conversation_id, tool_name, args) 时覆盖旧行 summary 与 created_at。
-
-        重复查询同一工具不新增记录，从源头控制短期记忆体积。
-        """
-        args_json = self._normalize_args(args)
-
-        def r():
-            with self._conn() as c:
-                c.execute("""
-                    INSERT INTO short_term_memory(conversation_id, tool_name, args, summary, created_at)
-                    VALUES(?,?,?,?,?)
-                    ON CONFLICT(conversation_id, tool_name, args)
-                    DO UPDATE SET summary=excluded.summary, created_at=excluded.created_at
-                """, (conversation_id, tool_name, args_json, summary, datetime.now().isoformat()))
-
-        await asyncio.to_thread(r)
-
-    async def get_all(self, conversation_id):
-        """按 created_at 升序返回该会话全部已查摘要，供拼 short_term_hint（极简清单）。"""
+    async def get_records(self, conversation_id):
+        """返回该会话短期记忆的 [{role, content}, ...] 列表（按 id 升序，summary 在最前）；无则空列表。"""
 
         def r():
             with self._conn() as c:
                 rows = c.execute(
-                    "SELECT tool_name, args, summary, created_at FROM short_term_memory WHERE conversation_id=? ORDER BY created_at",
+                    "SELECT role, content FROM short_term_memory WHERE conversation_id=? ORDER BY id",
                     (conversation_id,)).fetchall()
-            return [dict(x) for x in rows]
+            return [{"role": x["role"], "content": x["content"]} for x in rows]
 
         return await asyncio.to_thread(r)
 
-    async def clear_conversation(self, conversation_id):
-        """删除单会话的短期记忆（删主会话或子会话任务结束时清理）。
+    async def replace_records(self, conversation_id, records):
+        """全量替换该会话的短期记忆：先清空旧记录，再按序写入新 records（[{role, content}, ...]）。
 
-        子会话使用独立 uuid 作为 conversation_id，任务结束时各自清理，不与主会话产生前缀关联，
-        故清理只需按 conversation_id 精确匹配即可。
+        records 顺序即最终展示顺序：summary 排最前，随后是最近几轮对话原文。
         """
 
         def r():
             with self._conn() as c:
-                return c.execute("DELETE FROM short_term_memory WHERE conversation_id=?", (conversation_id,)).rowcount
+                c.execute("DELETE FROM short_term_memory WHERE conversation_id=?", (conversation_id,))
+                now = datetime.now().isoformat()
+                c.executemany(
+                    "INSERT INTO short_term_memory(conversation_id, role, content, created_at) VALUES(?,?,?,?)",
+                    [(conversation_id, rec["role"], rec["content"], now) for rec in records])
+
+        await asyncio.to_thread(r)
+        logger.info("[记忆:short_term] 更新短期记忆：%s（%d 条记录）", conversation_id, len(records))
+
+    async def clear_conversation(self, conversation_id):
+        """删除单会话的短期记忆（删除会话时清理）。"""
+
+        def r():
+            with self._conn() as c:
+                return c.execute("DELETE FROM short_term_memory WHERE conversation_id=?",
+                                 (conversation_id,)).rowcount
 
         deleted = await asyncio.to_thread(r)
         logger.info("[记忆:short_term] 清理会话短期记忆：%s（%d 条）", conversation_id, deleted)

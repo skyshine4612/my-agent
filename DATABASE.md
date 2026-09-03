@@ -11,8 +11,6 @@
 | `id` | TEXT PRIMARY KEY | 会话 id（uuid） |
 | `user_id` | TEXT | 所属用户 |
 | `title` | TEXT | 会话标题 |
-| `summary` | TEXT | 累积摘要（历史会话压缩，一个会话一条） |
-| `path` | TEXT | 完整历史文件路径（历史会话压缩） |
 | `created_at` | TEXT | 创建时间 |
 
 ### messages（消息记录）
@@ -56,18 +54,18 @@
 | `importance` | REAL | 重要度 0~1 |
 | `created_at` | TEXT | 创建时间 |
 
-### short_term_memory（短期记忆，会话内已查工具摘要）
+### short_term_memory（短期记忆，摘要 + 最近几轮对话）
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
-| `id` | INTEGER PRIMARY KEY AUTOINCREMENT | 自增 id |
+| `id` | INTEGER PRIMARY KEY AUTOINCREMENT | 自增 id（决定展示顺序） |
 | `conversation_id` | TEXT | 所属会话 id |
-| `tool_name` | TEXT | 工具名 |
-| `args` | TEXT | 工具入参（JSON 字符串，规范化） |
-| `summary` | TEXT | 一句话结果摘要 |
-| `created_at` | TEXT | 创建时间 |
+| `role` | TEXT | `summary`（摘要）/ `user` / `assistant`（对话原文） |
+| `content` | TEXT | 摘要文本 或 对话原文 |
+| `created_at` | TEXT | 写入时间 |
 
-- 唯一索引 `idx_short_term_dedup(conversation_id, tool_name, args)`：同工具同参数覆盖旧行。
+- 一个会话多行：1 条 `summary`（早期对话压缩摘要，排最前）+ 最近几轮对话原文（每条一条）。
+- `replace_records` 每轮清空重写，保证「摘要 vs 原文」边界清晰、跨轮持久。
 
 ## 非表存储（文件）
 
@@ -78,4 +76,4 @@
 | 路径 | `result_dir/<user_id>/<conversation_id>/<rid>.txt` |
 | 存 | 超长工具结果（`truncate_limit` 超阈值时）+ 历史答案（历史会话压缩） |
 | 读 | 模型用 `read_file` / `grep` 按需读回 |
-| 清理 | 本轮结束（`done` 前）与 `delete_conversation` 删该会话目录 |
+| 清理 | spill 文件本轮结束清（保留 `_history.txt`）；`delete_conversation` 删整个目录（含 `_history.txt`） |

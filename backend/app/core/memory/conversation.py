@@ -28,7 +28,7 @@ class ConversationStore:
         # 用 executescript 一次性建好 conversations / messages 两张表（IF NOT EXISTS 保证幂等）
         with self._conn() as c:
             c.executescript("""
-            CREATE TABLE IF NOT EXISTS conversations(id TEXT PRIMARY KEY, user_id TEXT, title TEXT, summary TEXT, path TEXT, created_at TEXT);
+            CREATE TABLE IF NOT EXISTS conversations(id TEXT PRIMARY KEY, user_id TEXT, title TEXT, created_at TEXT);
             CREATE TABLE IF NOT EXISTS messages(id INTEGER PRIMARY KEY AUTOINCREMENT, conv_id TEXT, role TEXT, content TEXT, created_at TEXT);
             """)
 
@@ -101,26 +101,6 @@ class ConversationStore:
                 c.execute("UPDATE conversations SET title=? WHERE id=?", (title, conv_id))
 
         await asyncio.to_thread(r)
-
-    async def get_summary(self, conv_id):
-        """读取会话的累积摘要与历史文件路径，返回 (summary, path)，无则 (None, None)。"""
-
-        def r():
-            with self._conn() as c:
-                row = c.execute("SELECT summary, path FROM conversations WHERE id=?", (conv_id,)).fetchone()
-            return (row["summary"], row["path"]) if row else (None, None)
-
-        return await asyncio.to_thread(r)
-
-    async def set_summary(self, conv_id, summary, path):
-        """更新会话的累积摘要与历史文件路径（历史会话压缩）。"""
-
-        def r():
-            with self._conn() as c:
-                c.execute("UPDATE conversations SET summary=?, path=? WHERE id=?", (summary, path, conv_id))
-
-        await asyncio.to_thread(r)
-        logger.info("[记忆:conversation] 更新累积摘要（running summary，%d 字符，历史文件 %s）", len(summary), path)
 
     async def delete_conversation(self, user_id, conv_id):
         """删除会话及其消息；先校验归属，归属不对返回 False（防止跨用户删除）。"""

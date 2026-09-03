@@ -44,7 +44,7 @@ export async function getLongTermMemory() {
     return (await api.get('/memory/long-term')).data
 }
 
-// 短期记忆（某会话的已查工具清单）
+// 短期记忆（某会话的 summary 摘要 + 最近几轮对话原文）
 export async function getShortTermMemory(id: string) {
     return (await api.get(`/memory/short-term/${id}`)).data
 }

@@ -1,47 +1,53 @@
 # tests/test_short_term.py
-# 短期记忆契约测试：写入/UPSERT 去重/按 conversation_id 查询与隔离/清理
+# 短期记忆（summary + 最近几轮对话）契约测试：replace_records / get_records / clear_conversation
 import pytest
 
 from app.core.memory import ShortTermMemory
 
 
 @pytest.mark.asyncio
-async def test_write_and_get_all(tmp_path):
-    """写入后按 conversation_id 取回，且不同会话隔离。"""
+async def test_replace_and_get_records(tmp_path):
+    """replace_records 后 get_records 按序取回（summary 在前，对话在后）。"""
     s = ShortTermMemory(str(tmp_path / "st.db"))
-    await s.write("conv1", "weather_query", {"city": "泰安"}, "晴33℃")
-    await s.write("conv1", "poi_search", {"city": "泰安"}, "泰山/岱庙")
-    rows = await s.get_all("conv1")
-    assert [r["tool_name"] for r in rows] == ["weather_query", "poi_search"]
-    assert await s.get_all("conv2") == []  # 会话隔离
+    records = [
+        {"role": "summary", "content": "早期对话摘要"},
+        {"role": "user", "content": "最近一轮用户"},
+        {"role": "assistant", "content": "最近一轮助手"},
+    ]
+    await s.replace_records("conv1", records)
+    got = await s.get_records("conv1")
+    assert [r["role"] for r in got] == ["summary", "user", "assistant"]
+    assert got[0]["content"] == "早期对话摘要"
+    assert got[1]["content"] == "最近一轮用户"
 
 
 @pytest.mark.asyncio
-async def test_upsert_dedup(tmp_path):
-    """同 (conversation_id, tool_name, args) 覆盖旧行而非新增（去重核心）。"""
+async def test_replace_records_overwrites(tmp_path):
+    """同会话再次 replace_records 清空旧记录、只保留新记录。"""
     s = ShortTermMemory(str(tmp_path / "st.db"))
-    await s.write("conv1", "weather_query", {"city": "泰安", "days": 3}, "晴33℃")
-    await s.write("conv1", "weather_query", {"city": "泰安", "days": 3}, "雨26℃")
-    rows = await s.get_all("conv1")
-    assert len(rows) == 1  # 覆盖而非新增
-    assert rows[0]["summary"] == "雨26℃"  # summary 更新为最新
+    await s.replace_records("conv1", [{"role": "user", "content": "旧"}])
+    await s.replace_records("conv1", [{"role": "summary", "content": "新摘要"}])
+    got = await s.get_records("conv1")
+    assert len(got) == 1
+    assert got[0]["content"] == "新摘要"
 
 
 @pytest.mark.asyncio
-async def test_upsert_distinct_args_kept(tmp_path):
-    """不同 args 是不同记录，不去重。"""
+async def test_records_isolation(tmp_path):
+    """不同会话的短期记忆互相隔离。"""
     s = ShortTermMemory(str(tmp_path / "st.db"))
-    await s.write("conv1", "weather_query", {"city": "泰安"}, "晴")
-    await s.write("conv1", "weather_query", {"city": "济南"}, "雨")
-    assert len(await s.get_all("conv1")) == 2
+    await s.replace_records("conv1", [{"role": "summary", "content": "A"}])
+    await s.replace_records("conv2", [{"role": "summary", "content": "B"}])
+    assert (await s.get_records("conv1"))[0]["content"] == "A"
+    assert (await s.get_records("conv2"))[0]["content"] == "B"
 
 
 @pytest.mark.asyncio
 async def test_clear_conversation(tmp_path):
-    """清理单会话的短期记忆，不影响其他会话。"""
+    """clear_conversation 删除单会话，不影响其他会话。"""
     s = ShortTermMemory(str(tmp_path / "st.db"))
-    await s.write("conv1", "weather_query", {"city": "泰安"}, "晴")
-    await s.write("conv2", "poi_search", {"city": "济南"}, "趵突泉")
+    await s.replace_records("conv1", [{"role": "summary", "content": "A"}])
+    await s.replace_records("conv2", [{"role": "summary", "content": "B"}])
     await s.clear_conversation("conv1")
-    assert await s.get_all("conv1") == []
-    assert len(await s.get_all("conv2")) == 1  # 其他会话不受影响
+    assert await s.get_records("conv1") == []
+    assert len(await s.get_records("conv2")) == 1

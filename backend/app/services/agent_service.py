@@ -71,9 +71,9 @@ class AgentService:
         self._datasources.extend(register_all_tools(registry, amap_web_ds, [s["name"] for s in self.skills]))
         # read_file/grep 工具：地址索引的按需读出口（需要 tool_result_store，故在 service 层注册）
         register_file_tools(registry, self.tool_result_store)
-        # 注册 call_sub_agent（子 Agent 委派，需要 llm + skill 清单 + 短期记忆，只能在 service 层注册）
+        # 注册 call_sub_agent（子 Agent 委派，需要 llm + skill 清单 + 工具结果地址索引，只能在 service 层注册）
         sub_agent_fn = make_call_sub_agent(self.llm, registry, [s["name"] for s in self.skills],
-                                           self.short_term_memory, settings.llm_context_budget,
+                                           settings.llm_context_budget,
                                            self.tool_result_store)
         registry.register("call_sub_agent", sub_agent_fn.description, sub_agent_fn.parameters, sub_agent_fn,
                           "委派子任务")
@@ -94,10 +94,7 @@ class AgentService:
             await llm_close()
 
     async def delete_conversation(self, user_id, conv_id):
-        """删除会话及其消息，并清理该会话的短期记忆与工具结果地址索引；归属校验失败返回 False。
-
-        子会话的短期记忆由子任务结束时各自清理，这里只清主会话自身（conversation_id = conv_id）。
-        """
+        """删除会话及其消息，并清理该会话的短期记忆（running summary）与工具结果地址索引；归属校验失败返回 False。"""
         ok = await self.conversation_store.delete_conversation(user_id, conv_id)
         if ok:
             await self.short_term_memory.clear_conversation(conv_id)
@@ -124,7 +121,8 @@ class AgentService:
         facts = await self.long_term_memory.recall(user_id, top_n=20)
         long_term_hint = "用户历史偏好：" + "；".join(f["fact"] for f in facts) if facts else ""
         # 4. 组装历史（running summary）：预算内保留最近回合原文，超预算的早期回合压缩。
-        history = await self._assemble_history(user_id, conv_id)
+        #    短期记忆摘要单独返回，固定注入 system（不参与工作记忆 token 预算淘汰）。
+        history, summary = await self._assemble_history(user_id, conv_id)
         # 5. 顶层 agent：复用 __init__ 缓存的 registry（不在每请求重建，避免泄漏 MCP 数据源）
         registry = self.registry
         tool_grounding = load_prompt("grounding")
@@ -134,6 +132,8 @@ class AgentService:
         system += "\n" + today_hint()
         if long_term_hint:
             system += "\n" + long_term_hint
+        if summary:
+            system += "\n" + f"[摘要] {summary}\n[完整历史存到 {conv_id}/_history.txt，可用 read_file 读]"
         agent = Agent(name="assistant", system_prompt=system, tools=registry.list_names(), llm=self.llm)
 
         # 7. 跑 run_stream：on_event 把事件塞队列，主循环消费队列转 SSE。
@@ -153,7 +153,7 @@ class AgentService:
             try:
                 return await agent.run_stream(
                     user_message, history, registry, on_event=emit,
-                    short_term_memory=self.short_term_memory, conversation_id=conv_id,
+                    conversation_id=conv_id,
                     context_budget=settings.llm_context_budget,
                     tool_result_store=self.tool_result_store,
                 )
@@ -271,20 +271,19 @@ class AgentService:
         for j in range(0, len(answer), 40):
             yield {"type": "token", "content": answer[j:j + 40]}
 
-        # 10. 清理本轮工具结果地址索引（完整结果 read 完即弃，避免 DB 堆积）；
+        # 10. 清理本轮 spill 文件（工具结果地址索引 read 完即弃，保留 _history.txt）；
         #     异步提炼长期记忆（fire-and-forget，不影响主流程返回）
-        await self.tool_result_store.delete_conversation(conv_id, user_id)
+        await self.tool_result_store.clear_spill(conv_id, user_id)
         asyncio.create_task(self._extract_facts(user_id, conv_id))
         yield {"type": "done"}
 
     async def _assemble_history(self, user_id, conv_id):
-        """组装会话历史（running summary 压缩）：预算内保留最近回合原文，超预算的早期回合压缩。
+        """组装短期记忆（running summary 摘要 + 最近几轮原文），返回 (recent_messages, summary)。
 
-        返回时间正序的 [{"role","content"}] 列表，已剔除本轮刚落库的 user 消息（run_stream 会再追加）。
-        压缩副作用：超预算的早期消息落盘历史文件 + LLM 浓缩进累积摘要（存回 conversations 表）。
+        从完整历史（messages 表）按 token 预算切分：早期回合压成累积摘要（存 short_term_memory 表 + 落盘 _history.txt），
+        最近几轮保留原文（存 short_term_memory 表）。返回最近几轮原文（注入对话）与摘要（注入 system）。
         """
         raw_history = await self.conversation_store.get_history(user_id, conv_id)
-        summary, history_path = await self.conversation_store.get_summary(conv_id)
         budget = int(settings.llm_context_budget * settings.history_budget_ratio)
         # 还原纯文本并按「回合」分组：一个 user 消息 + 其后连续的 assistant 回复算一个回合。
         # 与工作记忆的「单元淘汰」同理——预算边界只落在回合之间，不把一问一答从中间切开。
@@ -314,8 +313,12 @@ class AgentService:
                 keep_from = i
             else:
                 break
-        history = [m for turn in turns[keep_from:] for m in turn]
+        recent = [{"role": m["role"], "content": m["content"]} for turn in turns[keep_from:] for m in turn]
         to_compress = [m for turn in turns[:keep_from] for m in turn]
+        # 读旧摘要（短期记忆表的 summary 记录），供压缩时累积浓缩
+        old_records = await self.short_term_memory.get_records(conv_id)
+        old_summary = next((r["content"] for r in old_records if r["role"] == "summary"), None)
+        summary = old_summary
         # 触发压缩：超预算的早期消息追加到历史文件 + 浓缩进累积摘要（替换旧摘要）
         if to_compress:
             logger.info("[service] 历史超预算，触发 running summary 压缩：压缩 %d 条早期消息", len(to_compress))
@@ -324,16 +327,18 @@ class AgentService:
                 f"[{'用户' if x['role'] == 'user' else '助手'}] {x['content']}"
                 for x in to_compress
             )
-            history_path = await self.tool_result_store.append_history(conv_id, user_id, compressed_text)
-            summary = await self._update_summary(summary, compressed_text)
-            await self.conversation_store.set_summary(conv_id, summary, history_path)
-        if summary:
-            history.insert(0, {"role": "assistant",
-                               "content": f"[摘要] {summary}\n[完整历史存到 {history_path}，可用 read_file 读]"})
+            await self.tool_result_store.append_history(conv_id, user_id, compressed_text)
+            summary = await self._update_summary(old_summary, compressed_text)
         # 末尾一条是本轮刚落库的用户消息，run_stream 会再追加一次，这里剔除避免重复
-        if history and history[-1]["role"] == "user":
-            history = history[:-1]
-        return history
+        if recent and recent[-1]["role"] == "user":
+            recent = recent[:-1]
+        # 写回短期记忆表：summary 1 条 + 最近几轮对话原文，边界清晰、跨轮持久
+        records = []
+        if summary:
+            records.append({"role": "summary", "content": summary})
+        records.extend(recent)
+        await self.short_term_memory.replace_records(conv_id, records)
+        return recent, summary
 
     async def _update_summary(self, old_summary, compressed_text):
         """LLM 把「旧摘要 + 更早对话」浓缩成新的累积摘要；失败回退字符串拼接。"""

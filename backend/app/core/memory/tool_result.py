@@ -1,7 +1,7 @@
 # app/core/memory/tool_result.py
 # 工具结果「地址索引」存储：完整工具结果写临时文件 result_dir/<user_id>/<conversation_id>/<uuid>.txt，
 # read_file / grep 工具按路径读片段/搜索（对齐 Claude Code 的读文件形式，模型熟悉）。
-# 生命周期：本轮对话结束（critic 校验完）删该会话目录，会话删除时兜底清，不堆积。
+# 生命周期：spill 文件本轮结束即清（保留 _history.txt）；会话删除时删整个目录（含 _history.txt）。
 import asyncio
 import re
 import shutil
@@ -107,8 +107,25 @@ class ToolResultStore:
         logger.info("[记忆:tool_result] 被压缩答案追加到历史文件：%s（+%d 字符）", rel_path, len(content))
         return rel_path
 
+    async def clear_spill(self, conversation_id, user_id):
+        """删除该会话目录下的 spill 文件（<uuid>.txt），保留 _history.txt（短期记忆完整历史）。
+
+        用于每轮结束清理：spill 文件 read 完即弃，但 _history.txt 是短期记忆的「存文件」部分，需跨轮保留。
+        """
+        dir_path = self.result_dir / user_id / conversation_id
+
+        def r():
+            if not dir_path.exists():
+                return
+            for f in dir_path.iterdir():
+                if f.is_file() and f.name != "_history.txt":
+                    f.unlink()
+
+        await asyncio.to_thread(r)
+        logger.info("[记忆:tool_result] 清理会话 spill 文件（保留 _history.txt）：%s", conversation_id)
+
     async def delete_conversation(self, conversation_id, user_id):
-        """删 result_dir/<user_id>/<conversation_id>/ 目录（本轮结束或会话删除时调用）。
+        """删 result_dir/<user_id>/<conversation_id>/ 目录（删除会话时调用，含 _history.txt）。
 
         顺带清理空的 user_id 目录，避免残留空目录。
         """
