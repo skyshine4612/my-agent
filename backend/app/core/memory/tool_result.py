@@ -110,7 +110,7 @@ class ToolResultStore:
     async def clear_spill(self, conversation_id, user_id):
         """删除该会话目录下的 spill 文件（<uuid>.txt），保留 _history.txt（短期记忆完整历史）。
 
-        用于每轮结束清理：spill 文件 read 完即弃，但 _history.txt 是短期记忆的「存文件」部分，需跨轮保留。
+        每轮结束调用：spill 文件 read 完即弃，但 _history.txt 是短期记忆的「存文件」部分，需跨轮保留。
         """
         dir_path = self.result_dir / user_id / conversation_id
 

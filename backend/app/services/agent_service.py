@@ -38,6 +38,7 @@ class _TurnState:
     tools: list = field(default_factory=list)
     hard_results: list = field(default_factory=list)
     loaded_skill_names: list = field(default_factory=list)
+    rounds: list = field(default_factory=list)  # 每轮的 tool_calls（ReAct 轮次），供短期记忆按轮次落库
 
 
 class AgentService:
@@ -149,8 +150,8 @@ class AgentService:
                 await self.conversation_store.add_message(
                     conv_id, "assistant",
                     json.dumps({"content": answer, "tools": state.tools}, ensure_ascii=False))
-                # 补写本轮到短期记忆，让「记忆」页立即显示最新一轮
-                await self.memory.append_current_turn(conv_id, message, answer)
+                # 补写本轮到短期记忆（按 ReAct 轮次），让「记忆」页立即显示最新一轮
+                await self.memory.append_turn(conv_id, message, answer, state.rounds)
                 # 流式输出最终答案：拆小块逐块上发（此时已过 critic 校验，保证只输出一段干净答案）
                 for j in range(0, len(answer), 40):
                     await queue.put({"type": "token", "content": answer[j:j + 40]})
@@ -261,7 +262,8 @@ class AgentService:
                         entry["status"] = True
                         # result = 模型工作记忆里的截断版结果（模型所见语料），供 critic 校验、修正重写与前端展示复用
                         entry["result"] = ev.get("result", "")
-                        entry.pop("id", None)  # id 仅用于配对，持久化 tools 保持 {tool,args,status,result} 结构
+                        # id 转成 tool_call_id 保留：供 assemble_history 跨轮还原 role=tool 消息时配对
+                        entry["tool_call_id"] = entry.pop("id")
                         state.tools.append(entry)
                     if name in HARD_DATA_TOOLS:
                         # 硬数据工具记模型所见语料（ev["result"]），保证 critic 与模型生成答案时语料一致
@@ -272,7 +274,7 @@ class AgentService:
         gen_task = asyncio.create_task(generate())
         async for sse in consume():
             yield sse
-        state.answer = await gen_task
+        state.answer, state.rounds = await gen_task
 
     async def _critic_correct(self, state, system, message, user_id, summary_hint=""):
         """critic 事实校验：不通过时复用已查工具结果让 LLM 重写答案（不重新调工具）；可能更新 state.answer。

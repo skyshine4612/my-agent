@@ -121,6 +121,8 @@ class Agent:
         # 累积文本：只累积最终答案（不调工具轮次的 content）；调工具的思考（thought）是内部推理，
         # 不计入回答、也不上发前端，避免把 agent 的自言自语当答案展示给用户。
         full_text = ""
+        # 累积每轮的 tool_calls（ReAct 轮次）：供上层按轮次落库短期记忆（每轮一条 assistant(tool_calls)）
+        rounds = []
         # 进入 ReAct 循环：最多迭代 max_iters 轮，每轮完成一次「思考 → 行动 → 观察」
         for i in range(self.max_iters):
             messages = fixed + short_term + working + [user_msg]
@@ -144,9 +146,10 @@ class Agent:
                 for j in range(0, len(round_text), 40):
                     await emit({"type": "token", "content": round_text[j:j + 40]})
                 logger.info("[Agent:%s] 本轮完成，返回最终答案（%d 字）", self.name, len(full_text))
-                return full_text
+                return full_text, rounds
             # 有工具调用：把本轮 assistant 回复（含 tool_calls）写入工作记忆，让后续轮次能看见完整上下文
             working.append({"role": "assistant", "content": round_text, "tool_calls": calls})
+            rounds.append(calls)  # 记录本轮 tool_calls（按轮次），供短期记忆落库
             logger.info("[Agent:%s] 第 %d 轮决定调用 %d 个工具：%s", self.name, i + 1, len(calls),
                         ", ".join(tc["function"]["name"] for tc in calls))
 
@@ -206,5 +209,5 @@ class Agent:
         # 达到 max_iters 仍未收敛（每轮都在调工具）时兜底返回：
         # 有累积文本就用累积文本，否则给一句非空提示，避免最终输出空串
         if full_text:
-            return full_text
-        return "抱歉，本轮查询了较多信息但未能整合成完整回答，请换个方式或精简需求后再试。"
+            return full_text, rounds
+        return "抱歉，本轮查询了较多信息但未能整合成完整回答，请换个方式或精简需求后再试。", rounds

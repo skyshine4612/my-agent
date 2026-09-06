@@ -226,6 +226,35 @@ async function loadShortTerm() {
   try { const res = await getShortTermMemory(convStore.currentId); shortTerm.value = res.records || [] } catch { shortTerm.value = [] }
 }
 
+// 短期记忆角色 → 中文标签映射
+const MEMORY_ROLE_LABEL: Record<string, string> = {
+  summary: '摘要',
+  user: '用户',
+  assistant: '助手',
+}
+
+// 短期记忆记录的展示形态：assistant 带 tool_calls 的记录显示为「工具调用」+ 工具名(入参) 列表
+function memoryView(r: ShortTermMemoryRecord): { label: string; content: string } {
+  try {
+    const data = JSON.parse(r.content)
+    if (data && typeof data === 'object' && Array.isArray(data.tool_calls)) {
+      const calls = data.tool_calls
+        .map((tc: any) => {
+          const fn = tc?.function
+          if (!fn?.name) return ''
+          let args = ''
+          try {
+            args = fn.arguments ? JSON.stringify(JSON.parse(fn.arguments)) : ''
+          } catch { args = fn.arguments || '' }
+          return args ? `${fn.name}(${args})` : fn.name
+        })
+        .filter((s: string) => s)
+      return { label: '工具调用', content: calls.join('、') }
+    }
+  } catch { /* 非 JSON，按答案展示 */ }
+  return { label: MEMORY_ROLE_LABEL[r.role] ?? r.role, content: r.content }
+}
+
 onMounted(async () => {
   await refreshConversations()
   // 刷新后恢复上次会话：从 localStorage 读取当前会话 id 并加载历史消息
@@ -284,8 +313,8 @@ onMounted(async () => {
           <p v-if="!convStore.currentId" class="memory-empty">请先开始一个会话，短期记忆跟随当前会话</p>
           <div v-else-if="shortTerm.length" class="memory-records">
             <div v-for="(r, i) in shortTerm" :key="i" class="memory-record" :class="`memory-record--${r.role}`">
-              <span class="memory-record__role">{{ r.role === 'summary' ? '摘要' : r.role === 'user' ? '用户' : '助手' }}</span>
-              <span class="memory-record__content">{{ r.content }}</span>
+              <span class="memory-record__role">{{ memoryView(r).label }}</span>
+              <span class="memory-record__content">{{ memoryView(r).content }}</span>
             </div>
           </div>
           <p v-else class="memory-empty">当前会话还没有短期记忆（running summary）</p>

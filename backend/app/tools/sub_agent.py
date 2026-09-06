@@ -39,10 +39,10 @@ def make_call_sub_agent(llm, registry, skill_names, context_budget, tool_result_
         try:
             sub = Agent(name="sub", system_prompt=sub_system, tools=sub_tools, llm=llm)
             # 隔离上下文：历史为空，只传 task；on_event=None 子 Agent 内部工具调用不上报前端
-            answer = await sub.run_stream(task, [], registry, on_event=None,
-                                          conversation_id=sub_conversation_id,
-                                          context_budget=context_budget,
-                                          tool_result_store=tool_result_store)
+            answer, _ = await sub.run_stream(task, [], registry, on_event=None,
+                                             conversation_id=sub_conversation_id,
+                                             context_budget=context_budget,
+                                             tool_result_store=tool_result_store)
             return {"answer": answer}
         finally:
             # 子任务结束（含异常）清理子会话工具结果地址索引，不留垃圾记录

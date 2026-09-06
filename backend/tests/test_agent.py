@@ -85,7 +85,7 @@ async def test_run_stream_tokens_in_order():
     async def on_event(e):
         events.append(e)
 
-    out = await a.run_stream("查天气", [], FakeRegistry({}), on_event=on_event)
+    out, _ = await a.run_stream("查天气", [], FakeRegistry({}), on_event=on_event)
     assert out == "成都晴"
     # 最终答案按小块上发（合并后等于完整答案）
     assert "".join(e["content"] for e in events if e["type"] == "token") == "成都晴"
@@ -106,7 +106,7 @@ async def test_run_stream_tool_call_and_accumulated_text():
     async def on_event(e):
         events.append(e)
 
-    out = await a.run_stream("查天气", [], reg, on_event=on_event)
+    out, _ = await a.run_stream("查天气", [], reg, on_event=on_event)
     # 回答只含最终答案，思考 "查" 不计入
     assert out == "成都晴"
     assert "查" not in "".join(e["content"] for e in events if e["type"] == "token")
@@ -127,7 +127,7 @@ async def test_run_stream_parallel_tools_keep_order():
     ])
     reg = ConcurrentRegistry({"a": "a_result", "b": "b_result"})
     a = Agent(name="t", system_prompt="s", tools=["a", "b"], llm=llm)
-    out = await a.run_stream("go", [], reg, on_event=None)
+    out, _ = await a.run_stream("go", [], reg, on_event=None)
     assert out == "done"
     # 并发度达到 2，证明两个工具是并行执行而非串行
     assert reg.max_active == 2
@@ -147,7 +147,7 @@ async def test_run_stream_struct_truncates_tool_result():
     ])
     reg = FakeRegistry({"big": "x" * 6000})
     a = Agent(name="t", system_prompt="s", tools=["big"], llm=llm)
-    out = await a.run_stream("go", [], reg, on_event=None)
+    out, _ = await a.run_stream("go", [], reg, on_event=None)
     assert out == "ok"
     tool_msgs = [m for m in llm.calls[1] if m["role"] == "tool"]
     assert len(tool_msgs[0]["content"]) == 4000 + len("[已截断]")

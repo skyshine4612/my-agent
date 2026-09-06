@@ -17,8 +17,8 @@ class Settings(BaseSettings):
     llm_model: str = "qwen3.7-plus"
     # Qwen 思考模式开关：False 关闭思考（更快，延迟降 60-75%），True 开启（更强推理，但每次调用多出几十秒思考）
     enable_thinking: bool = False
-    # LLM 采样温度：低更确定、更守工具调用指令；0.3 兼顾「严格遵循工具结果」与规划类任务的少量多样性
-    llm_temperature: float = 0.3
+    # LLM 采样温度
+    llm_temperature: float = 0.5
     # ModelScope 访问令牌（用于调用 ModelScope 上的 MCP 服务）
     modelscope_token: str = ""
     # 12306 火车票 MCP 服务地址（查询跨城火车票/票价）

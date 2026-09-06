@@ -17,6 +17,68 @@ def _similar(a: str, b: str, threshold: float = 0.7) -> bool:
     return difflib.SequenceMatcher(None, a, b).ratio() > threshold
 
 
+def _expand_record(rec):
+    """把短期记忆表的一条记录展开成 OpenAI 消息列表。
+
+    assistant 的 content 若是 JSON 且含 tool_calls 键，展开成
+    [assistant(tool_calls), tool×N(空串占位)]——tool 结果不存，动态生成空串占位配对；
+    其余记录返回单条消息。
+    """
+    role = rec["role"]
+    if role == "assistant":
+        content = rec["content"]
+        try:
+            data = json.loads(content)
+        except (json.JSONDecodeError, TypeError):
+            data = None
+        if isinstance(data, dict) and "tool_calls" in data:
+            calls = data["tool_calls"]
+            msgs = [{"role": "assistant", "content": None, "tool_calls": calls}]
+            for tc in calls:
+                msgs.append({"role": "tool", "tool_call_id": tc["id"], "content": ""})
+            return msgs
+        return [{"role": "assistant", "content": content}]
+    return [{"role": role, "content": rec["content"]}]
+
+
+def _record_from_msg(m):
+    """把 OpenAI 消息转成短期记忆表记录（写回用），_expand_record 的逆操作（tool 占位不落表）。"""
+    if m["role"] == "assistant" and m.get("tool_calls"):
+        return {"role": "assistant",
+                "content": json.dumps({"tool_calls": m["tool_calls"]}, ensure_ascii=False),
+                "tool_call_id": None}
+    return {"role": m["role"], "content": m.get("content") or "", "tool_call_id": None}
+
+
+def _serialize_for_summary(msgs):
+    """把早期回合的结构化消息序列化成纯文本（供摘要蒸馏）：tool_calls 保留、tool 结果跳过。"""
+    parts = []
+    for m in msgs:
+        role = m.get("role")
+        if role == "user":
+            parts.append(f"[用户] {m.get('content', '')}")
+        elif role == "assistant" and m.get("tool_calls"):
+            names = []
+            for tc in m["tool_calls"]:
+                fn = tc.get("function") or {}
+                args = fn.get("arguments", "") or ""
+                try:
+                    args = json.dumps(json.loads(args), ensure_ascii=False)
+                except (json.JSONDecodeError, TypeError):
+                    pass
+                names.append(f"{fn.get('name', '')}({args})")
+            parts.append("[工具调用] " + "、".join(names))
+        elif role == "assistant":
+            parts.append(f"[助手] {m.get('content', '')}")
+        # role == "tool" 跳过：结果不存短期记忆（content 空串占位），摘要只保留 tool_calls
+    return "\n\n".join(parts)
+
+
+def _msg_cost(m):
+    """估算单条结构化消息的 token 成本（用于回合预算切分）。"""
+    return estimate_tokens(json.dumps(m, ensure_ascii=False, default=str))
+
+
 class MemoryManager:
     """记忆管理器：持有会话历史/短期/长期记忆/工具结果地址索引，封装记忆的组装与提炼编排。
 
@@ -41,79 +103,67 @@ class MemoryManager:
             await self.tool_result_store.delete_conversation(conv_id, user_id)
         return ok
 
-    async def append_current_turn(self, conv_id, user_message, answer):
-        """把本轮 user + assistant 追加进短期记忆 recent，让「记忆」页立即显示最新一轮。
+    async def append_turn(self, conv_id, user_message, answer, rounds=None):
+        """把本轮完整回合写进短期记忆表：user + 每轮 assistant(tool_calls) + assistant(答案)。
 
-        不做预算淘汰——超预算部分由下一轮 assemble_history 重新切分时压进摘要。
+        rounds 是 ReAct 每轮的 tool_calls 列表（[[tc, ...], ...]），按轮次各存一条 assistant(tool_calls)；
+        tool 结果与 tool 占位消息都不落表，喂 LLM 时由 _expand_record 动态生成空串占位配对。
         """
-        records = await self.short_term_memory.get_records(conv_id)
-        records.append({"role": "user", "content": user_message})
-        records.append({"role": "assistant", "content": answer})
-        await self.short_term_memory.replace_records(conv_id, records)
+        records = [{"role": "user", "content": user_message, "tool_call_id": None}]
+        for calls in (rounds or []):
+            if not calls:
+                continue
+            records.append({"role": "assistant",
+                            "content": json.dumps({"tool_calls": calls}, ensure_ascii=False),
+                            "tool_call_id": None})
+        records.append({"role": "assistant", "content": answer, "tool_call_id": None})
+        await self.short_term_memory.append_records(conv_id, records)
 
     async def assemble_history(self, user_id, conv_id):
-        """组装短期记忆（running summary 摘要 + 最近几轮原文），返回 (recent_messages, summary)。
+        """组装短期记忆（summary 摘要 + 结构化消息序列），返回 (messages, summary)。
 
-        只读 compressed_through marker 之后的消息（已压缩的早期回合不再读原文），按 token 预算切分：
-        超预算的早期回合压成累积摘要（存 short_term_memory 表 + 落盘 _history.txt），
-        预算内的最近几轮保留原文。返回最近几轮原文（注入对话）与摘要（注入 system）。
+        从 short_term_memory 表读（短期记忆权威源，不依赖 messages 表），分离 summary 与消息序列；
+        超预算时按「整回合」压缩早期回合（序列化 + 蒸馏累积摘要 + 物理删除早期消息）。
         """
         budget = int(settings.llm_context_budget * settings.history_budget_ratio)
-        # 先读旧摘要 + 压缩截止 marker，再只读 marker 之后的消息（增量读，避免每轮全量扫 messages）
-        old_records = await self.short_term_memory.get_records(conv_id)
-        old_summary = next((r["content"] for r in old_records if r["role"] == "summary"), None)
-        old_marker = await self.conversation_store.get_compressed_through(conv_id)
-        raw_history = await self.conversation_store.get_history_since(user_id, conv_id, old_marker)
-        # 还原纯文本并按「回合」分组：一个 user 消息 + 其后连续的 assistant 回复算一个回合。
-        # 预算边界只落在回合之间，不把一问一答从中间切开。
+        records = await self.short_term_memory.get_records(conv_id)
+        old_summary = next((r["content"] for r in records if r["role"] == "summary"), None)
+        raw_msgs = []
+        for r in records:
+            if r["role"] == "summary":
+                continue
+            raw_msgs.extend(_expand_record(r))
+        # 按「回合」分组（user 开新回合，后续 assistant/tool 归入），预算边界落在回合之间
         turns = []
-        for h in raw_history:
-            content = h["content"]
-            if h["role"] == "assistant":
-                data = None
-                try:
-                    data = json.loads(content)
-                except (json.JSONDecodeError, TypeError):
-                    pass
-                if isinstance(data, dict) and isinstance(data.get("content"), str):
-                    content = data["content"]
-            if h["role"] == "user" or not turns:
+        for m in raw_msgs:
+            if m["role"] == "user" or not turns:
                 turns.append([])
-            turns[-1].append({"id": h["id"], "role": h["role"], "content": content})
-        # 反序遍历回合（最新→最老），按整回合累积预算；至少保留最新一个回合。
+            turns[-1].append(m)
+        # 反序遍历回合（最新→最老），按整回合累积预算；至少保留最新一个回合
         used = 0
         keep_from = len(turns)
         for i in range(len(turns) - 1, -1, -1):
-            cost = sum(estimate_tokens(m["content"]) for m in turns[i])
+            cost = sum(_msg_cost(m) for m in turns[i])
             if used + cost <= budget or i == len(turns) - 1:
                 used += cost
                 keep_from = i
             else:
                 break
-        recent = [{"role": m["role"], "content": m["content"]} for turn in turns[keep_from:] for m in turn]
+        recent = [m for turn in turns[keep_from:] for m in turn]
         early = [m for turn in turns[:keep_from] for m in turn]
         summary = old_summary
-        new_marker = old_marker
-        # 读到的都是 marker 之后的未压缩消息，early 全部是新增待压缩的
+        # 读到的都是未压缩消息，early 全部是新增待压缩的
         if early:
-            logger.info("[memory] 历史超预算，增量压缩 %d 条早期消息（marker=%d）", len(early), old_marker)
-            compressed_text = "\n\n".join(
-                f"[{'用户' if x['role'] == 'user' else '助手'}] {x['content']}"
-                for x in early
-            )
+            logger.info("[memory] 历史超预算，压缩 %d 个早期回合", len(turns[:keep_from]))
+            compressed_text = _serialize_for_summary(early)
             await self.tool_result_store.append_history(conv_id, user_id, compressed_text)
             summary = await self._update_summary(old_summary, compressed_text)
-            new_marker = early[-1]["id"]
-        # 末尾一条是本轮刚落库的用户消息，run_stream 会再追加一次，这里剔除避免重复
-        if recent and recent[-1]["role"] == "user":
-            recent = recent[:-1]
-        # 写回：summary 1 条 + 最近几轮对话原文存短期记忆表，压缩进度 marker 存 conversations 表
-        records = []
-        if summary:
-            records.append({"role": "summary", "content": summary})
-        records.extend(recent)
-        await self.short_term_memory.replace_records(conv_id, records)
-        await self.conversation_store.set_compressed_through(conv_id, new_marker)
+            # 写回：summary + 剩余消息（物理删除早期回合，删除即增量，无需 marker）
+            write_records = []
+            if summary:
+                write_records.append({"role": "summary", "content": summary, "tool_call_id": None})
+            write_records.extend(_record_from_msg(m) for m in recent if m["role"] != "tool")
+            await self.short_term_memory.replace_records(conv_id, write_records)
         return recent, summary
 
     async def extract_facts(self, user_id, user_message):
@@ -161,7 +211,7 @@ class MemoryManager:
         try:
             return await self.llm.complete([
                 {"role": "system",
-                 "content": "把下面的「旧摘要 + 更早对话」浓缩成一个新的累积摘要（100-300 字），保留核心结论、关键数据（菜名/价格/时间/结构要点）。"},
+                 "content": "把下面的「旧摘要 + 更早对话」浓缩成一个新的累积摘要（100-300 字），保留核心结论、关键数据（菜名/价格/时间/结构要点），以及调用了哪些工具、查了什么参数（如「菜谱做法(宫保鸡丁)」）。"},
                 {"role": "user",
                  "content": f"旧摘要：{old_summary or '（无）'}\n\n更早对话：\n{compressed_text}"},
             ])

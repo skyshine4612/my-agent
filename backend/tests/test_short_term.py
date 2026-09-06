@@ -51,3 +51,19 @@ async def test_clear_conversation(tmp_path):
     await s.clear_conversation("conv1")
     assert await s.get_records("conv1") == []
     assert len(await s.get_records("conv2")) == 1
+
+
+@pytest.mark.asyncio
+async def test_append_records_with_tool(tmp_path):
+    """append_records 追加消息（不清空旧记录），tool 消息带 tool_call_id。"""
+    s = ShortTermMemory(str(tmp_path / "st.db"))
+    await s.append_records("conv1", [
+        {"role": "user", "content": "问", "tool_call_id": None},
+        {"role": "assistant", "content": '{"tool_calls":[]}', "tool_call_id": None},
+        {"role": "tool", "content": "结果", "tool_call_id": "c1"},
+        {"role": "assistant", "content": "答", "tool_call_id": None},
+    ])
+    got = await s.get_records("conv1")
+    assert [r["role"] for r in got] == ["user", "assistant", "tool", "assistant"]
+    assert got[2]["tool_call_id"] == "c1"
+    assert got[2]["content"] == "结果"

@@ -198,7 +198,7 @@ class RecordingLLM:
 
 @pytest.mark.asyncio
 async def test_assemble_history_no_recompression(tmp_path, monkeypatch):
-    """增量压缩：历史未新增时重复 assemble 不重复压缩（compressed_through marker 挡住已压缩回合）。"""
+    """压缩物理删除早期回合：压缩后再次 assemble 不重复压缩（删除即增量，无需 marker）。"""
     monkeypatch.setattr(settings, "db_path", str(tmp_path / "svc.db"))
     monkeypatch.setattr(settings, "result_dir", str(tmp_path / "results"))
     monkeypatch.setattr(settings, "llm_context_budget", 100)  # 小预算强制早期回合压缩
@@ -208,20 +208,47 @@ async def test_assemble_history_no_recompression(tmp_path, monkeypatch):
     svc.memory.llm = llm
 
     cid = await svc.conversation_store.create_conversation("u1")
-    # 造 4 个回合（每回合 user + assistant），远超小预算，必然触发早期回合压缩
+    # 写 4 个回合到短期记忆表（每回合 user + assistant），远超小预算，必然触发早期回合压缩
     for i in range(4):
-        await svc.conversation_store.add_message(cid, "user", f"用户问题{i}" + "长" * 40)
-        await svc.conversation_store.add_message(
-            cid, "assistant", json.dumps({"content": f"助手回答{i}" + "长" * 40, "tools": []},
-                                         ensure_ascii=False))
+        await svc.memory.append_turn(cid, f"用户问题{i}" + "长" * 40, f"助手回答{i}" + "长" * 40)
 
     # 第一次 assemble：触发压缩，摘要浓缩调用一次
     await svc.memory.assemble_history("u1", cid)
     assert llm.complete_calls == 1
 
-    # 第二次 assemble（历史无新增）：marker 已覆盖所有早期回合，不应再压缩
+    # 第二次 assemble：早期回合已被物理删除，不应再压缩
     await svc.memory.assemble_history("u1", cid)
     assert llm.complete_calls == 1  # 仍为 1，未重复压缩
+
+
+@pytest.mark.asyncio
+async def test_assemble_history_restores_structured_tool_messages(tmp_path, monkeypatch):
+    """append_turn 写结构化回合后，assemble_history 从短期记忆表还原成 tool_calls + role=tool 消息。"""
+    monkeypatch.setattr(settings, "db_path", str(tmp_path / "svc.db"))
+    monkeypatch.setattr(settings, "result_dir", str(tmp_path / "results"))
+    svc = AgentService()
+    svc.llm = FakeStreamingLLM()
+
+    cid = await svc.conversation_store.create_conversation("u1")
+    # 一轮 tool_calls（OpenAI 格式）
+    rounds = [[{"id": "c1", "type": "function",
+                "function": {"name": "菜谱做法", "arguments": '{"name": "宫保鸡丁"}'}}]]
+    await svc.memory.append_turn(cid, "第一天详细菜谱", "第一天做法", rounds)
+
+    recent, summary = await svc.memory.assemble_history("u1", cid)
+
+    # recent 结构化：user + assistant(tool_calls) + tool + assistant(最终答案)
+    assert [m["role"] for m in recent] == ["user", "assistant", "tool", "assistant"]
+    assert recent[1]["tool_calls"][0]["function"]["name"] == "菜谱做法"
+    assert "宫保鸡丁" in recent[1]["tool_calls"][0]["function"]["arguments"]
+    assert recent[2]["tool_call_id"] == "c1"
+    assert recent[2]["content"] == ""  # 不存 result，占位空串
+    assert recent[3]["content"] == "第一天做法"
+
+    # 短期记忆表存结构化记录（tool 占位不落表，仅 user + assistant(tool_calls) + assistant 答案）
+    records = await svc.short_term_memory.get_records(cid)
+    assert [r["role"] for r in records] == ["user", "assistant", "assistant"]
+    assert records[2]["content"] == "第一天做法"
 
 
 class SlowStreamingLLM:

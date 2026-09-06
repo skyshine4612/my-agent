@@ -58,13 +58,3 @@ async def test_long_term_prune_user_isolation(tmp_path):
     # B 的 facts 数量与内容均不受 A 的淘汰影响
     b_facts = await l.get_all("b")
     assert [f["fact"] for f in b_facts] == ["B-important"]
-
-
-@pytest.mark.asyncio
-async def test_compressed_through_roundtrip(tmp_path):
-    """压缩进度 marker 的读写往返：未压缩过为 0，set 后 get 取回原值。"""
-    s = ConversationStore(str(tmp_path / "m.db"))
-    cid = await s.create_conversation("u1")
-    assert await s.get_compressed_through(cid) == 0
-    await s.set_compressed_through(cid, 42)
-    assert await s.get_compressed_through(cid) == 42
