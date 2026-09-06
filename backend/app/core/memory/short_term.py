@@ -2,9 +2,10 @@
 # 短期记忆存储：short_term_memory 表，多行记录——1 条 summary（早期对话压缩摘要）+ 最近几轮对话原文（每条一条）。
 # 目的：让「短期记忆 = 摘要 + 最近几轮原文」自包含、边界清晰（role=summary 区分摘要），跨轮持久，供上下文注入与「记忆」页查询。
 import asyncio
-import sqlite3
 import logging
 from datetime import datetime
+
+from app.core.memory.db import connect
 
 logger = logging.getLogger(__name__)
 
@@ -21,9 +22,7 @@ class ShortTermMemory:
         self._init()
 
     def _conn(self):
-        c = sqlite3.connect(self.db_path)
-        c.row_factory = sqlite3.Row
-        return c
+        return connect(self.db_path)
 
     def _init(self):
         # 建表（IF NOT EXISTS 保证幂等）；每条记录存 role（summary/user/assistant）+ content

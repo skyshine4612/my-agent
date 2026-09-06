@@ -29,7 +29,6 @@ def make_call_sub_agent(llm, registry, skill_names, context_budget, tool_result_
         sub_system = (
             "你是子助手，独立完成主助手委派给你的子任务，只返回最终结果，不要复述过程。\n"
             f"可用的业务：\n{skill_directory}\n"
-            "处理业务任务时，先调用 get_skill 获取对应业务的规则，再按规则调用工具。\n\n"
             f"{load_prompt('grounding')}\n\n"
             f"{today_hint()}"
         )

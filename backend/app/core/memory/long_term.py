@@ -1,9 +1,10 @@
 # app/core/memory/long_term.py
 # 长期记忆存储：long_term_memory 表，跨会话持久偏好，按 user_id 隔离，超容量按 importance 淘汰。
 import asyncio
-import sqlite3
 import logging
 from datetime import datetime
+
+from app.core.memory.db import connect
 
 logger = logging.getLogger(__name__)
 
@@ -17,9 +18,7 @@ class LongTermMemory:
         self._init()
 
     def _conn(self):
-        c = sqlite3.connect(self.db_path)
-        c.row_factory = sqlite3.Row
-        return c
+        return connect(self.db_path)
 
     def _init(self):
         # 建 long_term_memory 表（IF NOT EXISTS 保证幂等）

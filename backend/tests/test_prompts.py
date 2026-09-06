@@ -1,8 +1,9 @@
 # tests/test_prompts.py
-# 提示词加载器契约测试：load_prompt 读 .md 全文、render_system_prompt 正确替换两个插槽。
+# 提示词加载器契约测试：load_prompt 读 .md 全文、render_system_prompt 正确替换各插槽。
 from datetime import datetime
 
-from app.core.prompts import load_prompt, render_system_prompt, today_hint
+from app.core.prompts import (load_prompt, render_history_summary, render_long_term_hint,
+                              render_system_prompt, today_hint)
 
 
 def test_today_hint_contains_current_date():
@@ -25,12 +26,41 @@ def test_load_prompt_reads_markdown():
 
 
 def test_render_system_prompt_fills_slots():
-    """render_system_prompt 把可用业务清单与事实规范填进两个插槽，输出不再含占位符。"""
+    """render_system_prompt 把业务清单、事实规范、日期与偏好填进插槽，输出不再含占位符。"""
     directory = "- travel：旅行规划（行程/交通/景点/天气/预算）"
     grounding = load_prompt("grounding")
-    out = render_system_prompt(directory, grounding)
+    out = render_system_prompt(directory, grounding,
+                               today="今天是 2026-09-06（周六）。",
+                               long_term_hint="喜欢自然风光；偏好经济型酒店")
     assert "{skill_directory}" not in out
     assert "{tool_grounding}" not in out
+    assert "{today}" not in out
+    assert "{long_term_hint}" not in out
     assert directory in out
     assert grounding in out
     assert "你是通用多业务助手" in out
+    assert "今天是 2026-09-06（周六）。" in out
+    assert "喜欢自然风光；偏好经济型酒店" in out
+
+
+def test_render_long_term_hint():
+    """render_long_term_hint 用「；」连接 facts，空则返回空串。"""
+    assert render_long_term_hint([]) == ""
+    assert render_long_term_hint(["喜欢自然风光", "偏好经济型酒店"]) == "喜欢自然风光；偏好经济型酒店"
+
+
+def test_render_history_summary():
+    """render_history_summary 拼标题 + 摘要正文 + 完整历史落盘提示，空则返回空串。"""
+    assert render_history_summary("", "c1") == ""
+    out = render_history_summary("第一天去了武侯祠", "c1")
+    assert "【历史对话摘要】" in out
+    assert "第一天去了武侯祠" in out
+    assert "c1/_history.txt" in out
+    assert "read_file" in out
+
+
+def test_render_system_prompt_empty_context_shows_none():
+    """today / long_term_hint 为空时渲染为「无」，不残留空标题。"""
+    out = render_system_prompt("- travel：旅行规划", load_prompt("grounding"))
+    assert "【当前时间】\n无" in out
+    assert "【用户历史偏好】\n无" in out

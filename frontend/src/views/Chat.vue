@@ -414,6 +414,37 @@ onMounted(async () => {
 .memory-fact__text {
   font-size: 14px;
 }
+/* 短期记忆记录：卡片列表，summary 用浅琥珀底强调，与长期记忆卡片风格一致 */
+.memory-records {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 50vh;
+  overflow-y: auto;
+}
+.memory-record {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 10px 14px;
+  border-radius: 10px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+}
+.memory-record__role {
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+.memory-record__content {
+  font-size: 14px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.memory-record--summary {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+}
 /* 中间对话区：占满剩余空间 */
 .chat__main {
   flex: 1;

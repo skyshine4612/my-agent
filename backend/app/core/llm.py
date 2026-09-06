@@ -53,6 +53,7 @@ class OpenAICompatLLM(LLMClient):
         # 组装请求参数：模型名 + 消息列表，仅在提供 tools 时附带工具定义
         # extra_body 传 Qwen 的 enable_thinking（非标准字段，openai 库通过 extra_body 合并到请求体顶层）
         kw = {"model": self.model, "messages": messages,
+              "temperature": settings.llm_temperature,
               "extra_body": {"enable_thinking": settings.enable_thinking}}
         if tools:
             kw["tools"] = tools
@@ -82,6 +83,7 @@ class OpenAICompatLLM(LLMClient):
         """
         # 组装请求参数，stream=True 开启 SSE 流式返回
         kw = {"model": self.model, "messages": messages, "stream": True,
+              "temperature": settings.llm_temperature,
               "extra_body": {"enable_thinking": settings.enable_thinking}}
         if tools:
             kw["tools"] = tools

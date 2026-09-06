@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 多业务对话式 Agent 平台，前后端分离：
 
-- **backend/**：FastAPI 应用，实现「通用 ReAct agent → 工具调用 → critic 事实校验」链路。真实数据：高德（POI/推荐菜，Web 服务 API）、天气/节假日/翻译/热榜/菜谱/营养（UAPIS，天气最多 7 天预报）、搜索（Tavily）经 HTTP 直连；12306 火车票经 ModelScope 托管 MCP；机票直连 variflight 官方 MCP，LLM 默认接阿里云百炼 DashScope（`qwen-plus`）。
+- **backend/**：FastAPI 应用，实现「通用 ReAct agent → 工具调用 → critic 事实校验」链路。真实数据：高德（POI/推荐菜，Web 服务 API）、天气/节假日/翻译/热榜/菜谱/营养（UAPIS，天气最多 7 天预报）、搜索（Tavily）经 HTTP 直连；12306 火车票经 ModelScope 托管 MCP；机票直连 variflight 官方 MCP，LLM 默认接阿里云百炼 DashScope（`qwen3.7-plus`）。
 - **frontend/**：Vue 3 + Vite + Element Plus + Pinia 的单页应用，通用对话界面（会话列表 + 流式聊天 + 工具调用气泡）。
 
 架构已从「旅行专用」链路收敛为「通用 agent + 标准 skill」两段式（见下）。
@@ -53,15 +53,15 @@ api/routes/chat.py  →  services/agent_service.py  →  core/agent.py (ReAct �
                           + critic 校验 + LTM 提炼            → core/llm.py (LLM 客户端)
 ```
 
-- **`app/services/agent_service.py`**：核心编排器，进程级单例 `service`（路由层直接 `import` 复用）。`chat_stream` 依次做：会话归属校验/新建 → 落库用户消息 → LTM 召回偏好 → 组装历史 → 注入 system prompt（含可用业务清单 + 事实规范 + 今天日期）→ 驱动 `Agent.run_stream` → critic 校验 → 落库结构化 assistant 消息 → 流式输出答案 → fire-and-forget 提炼长期记忆。
-- **`app/core/agent.py`**：`Agent.run_stream` 实现 ReAct 循环（LLM 决策 → 工具调用 → 回填结果 → 再决策，最多 `max_iters=20` 轮）。同一轮多个 tool_calls 用 `asyncio.gather` 并行执行；工具结果用 `call_raw` 拿结构化原始结果后做结构化截断（list 前 3 / dict 前 10 键 / str 2000，`full` 字段保留完整结果供 critic 用），工作记忆（本轮工具结果）的 token 预算淘汰委托给 `core/memory/working.py` 的 `WorkingMemory`。
+- **`app/services/agent_service.py`**：核心编排器，进程级单例 `service`（路由层直接 `import` 复用）。`chat_stream` 依次做：会话归属校验/新建 → 落库用户消息 → LTM 召回偏好 → 组装历史 → 注入 system prompt（含可用业务清单 + 事实规范 + 今天日期）→ 驱动 `Agent.run_stream` → critic 校验 → 落库结构化 assistant 消息 → 流式输出答案 → fire-and-forget 提炼长期记忆。记忆的组装/压缩/提炼委托给 `core/memory/manager.py` 的 `MemoryManager`。
+- **`app/core/agent.py`**：`Agent.run_stream` 实现 ReAct 循环（LLM 决策 → 工具调用 → 回填结果 → 再决策，最多 `max_iters=20` 轮）。同一轮多个 tool_calls 用 `asyncio.gather` 并行执行；工具结果用 `call_raw` 拿结构化原始结果后做结构化截断（list 前 20 / dict 前 20 键 / str `truncate_limit` 默认 4000），完整结果 spill 到文件供 `read_file`/`grep` 读回；工作记忆（本轮工具结果）的 token 预算淘汰委托给 `core/memory/working.py` 的 `WorkingMemory`。
 - **`app/core/registry.py`**：`ToolRegistry` 统一管理工具元信息（name/description/parameters/fn/label），转成 OpenAI function-calling schema 供 LLM 决策，并执行同步/异步工具函数。
 - **`app/core/llm.py`**：`LLMClient` 抽象（`chat`/`complete`/`stream_chat` 三方法）+ `OpenAICompatLLM`（DashScope）+ `FallbackLLM`（无 key 兜底）+ `get_llm()` 单例工厂。
-- **`app/core/critic.py`**：`run_critic` 事实校验专家——多轮带工具（`read_result` 定向读完整落库结果做 grounded 校验），比对「工具结果 vs 回答」，输出 `{ok, issues}`；注入当天日期避免年份误判，过滤「correction 为空」的误报 issue，限轮数 + fail-open（失败/超限按通过处理，不阻塞主流程）。
+- **`app/core/critic.py`**：`run_critic` 事实校验专家——多轮带工具（`read_file`/`grep` 定向读完整落库结果做 grounded 校验），比对「工具结果 vs 回答」，输出 `{ok, issues}`；注入当天日期避免年份误判，过滤「correction 为空」的误报 issue，限轮数 + fail-open（失败/超限按通过处理，不阻塞主流程）。
 
 ### 关键机制 / 不变量
 
-1. **critic 事实校验回路**（`agent_service.py` + `critic.py`）：仅当本轮调用了「硬数据工具」（`HARD_DATA_TOOLS = {train_ticket_query, flight_query, weather_query, holiday_calendar}`）才触发。第一轮答案先在 `consume()` 里被缓存、不直接下发；critic 判不通过时，**复用已查到的工具结果**让 LLM 直接重写答案（不重新调工具、不走 ReAct）。最终答案才拆成 40 字符块流式下发。所以 `token` 事件不是真正的逐 token 流式，而是「校验通过后分块补发」。critic 本体是「多轮带工具」：可用 `read_result` 定向读回完整落库结果做事实比对（对齐 CRITIC/CoV），限 `max_iter=3` + fail-open；校验语料与模型生成时所见一致（`visible` 截断版）。
+1. **critic 事实校验回路**（`agent_service.py` + `critic.py`）：仅当本轮调用了「硬数据工具」（`HARD_DATA_TOOLS = {train_ticket_query, flight_query, weather_query, holiday_calendar}`）才触发。第一轮答案先在 `consume()` 里被缓存、不直接下发；critic 判不通过时，**复用已查到的工具结果**让 LLM 直接重写答案（不重新调工具、不走 ReAct）。最终答案先落库（完整答案在拆块流式下发**之前**入库）、再拆成 40 字符块流式下发。所以 `token` 事件不是真正的逐 token 流式，而是「校验通过后分块补发」。落库与生成都跑在 `chat_stream` 里的独立 `run_full_turn` worker task 中，主协程只从事件队列转发 SSE——客户端刷新断开只取消主协程（转发），worker 照常跑完并落库，故「后端生成完、前端再刷新」仍能拉到本轮答案。critic 本体是「多轮带工具」：可用 `read_file`/`grep` 定向读回完整落库结果做事实比对（对齐 CRITIC/CoV），限 `max_iter=3` + fail-open；校验语料与模型生成时所见一致（`result` 截断版）。
 
 2. **ToolRegistry 只在启动时装配一次**：`AgentService.__init__` 里 `_build_registry()` 一次性 `new` 所有数据源并缓存到 `self.registry`。原因：`Train12306DataSource` / `FlightVariflightDataSource` 及各 HTTP 数据源（UAPIS/Tavily/高德 Web）的 `__init__` 会创建从不 `close()` 的 httpx 客户端，若每请求重建会导致连接泄漏。**新增工具时注意保持这个「启动时装配一次」的模式**。
 
@@ -79,11 +79,11 @@ api/routes/chat.py  →  services/agent_service.py  →  core/agent.py (ReAct �
 
 9. **子 Agent 委派（上下文隔离）**（`tools/sub_agent.py`）：顶层 agent 可用 `call_sub_agent` 工具把复杂子任务（如查交通、查景点）委派给独立上下文的子 Agent——子 Agent 历史为空、只吃 `task`，业务规则由它按需 `get_skill` 加载，跑完只回传最终答案摘要，主 agent 的上下文不被大量工具结果淹没。子 Agent 内部工具调用不上报前端（`on_event=None`），前端只显示「委派子任务」一个气泡。当前为单层委派（子 Agent 工具集不含 `call_sub_agent`，避免无限下钻）。子 Agent 分配独立 `sub_conversation_id`（uuid）隔离工具结果地址索引（spill 目录），任务结束（含异常）即清理，不与主会话/其他子 Agent 串扰。
 
-10. **三层记忆 + token 预算 + 三层压缩**（`core/memory/` 包）：工作记忆（本轮工具结果，内存，每次问答即丢）+ 短期记忆（`short_term_memory` 表，多行：1 条 summary 摘要 + 最近几轮对话原文，跨轮持久）+ 长期记忆（`long_term_memory` 表，按 `user_id` 跨会话）+ 会话历史（`conversation.py`）。短期记忆超 token 预算时早期回合压成累积摘要（存表 + 落盘 `_history.txt`）；工作记忆单个结果超长时 spill（结构化截断 + 文件地址索引），多结果累积超预算时成对淘汰最老 + LLM 蒸馏兜底。命名约定：工作/短期/长期记忆用 `working`/`short_term`/`long_term`，会话历史用 `conversation`，禁止 `session` 等混用。
+10. **三层记忆 + token 预算 + 三层压缩**（`core/memory/` 包）：工作记忆（本轮工具结果，内存，每次问答即丢）+ 短期记忆（`short_term_memory` 表，多行：1 条 summary 摘要 + 最近几轮对话原文，跨轮持久）+ 长期记忆（`long_term_memory` 表，按 `user_id` 跨会话）+ 会话历史（`conversation.py`）。记忆编排统一在 `memory/manager.py` 的 `MemoryManager`（组装/压缩/写回/提炼），四个 store 由 `AgentService` 创建后共享；SQLite 连接统一走 `memory/db.py`（WAL + busy_timeout，防并发写锁）。token 预算用 `tiktoken`（cl100k_base）真实计数，失败回退启发式（`token_utils.py`）。短期记忆超 token 预算时早期回合压成累积摘要（存表 + 落盘 `_history.txt`）；长期记忆 fire-and-forget 只提炼本轮 user 消息（per-user 锁串行，靠去重时 importance 提升体现「稳定」）；工作记忆单个结果超长时 spill（结构化截断 + 文件地址索引），多结果累积超预算时成对淘汰最老 + LLM 蒸馏兜底（蒸馏失败降级为拼接截断，不炸整轮）。命名约定：工作/短期/长期记忆用 `working`/`short_term`/`long_term`，会话历史用 `conversation`，禁止 `session` 等混用。
 
 11. **工具结果地址索引（spill-to-file）**（`core/memory/tool_result.py` + `tools/file.py`）：工具结果超 `truncate_limit`（默认 4000 字符）时，完整结果写临时文件 `result_dir/<user_id>/<conversation_id>/<uuid>.txt`，窗口只放「预览 + 文件路径提示」，模型用 `read_file(path, offset, limit)`（顺序读 + 未读完进度提示）与 `grep(pattern, path)`（正则搜 + 位置/上下文片段）两个**写死的安全工具**按需读回被省略的部分。path 经路径白名单校验（拒绝 `..`/绝对路径穿越），按 `current_user_id`（`core/context.py` 的 contextvar）隔离目录。生命周期：本轮结束（`done` 前）与 `delete_conversation` 删该会话目录；子 Agent 同样写文件、子任务结束即清。这是对「纯截断」的升级——被截掉的部分不再是永久丢失，而是可读回。
 
-12. **历史会话压缩（running summary，短期记忆 = 摘要 + 最近几轮原文）**（`agent_service.py` + `short_term.py`）：一个会话的短期记忆存 `short_term_memory` 表（多行：1 条 `summary` 摘要 + 最近几轮对话原文），完整历史文件落盘 `result_dir/<user_id>/<conv_id>/_history.txt`。组装时预算驱动（`llm_context_budget * history_budget_ratio`，默认 50%）：早期回合压成累积摘要（存表 + 追加历史文件），最近几轮保留原文（存表）。摘要固定注入 system prompt，最近几轮原文作为短期记忆注入对话，拼上下文 = system「`[摘要] {summary}\n[完整历史存到 {path}，可用 read_file 读]`」+ 最近几轮原文 + 本轮工作记忆（工具结果）。这样「压缩把跨轮编排结果（如『第8天=什锦烫饭』）蒸馏丢」的幻觉，被「完整历史落盘 + read_file 读回」兜住。
+12. **历史会话压缩（running summary，短期记忆 = 摘要 + 最近几轮原文）**（`memory/manager.py` + `short_term.py`）：一个会话的短期记忆存 `short_term_memory` 表（多行：1 条 `summary` 摘要 + 最近几轮对话原文），完整历史文件落盘 `result_dir/<user_id>/<conv_id>/_history.txt`。组装时预算驱动（`llm_context_budget * history_budget_ratio`，默认 50%）：早期回合压成累积摘要（存表 + 追加历史文件），最近几轮保留原文（存表）。压缩是增量的：`conversations.compressed_through` 记「已压缩到的最大消息 id」，每轮只读该 marker 之后的消息（增量读，不重复扫 messages 表）、只压新增的早期回合，避免已压回合被反复浓缩、`_history.txt` 被重复追加。摘要固定注入 system prompt，最近几轮原文作为短期记忆注入对话，拼上下文 = system「`[摘要] {summary}\n[完整历史存到 {path}，可用 read_file 读]`」+ 最近几轮原文 + 本轮工作记忆（工具结果）。这样「压缩把跨轮编排结果（如『第8天=什锦烫饭』）蒸馏丢」的幻觉，被「完整历史落盘 + read_file 读回」兜住。
 
 ### 前端结构
 

@@ -19,7 +19,7 @@
 
 | 层 | 技术                                                                                    |
 |---|-----------------------------------------------------------------------------------------|
-| 后端 | Python 3.11+ · FastAPI · pydantic-settings · openai SDK · mcp · sse-starlette · sqlite3 |
+| 后端 | Python 3.11+ · FastAPI · pydantic-settings · openai SDK · mcp · sse-starlette · sqlite3 · tiktoken |
 | 前端 | Vue 3 · Vite · TypeScript · Element Plus · Pinia · marked + DOMPurify                   |
 | LLM | 阿里云百炼 DashScope（`qwen3.7-plus`，OpenAI 兼容协议）                                 |
 | 部署 | Docker + docker-compose · nginx                                                         |
@@ -111,7 +111,7 @@ docker compose up --build
 | `TAVILY_API_KEY` | Tavily API Key（搜索/网页提取） | 空                                                  |
 | `AMAP_API_KEY` | 高德 Web 服务 Key（POI/推荐菜） | 空                                                  |
 | `DB_PATH` | SQLite 数据库文件路径 | `app.db`                                            |
-| `LLM_CONTEXT_BUDGET` | 工作记忆 token 预算上限（超限淘汰最老 + LLM 摘要兜底） | `32000`                                             |
+| `LLM_CONTEXT_BUDGET` | 工作记忆 token 预算上限（超限淘汰最老 + LLM 摘要兜底） | `128000`                                            |
 | `TRUNCATE_LIMIT` | 工具结果字符串截断阈值（超限完整结果写文件，read_file/grep 按需读） | `4000`                                              |
 | `RESULT_DIR` | 工具结果地址索引的落盘目录（本轮用完即删） | `results`                                           |
 

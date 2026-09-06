@@ -31,18 +31,39 @@ def today_hint() -> str:
     return f"今天是 {now:%Y-%m-%d}（周{weekdays[now.weekday()]}）。"
 
 
-def render_system_prompt(skill_directory: str, tool_grounding: str) -> str:
-    """把「可用业务清单」与工具事实规范填进 system.md 的两个插槽，生成顶层 system prompt。
+def render_long_term_hint(long_term_facts: list[str]) -> str:
+    """把长期记忆 facts 拼成「用户历史偏好」块的内容，用「；」分隔；空则返回空串（渲染为「无」）。"""
+    return "；".join(long_term_facts) if long_term_facts else ""
+
+
+def render_history_summary(summary: str, conv_id: str) -> str:
+    """把短期记忆摘要拼成独立 system 消息的内容：标题 + 摘要正文 + 完整历史落盘提示；空则返回空串。
+
+    文案外壳（「【历史对话摘要】」「[完整历史存到 …，可用 read_file 读]」）集中在这里，
+    agent_service 只传 summary 与 conv_id；返回非空时作为一条独立 system 消息注入。
+    """
+    if not summary:
+        return ""
+    return f"【历史对话摘要】\n{summary}\n[完整历史存到 {conv_id}/_history.txt，可用 read_file 读]"
+
+
+def render_system_prompt(skill_directory: str, tool_grounding: str,
+                         today: str = "", long_term_hint: str = "") -> str:
+    """把可用业务清单、工具事实规范、日期与用户偏好填进 system.md 的插槽，生成顶层 system prompt。
 
     参数：
         skill_directory: 可用业务清单文本（每业务一行 name + description），来自各 skill 的 frontmatter
         tool_grounding:  事实规范（严禁编造事实数据），来自 load_prompt("grounding")
+        today:           日期提示（today_hint()），必填
+        long_term_hint:  用户历史偏好（render_long_term_hint()），可空（空则显示「无」）
     返回：
-        替换掉 {skill_directory} 与 {tool_grounding} 插槽后的完整 system prompt。
+        替换掉全部插槽后的完整 system prompt（历史摘要由 render_history_summary 独立成 system 消息，不进此模板）。
     """
     template = load_prompt("system")
     # 用 str.replace 而非 str.format 替换插槽：system.md 除插槽外暂无花括号，
     # 但未来提示词里可能出现 JSON 花括号（如 critic 的 {"ok":...}），replace 更稳，不会误解析。
     return (template
             .replace("{skill_directory}", skill_directory)
-            .replace("{tool_grounding}", tool_grounding))
+            .replace("{tool_grounding}", tool_grounding)
+            .replace("{today}", today or "无")
+            .replace("{long_term_hint}", long_term_hint or "无"))

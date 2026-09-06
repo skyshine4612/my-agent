@@ -18,7 +18,7 @@ class WorkingMemory:
         budget_tokens:  token 预算上限，超限触发淘汰 + 蒸馏
     """
 
-    def __init__(self, llm, budget_tokens=32000):
+    def __init__(self, llm, budget_tokens=128000):
         self.llm = llm
         self.budget_tokens = budget_tokens
 
@@ -88,14 +88,27 @@ class WorkingMemory:
         return [m for unit in units for m in unit]
 
     async def _distill(self, messages):
-        """把一批被淘汰的消息 LLM 蒸馏成一段摘要，保留关键工具、参数与结果要点。"""
+        """把一批被淘汰的消息 LLM 蒸馏成一段摘要，保留关键工具、参数与结果要点。
+
+        LLM 蒸馏失败（超时/报错，或 FallbackLLM 无 key 返回空串）时降级为「序列化文本拼接截断」，
+        保证 fit 永不因蒸馏失败抛错——否则一次蒸馏异常会沿 run_stream 传播、炸掉整轮对话。
+        降级摘要保留被淘汰单元的可读内容（而非裸删），牺牲精简度换取不丢失关键信息。
+        """
         serialized = [self._serialize_message(m) for m in messages]
-        return await self.llm.complete([
-                                           {"role": "system",
-                                            "content": "把下面这段已查过的工具调用与结果蒸馏成一段摘要，保留关键工具、参数与结果要点。"
-                                                       "车次号/航班号/票价/时间/日期/地点名等硬数据必须保留精确原值，"
-                                                       "不要概括成「有航班」「价格中等」这类模糊描述。"}
-                                       ] + serialized)
+        try:
+            summary = await self.llm.complete([
+                {"role": "system",
+                 "content": "把下面这段已查过的工具调用与结果蒸馏成一段摘要，保留关键工具、参数与结果要点。"
+                            "车次号/航班号/票价/时间/日期/地点名等硬数据必须保留精确原值，"
+                            "不要概括成「有航班」「价格中等」这类模糊描述。"}
+            ] + serialized)
+            if summary:
+                return summary
+        except Exception as e:
+            logger.warning("[记忆:working] LLM 蒸馏失败，回退拼接截断：%s", e)
+        # 降级兜底：把被淘汰单元序列化后拼接截断，保留尽量多的原始信息
+        degraded = "；".join(m["content"] for m in serialized)
+        return degraded[:2000]
 
     async def fit(self, window):
         """超预算时，成对淘汰最老的交互单元，被淘汰单元批量 LLM 蒸馏成摘要放回，直到降到预算内。
@@ -112,10 +125,11 @@ class WorkingMemory:
         units = self._units(window)
         removed = []
         kept = units
-        # 从最老（最前）单元开始淘汰，直到估算降到预算内；至少保留一个单元避免窗口被清空
-        while self._estimate(self._flatten(kept)) > self.budget_tokens and len(kept) > 1:
+        # 从最老（最前）单元开始淘汰，直到降到预算内；即使只剩一个单元也淘汰（蒸馏），
+        # 保证「单个超预算的巨单」也能被蒸馏成摘要，而不是原样超预算返回。
+        while self._estimate(self._flatten(kept)) > self.budget_tokens and kept:
             removed.extend(kept.pop(0))
-        # 只剩一个单元仍超预算（单条极大），无法再淘汰，原样返回避免死循环
+        # 未淘汰任何单元（理论上超预算时不会发生，防御性兜底），原样返回
         if not removed:
             return window
         # 被淘汰单元批量 LLM 蒸馏成一段摘要，替代原始交互放回窗口最前（保留语义、不裸删）

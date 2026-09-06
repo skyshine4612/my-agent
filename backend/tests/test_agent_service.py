@@ -50,7 +50,7 @@ async def test_chat_stream_flow(tmp_path, monkeypatch):
     async def noop(user_id, conv_id):
         pass
 
-    svc._extract_facts = noop  # 摘掉异步 LTM 提炼，避免 fire-and-forget task 悬挂
+    svc.memory.extract_facts = noop  # 摘掉异步 LTM 提炼，避免 fire-and-forget task 悬挂
 
     events = [e async for e in svc.chat_stream("u1", None, "成都三日游")]
     types = [e["type"] for e in events]
@@ -64,6 +64,11 @@ async def test_chat_stream_flow(tmp_path, monkeypatch):
     saved = json.loads(history[-1]["content"])
     assert saved["content"] == "你好，成都"
     assert saved["tools"] == []
+    # 短期记忆应包含本轮 user + assistant（修正 _assemble_history 滞后一轮的问题）
+    records = await svc.short_term_memory.get_records(conv_id)
+    assert [r["role"] for r in records] == ["user", "assistant"]
+    assert records[0]["content"] == "成都三日游"
+    assert records[1]["content"] == "你好，成都"
 
 
 @pytest.mark.asyncio
@@ -91,7 +96,7 @@ async def test_registry_built_once_and_reused_across_requests(tmp_path, monkeypa
     async def noop(user_id, conv_id):
         pass
 
-    svc._extract_facts = noop
+    svc.memory.extract_facts = noop
 
     [e async for e in svc.chat_stream("u1", None, "第一次请求")]
     [e async for e in svc.chat_stream("u1", None, "第二次请求")]
@@ -161,7 +166,7 @@ async def test_tool_result_pairs_by_call_id_same_name_parallel(tmp_path, monkeyp
     async def noop(user_id, conv_id):
         pass
 
-    svc._extract_facts = noop
+    svc.memory.extract_facts = noop
 
     events = [e async for e in svc.chat_stream("u1", None, "帮我搜两个景点")]
     conv_id = next(e["conversation_id"] for e in events if e["type"] == "conversation_id")
@@ -177,3 +182,98 @@ async def test_tool_result_pairs_by_call_id_same_name_parallel(tmp_path, monkeyp
     tool_results = [e for e in events if e["type"] == "tool_result"]
     assert {e["id"] for e in tool_calls} == {"call_a", "call_b"}
     assert {e["id"] for e in tool_results} == {"call_a", "call_b"}
+
+
+class RecordingLLM:
+    """记录 complete 调用次数的 LLM 假实现，验证增量压缩不重复调用摘要浓缩。"""
+
+    def __init__(self, summary="累积摘要"):
+        self.summary = summary
+        self.complete_calls = 0
+
+    async def complete(self, messages):
+        self.complete_calls += 1
+        return self.summary
+
+
+@pytest.mark.asyncio
+async def test_assemble_history_no_recompression(tmp_path, monkeypatch):
+    """增量压缩：历史未新增时重复 assemble 不重复压缩（compressed_through marker 挡住已压缩回合）。"""
+    monkeypatch.setattr(settings, "db_path", str(tmp_path / "svc.db"))
+    monkeypatch.setattr(settings, "result_dir", str(tmp_path / "results"))
+    monkeypatch.setattr(settings, "llm_context_budget", 100)  # 小预算强制早期回合压缩
+    svc = AgentService()
+    llm = RecordingLLM()
+    svc.llm = llm
+    svc.memory.llm = llm
+
+    cid = await svc.conversation_store.create_conversation("u1")
+    # 造 4 个回合（每回合 user + assistant），远超小预算，必然触发早期回合压缩
+    for i in range(4):
+        await svc.conversation_store.add_message(cid, "user", f"用户问题{i}" + "长" * 40)
+        await svc.conversation_store.add_message(
+            cid, "assistant", json.dumps({"content": f"助手回答{i}" + "长" * 40, "tools": []},
+                                         ensure_ascii=False))
+
+    # 第一次 assemble：触发压缩，摘要浓缩调用一次
+    await svc.memory.assemble_history("u1", cid)
+    assert llm.complete_calls == 1
+
+    # 第二次 assemble（历史无新增）：marker 已覆盖所有早期回合，不应再压缩
+    await svc.memory.assemble_history("u1", cid)
+    assert llm.complete_calls == 1  # 仍为 1，未重复压缩
+
+
+class SlowStreamingLLM:
+    """慢速流式 LLM：stream_chat 先 sleep 再吐文本，模拟真实生成耗时。
+
+    用于验证「客户端在生成中途刷新断开 SSE，后端仍应继续跑完整轮并落库」。
+    """
+
+    async def stream_chat(self, messages, tools=None):
+        await asyncio.sleep(0.05)
+        yield {"type": "content", "text": "你好，成都"}
+        yield {"type": "end", "tool_calls": None}
+
+    async def chat(self, messages, tools=None, response_format=None):
+        return {"content": '{"ok":true,"issues":[]}', "tool_calls": None}
+
+    async def complete(self, messages):
+        return ""
+
+
+@pytest.mark.asyncio
+async def test_disconnect_still_persists_answer(tmp_path, monkeypatch):
+    """客户端生成中途断开（不消费完 SSE），后端仍应跑完整轮并落库 assistant 答案。
+
+    模拟刷新：消费到 conversation_id + 下一个事件后 aclose（= 断开 SSE），
+    然后轮询等待后台落库，断言历史里出现 assistant 消息。
+    """
+    monkeypatch.setattr(settings, "db_path", str(tmp_path / "svc.db"))
+    svc = AgentService()
+    svc.llm = SlowStreamingLLM()
+
+    async def noop(user_id, conv_id):
+        pass
+
+    svc.memory.extract_facts = noop
+
+    agen = svc.chat_stream("u1", None, "成都三日游")
+    # 消费 conversation_id 事件，拿到会话 id
+    first = await agen.__anext__()
+    conv_id = first["conversation_id"]
+    # 再消费一个事件，确保 worker 已启动并进入生成阶段
+    await agen.__anext__()
+    # 模拟刷新：关闭生成器（= 客户端断开 SSE），后台 worker 应继续跑完并落库
+    await agen.aclose()
+
+    # 轮询等待后台 worker 完成落库
+    history = []
+    for _ in range(100):
+        history = await svc.conversation_store.get_history("u1", conv_id)
+        if len(history) >= 2:
+            break
+        await asyncio.sleep(0.02)
+    assert [h["role"] for h in history] == ["user", "assistant"]
+    saved = json.loads(history[-1]["content"])
+    assert saved["content"] == "你好，成都"

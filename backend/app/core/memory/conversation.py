@@ -2,10 +2,11 @@
 # 会话历史存储：基于标准库 sqlite3，维护 conversations（会话元信息）与 messages（消息记录）两张表。
 # 所有阻塞的数据库操作通过 asyncio.to_thread 丢到线程池执行，避免阻塞事件循环。
 import asyncio
-import sqlite3
 import uuid
 import logging
 from datetime import datetime
+
+from app.core.memory.db import connect
 
 logger = logging.getLogger(__name__)
 
@@ -19,17 +20,20 @@ class ConversationStore:
         self._init()
 
     def _conn(self):
-        # 建立连接并设置 row_factory，使查询结果可按列名访问（如 row["role"]）
-        c = sqlite3.connect(self.db_path)
-        c.row_factory = sqlite3.Row
-        return c
+        # 统一连接入口：WAL + busy_timeout + row_factory（见 memory/db.py）
+        return connect(self.db_path)
 
     def _init(self):
         # 用 executescript 一次性建好 conversations / messages 两张表（IF NOT EXISTS 保证幂等）
         with self._conn() as c:
             c.executescript("""
-            CREATE TABLE IF NOT EXISTS conversations(id TEXT PRIMARY KEY, user_id TEXT, title TEXT, created_at TEXT);
-            CREATE TABLE IF NOT EXISTS messages(id INTEGER PRIMARY KEY AUTOINCREMENT, conv_id TEXT, role TEXT, content TEXT, created_at TEXT);
+            CREATE TABLE IF NOT EXISTS conversations(
+                id TEXT PRIMARY KEY, user_id TEXT, title TEXT, created_at TEXT,
+                compressed_through INTEGER DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS messages(
+                id INTEGER PRIMARY KEY AUTOINCREMENT, conv_id TEXT, role TEXT, content TEXT, created_at TEXT
+            );
             """)
 
     async def create_conversation(self, user_id, title="新会话"):
@@ -55,7 +59,11 @@ class ConversationStore:
         await asyncio.to_thread(r)
 
     async def get_history(self, user_id, conv_id):
-        """按时间顺序返回指定会话的历史消息；先校验会话归属该用户，归属不对返回空列表。"""
+        """按时间顺序返回指定会话的历史消息；先校验会话归属该用户，归属不对返回空列表。
+
+        每条返回 {"id","role","content"}，id 是 messages 表的自增主键，
+        供增量压缩判定「已压缩到哪里」（compressed_through marker 记录截止消息 id）。
+        """
 
         def r():
             with self._conn() as c:
@@ -63,10 +71,46 @@ class ConversationStore:
                 ok = c.execute("SELECT id FROM conversations WHERE id=? AND user_id=?", (conv_id, user_id)).fetchone()
                 if not ok:
                     return []
-                rows = c.execute("SELECT role,content FROM messages WHERE conv_id=? ORDER BY id", (conv_id,)).fetchall()
-            return [{"role": x["role"], "content": x["content"]} for x in rows]
+                rows = c.execute("SELECT id,role,content FROM messages WHERE conv_id=? ORDER BY id", (conv_id,)).fetchall()
+            return [{"id": x["id"], "role": x["role"], "content": x["content"]} for x in rows]
 
         return await asyncio.to_thread(r)
+
+    async def get_history_since(self, user_id, conv_id, since_id):
+        """只读 id > since_id 的消息（供增量压缩，marker 之前的已压缩进摘要无需再读原文）。
+
+        校验会话归属，归属不对返回空列表；每条返回 {"id","role","content"}。
+        """
+
+        def r():
+            with self._conn() as c:
+                ok = c.execute("SELECT id FROM conversations WHERE id=? AND user_id=?", (conv_id, user_id)).fetchone()
+                if not ok:
+                    return []
+                rows = c.execute("SELECT id,role,content FROM messages WHERE conv_id=? AND id>? ORDER BY id",
+                                 (conv_id, since_id)).fetchall()
+            return [{"id": x["id"], "role": x["role"], "content": x["content"]} for x in rows]
+
+        return await asyncio.to_thread(r)
+
+    async def get_compressed_through(self, conv_id):
+        """返回该会话的压缩进度 marker（已压缩到的最大消息 id），未压缩过返回 0。"""
+
+        def r():
+            with self._conn() as c:
+                row = c.execute("SELECT compressed_through FROM conversations WHERE id=?", (conv_id,)).fetchone()
+                return row["compressed_through"] if row and row["compressed_through"] else 0
+
+        return await asyncio.to_thread(r)
+
+    async def set_compressed_through(self, conv_id, value):
+        """更新该会话的压缩进度 marker（已压缩到的最大消息 id）。"""
+
+        def r():
+            with self._conn() as c:
+                c.execute("UPDATE conversations SET compressed_through=? WHERE id=?", (value, conv_id))
+
+        await asyncio.to_thread(r)
 
     async def belongs_to(self, user_id, conv_id):
         """校验指定会话是否归属该用户，返回 bool。

@@ -12,6 +12,7 @@
 | `user_id` | TEXT | 所属用户 |
 | `title` | TEXT | 会话标题 |
 | `created_at` | TEXT | 创建时间 |
+| `compressed_through` | INTEGER DEFAULT 0 | 压缩进度 marker：已压缩到 messages 的最大 id（增量压缩用，0=未压缩） |
 
 ### messages（消息记录）
 
@@ -66,6 +67,7 @@
 
 - 一个会话多行：1 条 `summary`（早期对话压缩摘要，排最前）+ 最近几轮对话原文（每条一条）。
 - `replace_records` 每轮清空重写，保证「摘要 vs 原文」边界清晰、跨轮持久。
+- 压缩进度 marker 存 `conversations.compressed_through`（会话级标量，不塞进本表 `role`）；`get_history` 额外返回消息 `id` 供其对齐。
 
 ## 非表存储（文件）
 

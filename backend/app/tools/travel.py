@@ -58,7 +58,7 @@ def register_travel_tools(registry, amap_web_ds):
                                        "description": "排序规则：distance(按距离)/weight(综合推荐)/rating(按评分)，不填默认综合"},
                       }, "required": []},
                       make_poi_search(amap_web_ds), "搜索景点/酒店/美食")
-    registry.register("poi_detail", "按 POI id 查询详情，返回名称/地址/推荐菜标签（餐饮类 POI 的 tag 含招牌菜）",
+    registry.register("poi_detail", "按 poi_search 搜索返回的 POI id 查询详情，返回名称/地址/推荐菜标签（餐饮类 POI 的 tag 含招牌菜）",
                       {"type": "object",
                        "properties": {"id": {"type": "string", "description": "POI id，来自 poi_search 返回"}},
                        "required": ["id"]},

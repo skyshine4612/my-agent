@@ -16,6 +16,8 @@ dist/
 # SQLite 数据库
 *.db
 *.db-journal
+*.db-shm
+*.db-wal
 
 # 工具结果地址索引的临时文件（本轮用完即删）
 results/
@@ -31,3 +33,6 @@ results/
 
 # superpowers 工作区
 .superpowers/
+
+# claude
+.claude/

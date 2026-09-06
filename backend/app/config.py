@@ -14,9 +14,11 @@ class Settings(BaseSettings):
     # LLM 服务接口地址（默认使用阿里云百炼 DashScope 兼容模式）
     llm_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
     # 使用的 LLM 模型名称
-    llm_model: str = "qwen-plus"
+    llm_model: str = "qwen3.7-plus"
     # Qwen 思考模式开关：False 关闭思考（更快，延迟降 60-75%），True 开启（更强推理，但每次调用多出几十秒思考）
     enable_thinking: bool = False
+    # LLM 采样温度：低更确定、更守工具调用指令；0.3 兼顾「严格遵循工具结果」与规划类任务的少量多样性
+    llm_temperature: float = 0.3
     # ModelScope 访问令牌（用于调用 ModelScope 上的 MCP 服务）
     modelscope_token: str = ""
     # 12306 火车票 MCP 服务地址（查询跨城火车票/票价）
@@ -34,8 +36,8 @@ class Settings(BaseSettings):
     # SQLite 数据库文件路径
     db_path: str = "app.db"
     # 工作记忆 token 预算上限：每次 LLM 调用前估算上下文，超预算淘汰最老交互 + LLM 摘要兜底
-    # 应 ≤ 模型上下文上限并预留输出余量（qwen-plus 默认留一半）
-    llm_context_budget: int = 32000
+    # 应 ≤ 模型上下文上限（qwen3.7-plus 为 1M）并预留输出余量（128K）；取 128K 平衡成本与长上下文能力
+    llm_context_budget: int = 128000
     # 工具结果字符串截断阈值：超过该字符数时，完整结果写临时文件，
     # 窗口只放预览 + 文件路径提示，模型用 read_file/grep 按需读回被截掉的部分
     truncate_limit: int = 4000
@@ -43,6 +45,8 @@ class Settings(BaseSettings):
     result_dir: str = "results"
     # 历史答案原文占 llm_context_budget 的比例（历史会话压缩：超预算的早期答案落盘+摘要，剩余的留给工具交互）
     history_budget_ratio: float = 0.5
+    # 长期记忆 hint 占 llm_context_budget 的比例（召回的用户偏好注入 system 的 token 预算上限）
+    long_term_hint_ratio: float = 0.05
 
 
 # 全局配置实例，供各模块导入使用

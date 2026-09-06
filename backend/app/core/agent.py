@@ -78,21 +78,22 @@ class Agent:
 
     async def run_stream(self, user_message, history, registry, on_event=None,
                          conversation_id=None, context_budget=None,
-                         tool_result_store=None):
+                         tool_result_store=None, summary=None):
         """以流式方式执行一次完整 ReAct 循环，返回最终累积文本答复。
 
         流程：
             - 通过 llm.stream_chat 逐 token 产出；调工具轮次的 content 是内部思考（thought），不上发前端；
             - 仅最终答案（不调工具的轮次）经 on_event 发为 token 事件；
             - 同一轮多个 tool_calls 用 asyncio.gather 并行执行，结果按原始顺序回填 tool 消息；
-            - 工具结果回填前做结构化截断（list 前15 / dict 前20键 / str 4000），
-              tool_result 事件额外携带 visible（模型工作记忆里的截断版结果），供上层 critic 校验，
+            - 工具结果回填前做结构化截断（list 前20 / dict 前20键 / str truncate_limit），
+              tool_result 事件的 result 字段是模型工作记忆里的截断版结果，供上层 critic 校验，
               保证 critic 校验所用语料与模型生成答案时所见一致；
             - 每轮后工作记忆按 token 预算淘汰最老交互（超预算时 LLM 蒸馏成摘要兜底）。
 
         conversation_id：  工具结果地址索引的隔离维度（主会话或子会话 id）。
         context_budget：   工作记忆 token 预算，为 None 时不淘汰（保持原有无限累积行为）。
         tool_result_store：工具结果地址索引存储（ToolResultStore），为 None 时不落库（不启用地址索引）。
+        summary：          历史对话摘要，非空时作为独立 system 消息紧跟主 system prompt 之后。
 
         on_event：可选异步回调，接收流式事件（token / tool_call / tool_result）；为 None 时静默。
         """
@@ -105,8 +106,10 @@ class Agent:
         logger.info("[Agent:%s] 开始执行（流式），输入：%.60s", self.name, user_message)
         # 工作记忆（预算淘汰器）：传入 llm 与预算时启用，否则禁用（不淘汰）
         wm = WorkingMemory(self.llm, context_budget) if context_budget else None
-        # 固定头：system 提示词（已含 long_term_hint + 短期记忆摘要），永不淘汰
+        # 固定头：主 system 提示词（含 long_term_hint），永不淘汰；历史摘要作为独立 system 消息紧随其后
         fixed = [{"role": "system", "content": self.system_prompt}]
+        if summary:
+            fixed.append({"role": "system", "content": summary})
         # 短期记忆：最近几轮对话原文（持久，来自 messages 表，不参与工作记忆淘汰）
         short_term = list(history)
         # 工作记忆：本轮工具交互（易失，超预算时 WorkingMemory 淘汰最老交互）

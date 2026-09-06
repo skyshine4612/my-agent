@@ -1,11 +1,11 @@
 # app/services/agent_service.py
 # 多业务通用 service：把会话历史、短期记忆、长期记忆、LLM、数据源、业务工具
-# 串成一个完整的 AgentService，对外提供 SSE 流式对话 chat_stream 与长期记忆异步提炼。
+# 串成一个完整的 AgentService，对外提供 SSE 流式对话 chat_stream；记忆编排委托给 core/memory/manager.py。
 import asyncio
-import difflib
 import json
 import logging
 import time
+from dataclasses import dataclass, field
 
 from app.config import settings
 from app.core.agent import Agent
@@ -13,7 +13,9 @@ from app.core.context import current_user_id
 from app.core.critic import run_critic
 from app.core.llm import get_llm
 from app.core.memory import ConversationStore, LongTermMemory, ShortTermMemory, ToolResultStore
-from app.core.prompts import load_prompt, render_system_prompt, today_hint
+from app.core.memory.manager import MemoryManager
+from app.core.prompts import (load_prompt, render_history_summary, render_long_term_hint,
+                              render_system_prompt, today_hint)
 from app.core.registry import ToolRegistry
 from app.core.skills import load_skills
 from app.core.token_utils import estimate_tokens
@@ -29,9 +31,13 @@ logger = logging.getLogger(__name__)
 HARD_DATA_TOOLS = {"train_ticket_query", "flight_query", "weather_query", "holiday_calendar"}
 
 
-def _similar(a: str, b: str, threshold: float = 0.7) -> bool:
-    """简单字符串相似度：用 difflib.SequenceMatcher 判断两条 fact 是否语义相近（去重用）。"""
-    return difflib.SequenceMatcher(None, a, b).ratio() > threshold
+@dataclass
+class _TurnState:
+    """一轮对话的跨阶段累积状态：生成阶段写入，critic 与落库阶段读取。"""
+    answer: str = ""
+    tools: list = field(default_factory=list)
+    hard_results: list = field(default_factory=list)
+    loaded_skill_names: list = field(default_factory=list)
 
 
 class AgentService:
@@ -50,6 +56,9 @@ class AgentService:
         self.tool_result_store = ToolResultStore(settings.result_dir)
         # LLM 客户端
         self.llm = get_llm()
+        # 记忆管理器：编排短期记忆组装/压缩与长期记忆提炼，四个 store 与 AgentService 共享同一实例
+        self.memory = MemoryManager(self.conversation_store, self.short_term_memory,
+                                    self.long_term_memory, self.tool_result_store, self.llm)
         # 加载 skills 清单（name/description/body）：name+description 进 system prompt，body 由 get_skill 按需加载
         self.skills = load_skills()
         # 一次性装配扁平 ToolRegistry（旅行 + 系统 + 网络工具）并缓存到 self。
@@ -94,12 +103,8 @@ class AgentService:
             await llm_close()
 
     async def delete_conversation(self, user_id, conv_id):
-        """删除会话及其消息，并清理该会话的短期记忆（running summary）与工具结果地址索引；归属校验失败返回 False。"""
-        ok = await self.conversation_store.delete_conversation(user_id, conv_id)
-        if ok:
-            await self.short_term_memory.clear_conversation(conv_id)
-            await self.tool_result_store.delete_conversation(conv_id, user_id)
-        return ok
+        """删除会话及其消息，并清理该会话的短期记忆与工具结果地址索引；归属校验失败返回 False。"""
+        return await self.memory.delete_conversation(user_id, conv_id)
 
     async def chat_stream(self, user_id, conv_id, message):
         """SSE 流式对话主流程，依次产出事件：conversation_id → token/tool_call/tool_result → done。
@@ -109,60 +114,123 @@ class AgentService:
         # 设置请求级 user_id contextvar，供工具层（read_file/grep 按用户隔离读）与 run_tool 写文件使用
         current_user_id.set(user_id)
         logger.info("[service] 收到请求，user=%s，消息：%.60s", user_id, message)
-        # 1. 无会话则新建（首次对话），并先回传 conversation_id 让前端记住会话。
-        #    写路径归属校验：客户端传入他人 conv_id 时当作首次对话重建，杜绝跨用户写入。
+
+        conv_id = await self._ensure_conversation(user_id, conv_id, message)
+        yield {"type": "conversation_id", "conversation_id": conv_id}
+        # 落库本轮用户消息
+        await self.conversation_store.add_message(conv_id, "user", message)
+
+        system, history, summary_hint, agent = await self._prepare_context(user_id, conv_id)
+
+        # 事件队列：worker 在独立 task 里跑完整轮（生成→critic→落库→记忆→token 输出），
+        # 主协程只负责从 queue 取事件转发 SSE。客户端刷新断开只会取消主协程（转发），
+        # worker 不受影响，照常跑完并落库——保证「后端生成完，前端再刷新也能拉到」。
+        queue: asyncio.Queue = asyncio.Queue()
+
+        async def run_full_turn():
+            """后台跑完完整一轮，把所有要下发的事件塞进 queue。
+
+            放在独立 task 而非主协程里，是为了让落库不依赖「SSE 转发」这条可被
+            客户端断开取消的路径：断开后 worker 继续执行到 add_message，答案照常入库。
+            """
+            state = _TurnState()
+            try:
+                # 工具调用阶段：run_stream 产出的事件转发进 queue（token 不立即下发，等 critic 后统一输出）
+                async for sse in self._stream_agent_reply(agent, history, conv_id, message, state, summary_hint):
+                    await queue.put(sse)
+                # 工具调用结束，进入「整理答案」阶段：有硬数据先做事实校验，校验不过再修正
+                await queue.put({"type": "status", "status": "checking" if state.hard_results else "generating"})
+                if state.hard_results:
+                    async for sse in self._critic_correct(state, system, message, user_id, summary_hint):
+                        await queue.put(sse)
+
+                answer = state.answer
+                # 先落库完整答案（流式输出之前）：即使客户端中途刷新、SSE 流被中断，历史里也已存有本轮完整回复
+                await self.conversation_store.add_message(
+                    conv_id, "assistant",
+                    json.dumps({"content": answer, "tools": state.tools}, ensure_ascii=False))
+                # 补写本轮到短期记忆，让「记忆」页立即显示最新一轮
+                await self.memory.append_current_turn(conv_id, message, answer)
+                # 流式输出最终答案：拆小块逐块上发（此时已过 critic 校验，保证只输出一段干净答案）
+                for j in range(0, len(answer), 40):
+                    await queue.put({"type": "token", "content": answer[j:j + 40]})
+                # 清理本轮 spill 文件（保留 _history.txt）；异步提炼长期记忆（fire-and-forget，不影响主流程返回）
+                await self.tool_result_store.clear_spill(conv_id, user_id)
+                asyncio.create_task(self.memory.extract_facts(user_id, message))
+                await queue.put({"type": "done"})
+            finally:
+                # 终止标记：成功或异常都放，保证主协程能退出；异常随后在 await worker 处重新抛出
+                await queue.put(None)
+
+        worker = asyncio.create_task(run_full_turn())
+        while True:
+            ev = await queue.get()
+            if ev is None:
+                break
+            yield ev
+        await worker  # 正常流程等 worker 收尾（保证落库完成后再返回）；断开时主协程被取消，worker 继续后台落库
+
+    async def _ensure_conversation(self, user_id, conv_id, message):
+        """无会话则新建（首次对话）并回写标题；客户端传入他人 conv_id 时当作首次对话重建，杜绝跨用户写入。"""
         if conv_id is None or not await self.conversation_store.belongs_to(user_id, conv_id):
             conv_id = await self.conversation_store.create_conversation(user_id)
             await self.conversation_store.update_title(conv_id, message[:20])
-        yield {"type": "conversation_id", "conversation_id": conv_id}
-        # 2. 落库本轮用户消息
-        await self.conversation_store.add_message(conv_id, "user", message)
-        # 3. 长期记忆召回：按 importance 降序取前 20 条（单条已截断），拼成 long_term_hint 注入 system 上下文
+        return conv_id
+
+    async def _prepare_context(self, user_id, conv_id):
+        """准备阶段：召回长期记忆 + 组装短期历史 + 渲染 system prompt，返回 (system, history, summary_hint, agent)。"""
+        # 长期记忆召回：按 importance 降序取前 20 条，按 token 预算截断（占 long_term_hint_ratio），
+        # 避免历史偏好无限挤占留给对话的预算；文案由 render_long_term_hint 集中拼装。
         facts = await self.long_term_memory.recall(user_id, top_n=20)
-        long_term_hint = "用户历史偏好：" + "；".join(f["fact"] for f in facts) if facts else ""
-        # 4. 组装历史（running summary）：预算内保留最近回合原文，超预算的早期回合压缩。
-        #    短期记忆摘要单独返回，固定注入 system（不参与工作记忆 token 预算淘汰）。
-        history, summary = await self._assemble_history(user_id, conv_id)
-        # 5. 顶层 agent：复用 __init__ 缓存的 registry（不在每请求重建，避免泄漏 MCP 数据源）
-        registry = self.registry
-        tool_grounding = load_prompt("grounding")
+        hint_budget = int(settings.llm_context_budget * settings.long_term_hint_ratio)
+        hint_parts = []
+        hint_used = 0
+        for f in facts:
+            cost = estimate_tokens(f["fact"])
+            if hint_used + cost > hint_budget:
+                break
+            hint_parts.append(f["fact"])
+            hint_used += cost
+        # 组装历史（running summary）：预算内保留最近回合原文，超预算的早期回合压缩成摘要注入 system
+        history, summary = await self.memory.assemble_history(user_id, conv_id)
         # 可用业务清单（name + description）注入 system prompt；正文由 get_skill 工具按需加载
         skill_directory = "\n".join(f"- {s['name']}：{s['description']}" for s in self.skills)
-        system = render_system_prompt(skill_directory, tool_grounding)
-        system += "\n" + today_hint()
-        if long_term_hint:
-            system += "\n" + long_term_hint
-        if summary:
-            system += "\n" + f"[摘要] {summary}\n[完整历史存到 {conv_id}/_history.txt，可用 read_file 读]"
-        agent = Agent(name="assistant", system_prompt=system, tools=registry.list_names(), llm=self.llm)
+        summary_hint = render_history_summary(summary, conv_id)
+        system = render_system_prompt(
+            skill_directory, load_prompt("grounding"),
+            today=today_hint(),
+            long_term_hint=render_long_term_hint(hint_parts),
+        )
+        agent = Agent(name="assistant", system_prompt=system, tools=self.registry.list_names(), llm=self.llm)
+        return system, history, summary_hint, agent
 
-        # 7. 跑 run_stream：on_event 把事件塞队列，主循环消费队列转 SSE。
-        #    本地累积 tools（每对 tool_call/tool_result）与 hard_results（硬数据工具完整结果）供 critic。
+    async def _stream_agent_reply(self, agent, history, conv_id, message, state, summary_hint=""):
+        """跑 ReAct 生成，把内部事件转成 SSE 转发，同时累积 tools/hard_results/loaded_skill_names 到 state。
+
+        结束时把最终答案写入 state.answer；summary_hint 作为历史摘要传给 run_stream（独立 system 消息）。
+        """
         queue: asyncio.Queue = asyncio.Queue()
-        tools: list[dict] = []
-        hard_results: list[str] = []
         pending_calls: list[dict] = []  # 待配对的 tool_call（工具并行执行时按 tool_call_id 匹配回 result）
-        loaded_skill_names: list[str] = []  # 本轮 get_skill 加载过的业务名（供 critic 修正时注入规则正文，保住输出格式）
 
         async def emit(event):
             # 把 run_stream 的内部事件原样塞进队列，供下方循环实时转 SSE
             await queue.put(event)
 
-        async def generate(user_message):
+        async def generate():
             # 真正执行一轮 agent 生成；结束时放 None 作为队列终止标记
             try:
                 return await agent.run_stream(
-                    user_message, history, registry, on_event=emit,
+                    message, history, self.registry, on_event=emit,
                     conversation_id=conv_id,
                     context_budget=settings.llm_context_budget,
                     tool_result_store=self.tool_result_store,
+                    summary=summary_hint,
                 )
             finally:
                 await queue.put(None)
 
         async def consume():
-            # 消费队列：把 token/tool_call/tool_result 转成 SSE；
-            # 同时累积 tools 与 hard_results，供持久化与 critic 使用。
+            # 消费队列：把 token/tool_call/tool_result 转成 SSE，同时累积状态供 critic 与持久化使用
             while True:
                 ev = await queue.get()
                 if ev is None:
@@ -171,227 +239,87 @@ class AgentService:
                 if etype == "token":
                     pass  # 答案不立即输出：等 critic 校验通过后统一流式输出，避免「第一段编造答案」先流出
                 elif etype == "status":
-                    # LLM 开始生成（思考或答案）时的心跳，转发给前端显示「整理中」，覆盖生成期长静默
                     yield {"type": "status", "status": ev["status"]}
                 elif etype == "tool_call":
-                    # 入队待配对（带 tool_call_id）：后续 tool_result 按 id 回填 summary；
-                    # label 一并入队，随 tools 持久化，供前端历史气泡还原中文名
+                    # 入队待配对（带 tool_call_id），label 一并入队随 tools 持久化供前端还原中文名
                     label = ev.get("label", ev["tool"])
                     pending_calls.append({"tool": ev["tool"], "args": ev["args"], "id": ev["id"], "label": label})
                     # 记录 get_skill 加载的业务，供 critic 修正时注入规则正文（保住输出格式约束）
                     if ev["tool"] == "get_skill":
                         args = ev.get("args") or {}
                         if isinstance(args, dict) and args.get("name"):
-                            loaded_skill_names.append(args["name"])
+                            state.loaded_skill_names.append(args["name"])
                     # id/label 一并下发给前端：同名工具并发时前端也能按 id 精确配对 summary，不串
                     yield {"type": "tool_call", "tool": ev["tool"], "args": ev["args"], "id": ev["id"], "label": label}
                 elif etype == "tool_result":
                     name = ev["tool"]
-                    # 按 tool_call_id 精确配对：并行执行时工具按「完成先后」返回，tool_result 顺序
-                    # 与 tool_call 顺序并不一致；按名或按队列顺序都会在同名工具并发时错配 summary，
-                    # 只有 tool_call_id 是唯一可靠键。
+                    # 按 tool_call_id 精确配对：并行执行时工具按「完成先后」返回，tool_result 顺序与 tool_call
+                    # 顺序不一致，按名或按队列顺序都会在同名工具并发时错配，只有 tool_call_id 是唯一可靠键。
                     entry = next((p for p in pending_calls if p["id"] == ev["id"]), None)
                     if entry is not None:
                         pending_calls.remove(entry)
                         entry["status"] = True
-                        # result = 模型工作记忆里的截断版结果（模型所见语料），
-                        # 供 critic 校验、修正重写与前端展示复用，保证前端展示与模型所见一致；持久化保留
+                        # result = 模型工作记忆里的截断版结果（模型所见语料），供 critic 校验、修正重写与前端展示复用
                         entry["result"] = ev.get("result", "")
                         entry.pop("id", None)  # id 仅用于配对，持久化 tools 保持 {tool,args,status,result} 结构
-                        tools.append(entry)
+                        state.tools.append(entry)
                     if name in HARD_DATA_TOOLS:
                         # 硬数据工具记模型所见语料（ev["result"]），保证 critic 与模型生成答案时语料一致
-                        hard_results.append(ev.get("result", ""))
+                        state.hard_results.append(ev.get("result", ""))
                     yield {"type": "tool_result", "tool": name, "status": ev.get("status", True),
                            "result": ev.get("result", ""), "id": ev["id"], "label": ev.get("label", name)}
 
-        # 第一轮生成
-        gen_task = asyncio.create_task(generate(message))
+        gen_task = asyncio.create_task(generate())
         async for sse in consume():
             yield sse
-        answer = await gen_task
+        state.answer = await gen_task
 
-        # 7.5 工具调用结束，进入「整理答案」阶段：发 status 事件让前端显示进度，避免长静默。
-        #     有硬数据先做事实校验（checking），校验不过再修正（correcting），最后统一流式输出答案。
-        if hard_results:
-            yield {"type": "status", "status": "checking"}
-        else:
-            yield {"type": "status", "status": "generating"}
+    async def _critic_correct(self, state, system, message, user_id, summary_hint=""):
+        """critic 事实校验：不通过时复用已查工具结果让 LLM 重写答案（不重新调工具）；可能更新 state.answer。
 
-        # 8. critic 回路：仅当本轮调用了硬数据工具才校验（否则无事实依据可核对）
-        if hard_results:
-            # read_file_fn / grep_fn：绑定当前 user_id 的完整结果读取，供 critic 多轮用 read_file/grep 定向读文件
-            async def read_file_fn(path, offset, limit):
-                return await self.tool_result_store.read(path, offset, limit, user_id=user_id)
-
-            async def grep_fn(pattern, path):
-                return await self.tool_result_store.search(path, pattern, user_id=user_id)
-
-            verdict = await run_critic(self.llm, json.dumps(hard_results, ensure_ascii=False), answer,
-                                       read_file_fn=read_file_fn, grep_fn=grep_fn)
-            if not verdict.get("ok", True):
-                # ok=false：第一轮工具结果本身是准的，问题只在模型生成答案时编造了价格。
-                # 修正时复用第一轮的工具结果（tools），直接让模型重新生成答案——不重新调工具、不重新走 ReAct。
-                issues = verdict.get("issues", [])
-                logger.info("[service] critic 判定不通过（%d 条问题），进入修正答案", len(issues))
-                yield {"type": "status", "status": "correcting"}
-                # 修正 prompt 只喂 {tool,args,result} 事实依据，result 取模型所见语料（visible）而非展示用 summary，
-                # 剥离 label/visible 等内部字段，避免噪音，并保证与第一轮生成时语料一致
-                tool_results_text = json.dumps(
-                    [{"tool": t["tool"], "args": t["args"], "result": t.get("result", "")}
-                     for t in tools], ensure_ascii=False)
-                # 注入本轮 get_skill 加载过的业务规则正文，保住「输出格式」等约束
-                # （critic 修正走 complete 不重新调 get_skill，正文会丢）
-                skill_guide = "\n\n".join(
-                    f"【{s['name']} 业务规则】\n{s['body']}"
-                    for s in self.skills if s["name"] in loaded_skill_names
-                )
-                correction_prompt = (
-                        f"原始问题：{message}\n\n"
-                        f"以下是本轮已经查询到的工具结果（事实依据，请严格基于这些，不要编造）：\n{tool_results_text}\n\n"
-                        + (
-                            f"以下是本业务的规划规则与输出格式，修正后的答案必须同样遵守：\n{skill_guide}\n\n" if skill_guide else "")
-                        + f"请基于以上工具结果直接输出修正后的最终答案（中文 Markdown）。"
-                          f"用户明确询问但工具没查到的关键信息，如实说明「该信息未查到」，不要编造；用户没问的字段不要罗列缺失。\n"
-                          f"修正要点：\n{json.dumps(issues, ensure_ascii=False)}"
-                )
-                t0 = time.perf_counter()
-                answer = await self.llm.complete([
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": correction_prompt},
-                ])
-                logger.info("[service] 修正答案完成，耗时 %.1fs，%d 字", time.perf_counter() - t0, len(answer))
-
-        # 8.5 先落库完整答案（流式输出之前）：即使客户端中途刷新、SSE 流被中断，
-        #     历史里也已存有本轮完整回复，刷新后能恢复（与主流对话产品一致，避免「中途刷新回复丢失」）
-        await self.conversation_store.add_message(conv_id, "assistant",
-                                                  json.dumps({"content": answer, "tools": tools}, ensure_ascii=False))
-
-        # 9. 流式输出最终答案：拆小块逐块上发（此时已过 critic 校验，保证只输出一段干净答案）
-        for j in range(0, len(answer), 40):
-            yield {"type": "token", "content": answer[j:j + 40]}
-
-        # 10. 清理本轮 spill 文件（工具结果地址索引 read 完即弃，保留 _history.txt）；
-        #     异步提炼长期记忆（fire-and-forget，不影响主流程返回）
-        await self.tool_result_store.clear_spill(conv_id, user_id)
-        asyncio.create_task(self._extract_facts(user_id, conv_id))
-        yield {"type": "done"}
-
-    async def _assemble_history(self, user_id, conv_id):
-        """组装短期记忆（running summary 摘要 + 最近几轮原文），返回 (recent_messages, summary)。
-
-        从完整历史（messages 表）按 token 预算切分：早期回合压成累积摘要（存 short_term_memory 表 + 落盘 _history.txt），
-        最近几轮保留原文（存 short_term_memory 表）。返回最近几轮原文（注入对话）与摘要（注入 system）。
+        summary_hint 作为独立 system 消息随修正 prompt 一起注入，保持与主生成一致的历史上下文。
         """
-        raw_history = await self.conversation_store.get_history(user_id, conv_id)
-        budget = int(settings.llm_context_budget * settings.history_budget_ratio)
-        # 还原纯文本并按「回合」分组：一个 user 消息 + 其后连续的 assistant 回复算一个回合。
-        # 与工作记忆的「单元淘汰」同理——预算边界只落在回合之间，不把一问一答从中间切开。
-        turns = []
-        for h in raw_history:
-            # 统一还原纯文本 content：assistant 落库是 JSON（{"content","tools"}），user 是纯文本
-            content = h["content"]
-            if h["role"] == "assistant":
-                data = None
-                try:
-                    data = json.loads(content)
-                except (json.JSONDecodeError, TypeError):
-                    pass
-                if isinstance(data, dict) and isinstance(data.get("content"), str):
-                    content = data["content"]
-            # user 消息开启新回合（首个消息若为 assistant 也归入第一个回合）
-            if h["role"] == "user" or not turns:
-                turns.append([])
-            turns[-1].append({"role": h["role"], "content": content})
-        # 反序遍历回合（最新→最老），按整回合累积预算：预算内整回合保留，超预算整回合压缩；至少保留最新一个回合。
-        used = 0
-        keep_from = len(turns)
-        for i in range(len(turns) - 1, -1, -1):
-            cost = sum(estimate_tokens(m["content"]) for m in turns[i])
-            if used + cost <= budget or i == len(turns) - 1:
-                used += cost
-                keep_from = i
-            else:
-                break
-        recent = [{"role": m["role"], "content": m["content"]} for turn in turns[keep_from:] for m in turn]
-        to_compress = [m for turn in turns[:keep_from] for m in turn]
-        # 读旧摘要（短期记忆表的 summary 记录），供压缩时累积浓缩
-        old_records = await self.short_term_memory.get_records(conv_id)
-        old_summary = next((r["content"] for r in old_records if r["role"] == "summary"), None)
-        summary = old_summary
-        # 触发压缩：超预算的早期消息追加到历史文件 + 浓缩进累积摘要（替换旧摘要）
-        if to_compress:
-            logger.info("[service] 历史超预算，触发 running summary 压缩：压缩 %d 条早期消息", len(to_compress))
-            # to_compress 已按时间正序，带角色前缀拼接，供摘要与历史文件可读
-            compressed_text = "\n\n".join(
-                f"[{'用户' if x['role'] == 'user' else '助手'}] {x['content']}"
-                for x in to_compress
-            )
-            await self.tool_result_store.append_history(conv_id, user_id, compressed_text)
-            summary = await self._update_summary(old_summary, compressed_text)
-        # 末尾一条是本轮刚落库的用户消息，run_stream 会再追加一次，这里剔除避免重复
-        if recent and recent[-1]["role"] == "user":
-            recent = recent[:-1]
-        # 写回短期记忆表：summary 1 条 + 最近几轮对话原文，边界清晰、跨轮持久
-        records = []
-        if summary:
-            records.append({"role": "summary", "content": summary})
-        records.extend(recent)
-        await self.short_term_memory.replace_records(conv_id, records)
-        return recent, summary
+        # read_file_fn / grep_fn：绑定当前 user_id 的完整结果读取，供 critic 多轮定向读文件
+        async def read_file_fn(path, offset, limit):
+            return await self.tool_result_store.read(path, offset, limit, user_id=user_id)
 
-    async def _update_summary(self, old_summary, compressed_text):
-        """LLM 把「旧摘要 + 更早对话」浓缩成新的累积摘要；失败回退字符串拼接。"""
-        try:
-            return await self.llm.complete([
-                {"role": "system",
-                 "content": "把下面的「旧摘要 + 更早对话」浓缩成一个新的累积摘要（100-300 字），保留核心结论、关键数据（菜名/价格/时间/结构要点）。"},
-                {"role": "user",
-                 "content": f"旧摘要：{old_summary or '（无）'}\n\n更早对话：\n{compressed_text[:4000]}"},
-            ])
-        except Exception:
-            logger.warning("[service] 摘要浓缩失败，回退拼接")
-            return (old_summary or "") + "\n" + compressed_text[:500]
+        async def grep_fn(pattern, path):
+            return await self.tool_result_store.search(path, pattern, user_id=user_id)
 
-    async def _extract_facts(self, user_id, conv_id):
-        """异步提炼长期记忆：只从用户发言提取跨会话可复用偏好，并做语义去重。
-
-        关键：只提取 user 角色的消息，不把 agent 返回的方案内容误当成用户偏好。
-        去重：新 fact 与已有 fact 语义相近时，提升已有 fact 的 importance 而非新增重复条目。
-        """
-        try:
-            logger.info("[service] 开始提炼长期记忆 user=%s conv=%s", user_id, conv_id)
-            msgs = await self.conversation_store.get_history(user_id, conv_id)
-            user_msgs = [m for m in msgs if m["role"] == "user"]
-            if not user_msgs:
-                return
-            resp = await self.llm.complete([
-                {"role": "system",
-                 "content": "从下面的用户发言里，只提取【稳定的、跨会话可复用的】偏好或事实（如常住城市、长期的兴趣偏好、习惯性要求，例：'偏好经济型酒店'、'喜欢自然风光'）。不要提取一次性的行程请求参数（如'去成都玩2天预算2000'这种某次旅行的具体目的地/天数/预算），也不要提取助手推荐的内容。没有稳定偏好就输出空列表。每条 fact 不超过 100 个字。每条打 importance(0~1)。输出 JSON:{\"facts\":[{\"fact\":\"...\",\"importance\":0.8}]}"},
-                {"role": "user", "content": json.dumps(user_msgs, ensure_ascii=False)}])
-            data = json.loads(resp[resp.index("{"):resp.rindex("}") + 1])
-            new_facts = data.get("facts", [])
-            if not new_facts:
-                return
-            existing = await self.long_term_memory.get_all(user_id)
-            to_add = []
-            for nf in new_facts:
-                fact_text = nf.get("fact", "")
-                importance = nf.get("importance", 0.5)
-                # 语义去重：与已有 fact 相似则更新其 importance（取较大值），否则标记为新增
-                matched = next((ex for ex in existing if _similar(fact_text, ex["fact"])), None)
-                if matched:
-                    await self.long_term_memory.update_importance(user_id, matched["fact"],
-                                                                  max(matched["importance"], importance))
-                else:
-                    to_add.append(nf)
-            if to_add:
-                await self.long_term_memory.add_facts(user_id, to_add)
-            logger.info("[service] 长期记忆提炼完成：新增 %d 条", len(to_add))
-        except Exception as e:
-            # 提炼失败不影响主对话流程，记录 warning 便于发现数据质量回归
-            # （如 LLM 返回字符串型 importance 触发 max(float, str) 的 TypeError 也会走到这里）
-            logger.warning("[service] 提炼长期记忆失败 user=%s：%s", user_id, e)
+        verdict = await run_critic(self.llm, json.dumps(state.hard_results, ensure_ascii=False), state.answer,
+                                   read_file_fn=read_file_fn, grep_fn=grep_fn)
+        if verdict.get("ok", True):
+            return
+        # ok=false：第一轮工具结果本身是准的，问题只在模型生成答案时编造了价格。
+        # 修正时复用第一轮的工具结果，直接让模型重新生成答案——不重新调工具、不重新走 ReAct。
+        issues = verdict.get("issues", [])
+        logger.info("[service] critic 判定不通过（%d 条问题），进入修正答案", len(issues))
+        yield {"type": "status", "status": "correcting"}
+        # 修正 prompt 只喂 {tool,args,result} 事实依据，result 取模型所见语料（截断版）而非展示用 summary
+        tool_results_text = json.dumps(
+            [{"tool": t["tool"], "args": t["args"], "result": t.get("result", "")}
+             for t in state.tools], ensure_ascii=False)
+        # 注入本轮 get_skill 加载过的业务规则正文，保住「输出格式」等约束（修正走 complete 不重新调 get_skill）
+        skill_guide = "\n\n".join(
+            f"【{s['name']} 业务规则】\n{s['body']}"
+            for s in self.skills if s["name"] in state.loaded_skill_names
+        )
+        correction_prompt = (
+                f"原始问题：{message}\n\n"
+                f"以下是本轮已经查询到的工具结果（事实依据，请严格基于这些，不要编造）：\n{tool_results_text}\n\n"
+                + (
+                    f"以下是本业务的规划规则与输出格式，修正后的答案必须同样遵守：\n{skill_guide}\n\n" if skill_guide else "")
+                + f"请基于以上工具结果直接输出修正后的最终答案（中文 Markdown）。"
+                  f"用户明确询问但工具没查到的关键信息，如实说明「该信息未查到」，不要编造；用户没问的字段不要罗列缺失。\n"
+                  f"修正要点：\n{json.dumps(issues, ensure_ascii=False)}"
+        )
+        t0 = time.perf_counter()
+        msgs = [{"role": "system", "content": system}]
+        if summary_hint:
+            msgs.append({"role": "system", "content": summary_hint})
+        msgs.append({"role": "user", "content": correction_prompt})
+        state.answer = await self.llm.complete(msgs)
+        logger.info("[service] 修正答案完成，耗时 %.1fs，%d 字", time.perf_counter() - t0, len(state.answer))
 
 
 # 进程级单例：路由层共用同一个 service，避免重复装配/重复创建 LLM 与数据源客户端

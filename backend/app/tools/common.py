@@ -111,7 +111,7 @@ def register_common_tools(registry):
                           "keyword": {"type": "string", "description": "菜名或食材关键词，如 宫保鸡丁、鸡胸肉"}},
                        "required": ["keyword"]},
                       make_recipe_search(uapis_ds), "搜菜谱")
-    registry.register("recipe_detail", "按菜谱 id 查询菜谱详情，返回食材用量清单 + 分步做法",
+    registry.register("recipe_detail", "按 recipe_search 搜索返回的菜谱 id 查询菜谱详情，返回食材用量清单 + 分步做法",
                       {"type": "object",
                        "properties": {"id": {"type": "string", "description": "菜谱 id，来自 recipe_search 返回"}},
                        "required": ["id"]},

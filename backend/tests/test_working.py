@@ -32,7 +32,7 @@ async def test_fit_no_eviction_when_under_budget():
 async def test_fit_evicts_and_distills():
     """超预算时成对淘汰最老交互单元，被淘汰单元 LLM 蒸馏成 [早期交互摘要] 放回最前。"""
     llm = FakeLLM("已查泰安天气晴33℃")
-    wm = WorkingMemory(llm, budget_tokens=60)  # 小预算强制淘汰
+    wm = WorkingMemory(llm, budget_tokens=100)  # 预算需大于「最新单元」的 token 数，保证只淘汰最老单元
     window = [
         # 最老单元（将被淘汰）
         {"role": "assistant", "content": "查天气",
@@ -73,3 +73,47 @@ async def test_fit_evicts_pairwise_not_split():
             # 前一条是 assistant（带 tool_calls），配对未被拆散
             prev = out[i - 1]
             assert prev.get("role") == "assistant" and prev.get("tool_calls")
+
+
+class FailingLLM:
+    """complete 抛异常的 LLM 假实现，验证蒸馏失败时降级为拼接截断而非抛错。"""
+
+    async def complete(self, messages):
+        raise RuntimeError("LLM 超时")
+
+
+@pytest.mark.asyncio
+async def test_fit_distill_failure_falls_back():
+    """LLM 蒸馏失败时 fit 不抛异常，降级为序列化文本拼接摘要（保留被淘汰单元内容）。"""
+    llm = FailingLLM()
+    wm = WorkingMemory(llm, budget_tokens=60)
+    window = [
+        {"role": "assistant", "content": "查天气",
+         "tool_calls": [{"id": "1", "function": {"name": "weather", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "1", "content": "x" * 100},
+        {"role": "assistant", "content": "查POI",
+         "tool_calls": [{"id": "2", "function": {"name": "poi", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "2", "content": "y" * 10},
+    ]
+    out = await wm.fit(window)  # 不应抛异常
+    # 降级摘要作为 system 消息放回最前，且保留被淘汰单元的可读内容（x*100 拼进摘要）
+    assert out[0]["role"] == "system"
+    assert "[早期交互摘要]" in out[0]["content"]
+    assert "x" in out[0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_fit_distills_single_oversized_unit():
+    """单个单元超预算时也被蒸馏成摘要，而不是原样超预算返回。"""
+    llm = FakeLLM("巨单摘要")
+    wm = WorkingMemory(llm, budget_tokens=50)
+    window = [
+        {"role": "assistant", "content": "查天气",
+         "tool_calls": [{"id": "1", "function": {"name": "weather", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "1", "content": "x" * 500},  # 单条极大，超预算
+    ]
+    out = await wm.fit(window)
+    # 整个单元被蒸馏成摘要，窗口只剩 1 条 system 摘要
+    assert len(out) == 1
+    assert out[0]["role"] == "system"
+    assert "[早期交互摘要]" in out[0]["content"]
