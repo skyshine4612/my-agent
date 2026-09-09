@@ -37,7 +37,7 @@ my-agent/
 │   │   ├── prompts/           # 提示词 .md（system/grounding/critic）
 │   │   ├── services/          # AgentService 编排器
 │   │   ├── skills/            # 业务 skill（travel/meal_planning 等）
-│   │   ├── tools/             # 工具注册（travel/network/common/system/sub_agent）
+│   │   ├── tools/             # 工具注册（travel/network/common/file/system/sub_agent）
 │   │   ├── config.py          # 配置（读取 .env）
 │   │   └── main.py            # FastAPI 应用入口
 │   ├── tests/                 # pytest 测试（不依赖真实 LLM/网络）
@@ -103,6 +103,8 @@ docker compose up --build
 | `LLM_API_KEY` | LLM 服务 API Key | 空                                                  |
 | `LLM_BASE_URL` | LLM 接口地址 | `https://dashscope.aliyuncs.com/compatible-mode/v1` |
 | `LLM_MODEL` | 使用的模型 | `qwen3.7-plus`                                      |
+| `ENABLE_THINKING` | Qwen 思考模式开关（`false` 关闭更快，`true` 更强推理但更慢） | `false`                                            |
+| `LLM_TEMPERATURE` | LLM 采样温度 | `0.5`                                                |
 | `MODELSCOPE_TOKEN` | ModelScope 访问令牌（调用 MCP 服务） | 空                                                  |
 | `TRAIN_12306_URL` | 12306 火车票 MCP 服务地址 | 空                                                  |
 | `FLIGHT_VARIFLIGHT_URL` | variflight 官方 MCP 服务地址 | 空                                                  |
@@ -114,6 +116,8 @@ docker compose up --build
 | `LLM_CONTEXT_BUDGET` | 工作记忆 token 预算上限（超限淘汰最老 + LLM 摘要兜底） | `128000`                                            |
 | `TRUNCATE_LIMIT` | 工具结果字符串截断阈值（超限完整结果写文件，read_file/grep 按需读） | `4000`                                              |
 | `RESULT_DIR` | 工具结果地址索引的落盘目录（本轮用完即删） | `results`                                           |
+| `HISTORY_BUDGET_RATIO` | 历史答案原文占 `llm_context_budget` 的比例（早期答案落盘+摘要） | `0.5`                                                |
+| `LONG_TERM_HINT_RATIO` | 长期记忆 hint 占 `llm_context_budget` 的比例（召回偏好注入 system） | `0.05`                                              |
 
 ### 密钥获取来源
 
