@@ -1,6 +1,7 @@
 # tests/test_sub_agent.py
 # call_sub_agent 工具的契约测试：验证委派子任务返回摘要。
 import pytest
+from langchain_core.tools import tool
 
 from app.core.registry import ToolRegistry
 from app.tools.sub_agent import make_call_sub_agent
@@ -24,11 +25,12 @@ class FakeSubLLM:
 async def test_call_sub_agent_returns_answer(tmp_path):
     registry = ToolRegistry()
 
-    async def get_skill(name):
+    @tool
+    async def get_skill(name: str) -> str:
+        """读取业务规则。"""
         return f"{name} 规则"
 
-    get_skill.__name__ = "get_skill"
-    registry.register("get_skill", "读取业务规则", {"type": "object", "properties": {}}, get_skill, "读取业务规则")
+    registry.register_tool(get_skill, "读取业务规则")
 
     fn = make_call_sub_agent(FakeSubLLM(), registry, ["travel"], 32000)
     result = await fn.ainvoke({"task": "查北京到上海的火车票"})

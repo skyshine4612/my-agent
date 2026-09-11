@@ -1,7 +1,6 @@
 # app/core/registry.py
-# 工具注册表（ToolRegistry）：统一管理工具元信息，把工具转成 OpenAI function calling schema
-# 供 LLM 决策调用，并统一执行同步/异步工具函数。
-import inspect
+# 工具注册表（ToolRegistry）：统一管理工具元信息（schema 由 langchain tool 对象的 pydantic
+# args_schema 生成），把工具转成 OpenAI function calling schema 供 LLM 决策调用。
 from dataclasses import dataclass
 from typing import Callable
 
@@ -42,7 +41,7 @@ class Tool:
         name:        工具名（LLM 通过它选择要调用的工具）
         description: 工具用途描述，写入 OpenAI schema 供 LLM 理解何时调用
         parameters:  JSON Schema 形式的入参定义，约束工具接受的参数结构
-        fn:          真正的可调用对象（支持同步或异步函数）
+        fn:          可调用对象：langchain tool 对象（走 ainvoke），或普通同步/异步函数
         label:       中文动作短语（如「查询火车票」），供前端工具气泡展示；空则回退英文名
     """
     name: str
@@ -56,21 +55,14 @@ class ToolRegistry:
     """工具注册表：统一管理工具，转成 OpenAI function schema 供 LLM 调用。
 
     职责：
-        - register：注册工具（名字 → Tool 元信息 + 函数）
+        - register_tool：注册 langchain tool 对象（schema 取自其 args_schema）
         - to_openai_schemas：把指定名字的工具转成 OpenAI function calling schema 列表
-        - call：按名字执行工具，兼容同步/异步函数，统一返回字符串
+        - call：按名字执行工具，统一返回字符串（委托 call_raw 后 str()）
     """
 
     def __init__(self):
         # 内部字典：工具名 → Tool 对象
         self._tools = {}
-
-    def register(self, name, description, parameters, fn, label=""):
-        """注册一个工具：用名字作为唯一键，保存元信息与可调用函数。
-
-        label：可选的中文动作短语（如「查询火车票」），供前端工具气泡展示；缺省回退英文名。
-        """
-        self._tools[name] = Tool(name, description, parameters, fn, label)
 
     def register_tool(self, tool, label=""):
         """从 langchain tool 对象注册：schema 由 pydantic 生成，执行走 tool.ainvoke。
@@ -108,18 +100,7 @@ class ToolRegistry:
         供 run_tool 做结构化截断使用：拿到原始结构才能按类型截断（list 前 3 条 / dict 前 10 键），
         而 `str()` 会把结构信息压平丢失。
         """
-        t = self._tools[name]
-        fn = t.fn
-        # langchain tool 对象：走 ainvoke 调用（拿到的仍是结构化原始对象，另白拿 pydantic 校验）
-        if hasattr(fn, "ainvoke"):
-            return await fn.ainvoke(arguments)
-        # 老式普通函数（Task 4 转换完其余工具后这条分支删除）：
-        # 解包参数字典调用，拿到原始结果（可能是普通值，也可能是协程）
-        res = fn(**arguments)
-        # 若结果是可等待对象（协程/异步函数），则 await 取出真实结果
-        if inspect.isawaitable(res):
-            res = await res
-        return res
+        return await self._tools[name].fn.ainvoke(arguments)
 
     async def call(self, name, arguments) -> str:
         """执行工具，支持同步/异步函数，统一返回字符串结果（委托 call_raw 后 str()）。"""
