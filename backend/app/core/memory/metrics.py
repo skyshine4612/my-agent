@@ -6,7 +6,7 @@ _LOCK = threading.Lock()
 _METRICS: dict[str, int] = {}
 
 # 指标含义：
-#   working_evicted_units    工作记忆成对淘汰的单元数
+#   working_evicted_units    工作记忆成对淘汰的消息条数（一个 assistant + N×tool 单元贡献 N+1）
 #   working_distill_calls    蒸馏 LLM 调用次数（每次淘汰一批即一次）
 #   working_distill_fallbacks 蒸馏失败降级为拼接截断的次数
 #   spill_writes            工具结果落盘次数
@@ -18,9 +18,6 @@ _METRIC_NAMES = (
     "spill_writes",
     "dedup_hits",
 )
-
-# 同一份指标名单的公开别名（测试与外部观察者按此断言全集）；只暴露名单，不暴露内部计数字典
-MEMORY_METRICS = _METRIC_NAMES
 
 
 def bump(name: str, n: int = 1) -> None:

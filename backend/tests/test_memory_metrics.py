@@ -1,6 +1,6 @@
 # tests/test_memory_metrics.py
 # 记忆体系的计数器：证明各机制确实被触发过，而非纸面设计。
-from app.core.memory.metrics import MEMORY_METRICS, bump, snapshot
+from app.core.memory.metrics import bump, snapshot
 
 
 def test_bump_increments():

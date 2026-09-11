@@ -15,6 +15,7 @@ from app.core.knowledge import KnowledgeStore
 from app.core.llm import get_llm
 from app.core.memory import ConversationStore, LongTermMemory, ShortTermMemory, ToolResultStore
 from app.core.memory.manager import MemoryManager
+from app.core.memory.metrics import log_snapshot
 from app.core.prompts import (load_prompt, render_history_summary, render_long_term_hint,
                               render_system_prompt, today_hint)
 from app.core.registry import ToolRegistry
@@ -166,6 +167,8 @@ class AgentService:
                 # 清理本轮 spill 文件（保留 _history.txt）；异步提炼长期记忆（fire-and-forget，不影响主流程返回）
                 await self.tool_result_store.clear_spill(conv_id, user_id)
                 asyncio.create_task(self.memory.extract_facts(user_id, message))
+                # 观测出口：本轮收尾打一条记忆指标快照日志，供重构前后对比
+                log_snapshot()
                 await queue.put({"type": "done"})
             finally:
                 # 终止标记：成功或异常都放，保证主协程能退出；异常随后在 await worker 处重新抛出
