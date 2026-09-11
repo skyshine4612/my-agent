@@ -1,424 +1,368 @@
 {
   "call_sub_agent": {
-    "function": {
-      "description": "把相互独立的子任务（如查交通、查景点、查美食）委派给独立上下文的子助手执行，子助手会自行调用工具并按业务规则处理，最终只返回结果摘要。当本轮需要多个相互独立的查询、或某个查询会返回大量数据（如几十个车次）时，应把这类子任务委派出去，避免主助手的上下文被大量工具结果淹没。",
-      "name": "call_sub_agent",
-      "parameters": {
-        "properties": {
-          "task": {
-            "description": "交给子助手的完整子任务描述",
-            "type": "string"
-          }
-        },
-        "required": [
-          "task"
-        ],
-        "type": "object"
-      }
-    },
-    "type": "function"
+    "description": "把相互独立的子任务（如查交通、查景点、查美食）委派给独立上下文的子助手执行，子助手会自行调用工具并按业务规则处理，最终只返回结果摘要。当本轮需要多个相互独立的查询、或某个查询会返回大量数据（如几十个车次）时，应把这类子任务委派出去，避免主助手的上下文被大量工具结果淹没。",
+    "name": "call_sub_agent",
+    "parameters": {
+      "properties": {
+        "task": {
+          "description": "交给子助手的完整子任务描述",
+          "type": "string"
+        }
+      },
+      "required": [
+        "task"
+      ],
+      "type": "object"
+    }
   },
   "flight_query": {
-    "function": {
-      "description": "查询跨城机票(航班/时间/票价)",
-      "name": "flight_query",
-      "parameters": {
-        "properties": {
-          "date": {
-            "type": "string"
-          },
-          "from_city": {
-            "type": "string"
-          },
-          "to_city": {
-            "type": "string"
-          }
+    "description": "查询跨城机票(航班/时间/票价)",
+    "name": "flight_query",
+    "parameters": {
+      "properties": {
+        "date": {
+          "type": "string"
         },
-        "required": [
-          "date",
-          "from_city",
-          "to_city"
-        ],
-        "type": "object"
-      }
-    },
-    "type": "function"
+        "from_city": {
+          "type": "string"
+        },
+        "to_city": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "date",
+        "from_city",
+        "to_city"
+      ],
+      "type": "object"
+    }
   },
   "get_skill": {
-    "function": {
-      "description": "获取指定业务的规划规则正文（如旅行规划规则）。处理某业务任务前只需调用一次，规则正文加载后会保留在上下文中，不要重复调用。",
-      "name": "get_skill",
-      "parameters": {
-        "properties": {
-          "name": {
-            "description": "业务名",
-            "enum": [
-              "meal_planning",
-              "travel"
-            ],
-            "type": "string"
-          }
-        },
-        "required": [
-          "name"
-        ],
-        "type": "object"
-      }
-    },
-    "type": "function"
+    "description": "获取指定业务的规划规则正文（如旅行规划规则）。处理某业务任务前只需调用一次，规则正文加载后会保留在上下文中，不要重复调用。",
+    "name": "get_skill",
+    "parameters": {
+      "properties": {
+        "name": {
+          "description": "业务名",
+          "enum": [
+            "meal_planning",
+            "travel"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "type": "object"
+    }
   },
   "grep": {
-    "function": {
-      "description": "在某个工具结果文件里正则搜索关键词，返回每个命中的位置与上下文片段。当需要定位结果里的某个车次号、价格、名称等关键信息时使用。",
-      "name": "grep",
-      "parameters": {
-        "properties": {
-          "path": {
-            "description": "结果文件的相对路径",
-            "type": "string"
-          },
-          "pattern": {
-            "description": "正则表达式，如 MU5160、525元",
-            "type": "string"
-          }
+    "description": "在某个工具结果文件里正则搜索关键词，返回每个命中的位置与上下文片段。当需要定位结果里的某个车次号、价格、名称等关键信息时使用。",
+    "name": "grep",
+    "parameters": {
+      "properties": {
+        "path": {
+          "description": "结果文件的相对路径",
+          "type": "string"
         },
-        "required": [
-          "pattern",
-          "path"
-        ],
-        "type": "object"
-      }
-    },
-    "type": "function"
+        "pattern": {
+          "description": "正则表达式，如 MU5160、525元",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "pattern"
+      ],
+      "type": "object"
+    }
   },
   "holiday_calendar": {
-    "function": {
-      "description": "查询指定日期/月份/年份的节假日、农历、节气、休息日信息",
-      "name": "holiday_calendar",
-      "parameters": {
-        "properties": {
-          "date": {
-            "description": "按天查询，格式 YYYY-MM-DD",
-            "type": "string"
-          },
-          "month": {
-            "description": "按月查询，格式 YYYY-MM",
-            "type": "string"
-          },
-          "year": {
-            "description": "按年查询，格式 YYYY",
-            "type": "string"
-          }
+    "description": "查询指定日期/月份/年份的节假日、农历、节气、休息日信息",
+    "name": "holiday_calendar",
+    "parameters": {
+      "properties": {
+        "date": {
+          "description": "按天查询，格式 YYYY-MM-DD",
+          "type": "string"
         },
-        "required": [],
-        "type": "object"
-      }
-    },
-    "type": "function"
+        "month": {
+          "description": "按月查询，格式 YYYY-MM",
+          "type": "string"
+        },
+        "year": {
+          "description": "按年查询，格式 YYYY",
+          "type": "string"
+        }
+      },
+      "required": [],
+      "type": "object"
+    }
   },
   "hotboard": {
-    "function": {
-      "description": "查询指定平台的热搜热榜（微博/知乎/百度等）",
-      "name": "hotboard",
-      "parameters": {
-        "properties": {
-          "limit": {
-            "description": "返回条数，默认 20",
-            "type": "integer"
-          },
-          "type": {
-            "description": "平台类型，如 weibo/zhihu/baidu/bilibili",
-            "type": "string"
-          }
+    "description": "查询指定平台的热搜热榜（微博/知乎/百度等）",
+    "name": "hotboard",
+    "parameters": {
+      "properties": {
+        "limit": {
+          "description": "返回条数，默认 20",
+          "type": "integer"
         },
-        "required": [
-          "type"
-        ],
-        "type": "object"
-      }
-    },
-    "type": "function"
+        "type": {
+          "description": "平台类型，如 weibo/zhihu/baidu/bilibili",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "type": "object"
+    }
   },
   "ingredient_nutrition": {
-    "function": {
-      "description": "查询食材的营养成分（热量/蛋白质/脂肪/碳水/膳食纤维）",
-      "name": "ingredient_nutrition",
-      "parameters": {
-        "properties": {
-          "keyword": {
-            "description": "食材名称，如 鸡胸肉、白菜",
-            "type": "string"
-          }
-        },
-        "required": [
-          "keyword"
-        ],
-        "type": "object"
-      }
-    },
-    "type": "function"
+    "description": "查询食材的营养成分（热量/蛋白质/脂肪/碳水/膳食纤维）",
+    "name": "ingredient_nutrition",
+    "parameters": {
+      "properties": {
+        "keyword": {
+          "description": "食材名称，如 鸡胸肉、白菜",
+          "type": "string"
+        }
+      },
+      "required": [
+        "keyword"
+      ],
+      "type": "object"
+    }
   },
   "poi_detail": {
-    "function": {
-      "description": "调用前必须先调用 poi_search，按 poi_search 返回的 POI id 查询详情，返回名称/地址/推荐菜标签（餐饮类 POI 的 tag 含招牌菜）",
-      "name": "poi_detail",
-      "parameters": {
-        "properties": {
-          "id": {
-            "description": "POI id，来自 poi_search 返回",
-            "type": "string"
-          }
-        },
-        "required": [
-          "id"
-        ],
-        "type": "object"
-      }
-    },
-    "type": "function"
+    "description": "调用前必须先调用 poi_search，按 poi_search 返回的 POI id 查询详情，返回名称/地址/推荐菜标签（餐饮类 POI 的 tag 含招牌菜）",
+    "name": "poi_detail",
+    "parameters": {
+      "properties": {
+        "id": {
+          "description": "POI id，来自 poi_search 返回",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "type": "object"
+    }
   },
   "poi_search": {
-    "function": {
-      "description": "按关键词或分类码搜索POI(景点/酒店/美食)，可限定城市，返回名称/地址等基本信息",
-      "name": "poi_search",
-      "parameters": {
-        "properties": {
-          "city": {
-            "description": "限定城市，可选，不填则全局搜索",
-            "type": "string"
-          },
-          "keywords": {
-            "description": "搜索关键词（地点名，如 西湖、灵隐寺）",
-            "type": "string"
-          },
-          "sortrule": {
-            "description": "排序规则：distance(按距离)/weight(综合推荐)/rating(按评分)，不填默认综合",
-            "type": "string"
-          },
-          "types": {
-            "description": "高德分类码（110000风景名胜/140000科教文化/050000餐饮/100000住宿）",
-            "type": "string"
-          }
+    "description": "按关键词或分类码搜索POI(景点/酒店/美食)，可限定城市，返回名称/地址等基本信息",
+    "name": "poi_search",
+    "parameters": {
+      "properties": {
+        "city": {
+          "description": "限定城市，可选，不填则全局搜索",
+          "type": "string"
         },
-        "required": [],
-        "type": "object"
-      }
-    },
-    "type": "function"
+        "keywords": {
+          "description": "搜索关键词（地点名，如 西湖、灵隐寺）",
+          "type": "string"
+        },
+        "sortrule": {
+          "description": "排序规则：distance(按距离)/weight(综合推荐)/rating(按评分)，不填默认综合",
+          "type": "string"
+        },
+        "types": {
+          "description": "高德分类码（110000风景名胜/140000科教文化/050000餐饮/100000住宿）",
+          "type": "string"
+        }
+      },
+      "required": [],
+      "type": "object"
+    }
   },
   "read_file": {
-    "function": {
-      "description": "读取某个工具结果文件的片段。当工具结果因过长只显示了预览、末尾有文件路径提示时，用此工具按 offset 读回被省略的部分。",
-      "name": "read_file",
-      "parameters": {
-        "properties": {
-          "limit": {
-            "default": 3500,
-            "description": "读取字符数，默认 3500",
-            "type": "integer"
-          },
-          "offset": {
-            "default": 0,
-            "description": "起始字符偏移，默认 0",
-            "type": "integer"
-          },
-          "path": {
-            "description": "结果文件的相对路径（来自工具结果里的路径提示）",
-            "type": "string"
-          }
+    "description": "读取某个工具结果文件的片段。当工具结果因过长只显示了预览、末尾有文件路径提示时，用此工具按 offset 读回被省略的部分。",
+    "name": "read_file",
+    "parameters": {
+      "properties": {
+        "limit": {
+          "description": "读取字符数，默认 3500",
+          "type": "integer"
         },
-        "required": [
-          "path"
-        ],
-        "type": "object"
-      }
-    },
-    "type": "function"
+        "offset": {
+          "description": "起始字符偏移，默认 0",
+          "type": "integer"
+        },
+        "path": {
+          "description": "结果文件的相对路径（来自工具结果里的路径提示）",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path"
+      ],
+      "type": "object"
+    }
   },
   "recipe_detail": {
-    "function": {
-      "description": "调用前必须先调用 recipe_search，按 recipe_search 返回的 菜谱 id 查询菜谱详情，返回食材用量清单 + 分步做法",
-      "name": "recipe_detail",
-      "parameters": {
-        "properties": {
-          "id": {
-            "description": "菜谱 id，来自 recipe_search 返回",
-            "type": "string"
-          }
-        },
-        "required": [
-          "id"
-        ],
-        "type": "object"
-      }
-    },
-    "type": "function"
+    "description": "调用前必须先调用 recipe_search，按 recipe_search 返回的 菜谱 id 查询菜谱详情，返回食材用量清单 + 分步做法",
+    "name": "recipe_detail",
+    "parameters": {
+      "properties": {
+        "id": {
+          "description": "菜谱 id，来自 recipe_search 返回",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "type": "object"
+    }
   },
   "recipe_search": {
-    "function": {
-      "description": "按菜名或食材关键词搜索菜谱，返回菜谱列表（含 id）",
-      "name": "recipe_search",
-      "parameters": {
-        "properties": {
-          "keyword": {
-            "description": "菜名或食材关键词，如 宫保鸡丁、鸡胸肉",
-            "type": "string"
-          }
-        },
-        "required": [
-          "keyword"
-        ],
-        "type": "object"
-      }
-    },
-    "type": "function"
+    "description": "按菜名或食材关键词搜索菜谱，返回菜谱列表（含 id）",
+    "name": "recipe_search",
+    "parameters": {
+      "properties": {
+        "keyword": {
+          "description": "菜名或食材关键词，如 宫保鸡丁、鸡胸肉",
+          "type": "string"
+        }
+      },
+      "required": [
+        "keyword"
+      ],
+      "type": "object"
+    }
   },
   "search_knowledge": {
-    "function": {
-      "description": "在本地知识库中按语义检索攻略/游记语料，返回最相关的片段。当需要目的地的深度玩法、避坑经验、行程细节等攻略类信息时使用。",
-      "name": "search_knowledge",
-      "parameters": {
-        "properties": {
-          "query": {
-            "description": "检索问题，用自然语言，如「杭州三天怎么玩」",
-            "type": "string"
-          },
-          "top_k": {
-            "description": "返回片段数，默认 3",
-            "type": "integer"
-          }
+    "description": "在本地知识库中按语义检索攻略/游记语料，返回最相关的片段。当需要目的地的深度玩法、避坑经验、行程细节等攻略类信息时使用。",
+    "name": "search_knowledge",
+    "parameters": {
+      "properties": {
+        "query": {
+          "description": "检索问题，用自然语言，如「杭州三天怎么玩」",
+          "type": "string"
         },
-        "required": [
-          "query"
-        ],
-        "type": "object"
-      }
-    },
-    "type": "function"
+        "top_k": {
+          "description": "返回片段数，默认 3",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "query"
+      ],
+      "type": "object"
+    }
   },
   "tavily_extract": {
-    "function": {
-      "description": "从指定 URL 列表提取网页正文（Markdown）。用于深入阅读 tavily_search 返回的链接内容。",
-      "name": "tavily_extract",
-      "parameters": {
-        "properties": {
-          "extract_depth": {
-            "description": "提取深度：basic / advanced（JS 渲染页用 advanced）",
+    "description": "从指定 URL 列表提取网页正文（Markdown）。用于深入阅读 tavily_search 返回的链接内容。",
+    "name": "tavily_extract",
+    "parameters": {
+      "properties": {
+        "extract_depth": {
+          "description": "提取深度：basic / advanced（JS 渲染页用 advanced）",
+          "type": "string"
+        },
+        "urls": {
+          "description": "要提取的 URL 列表（最多 20 个）",
+          "items": {
             "type": "string"
           },
-          "urls": {
-            "description": "要提取的 URL 列表（最多 20 个）",
-            "items": {
-              "type": "string"
-            },
-            "type": "array"
-          }
-        },
-        "required": [
-          "urls"
-        ],
-        "type": "object"
-      }
-    },
-    "type": "function"
+          "type": "array"
+        }
+      },
+      "required": [
+        "urls"
+      ],
+      "type": "object"
+    }
   },
   "tavily_search": {
-    "function": {
-      "description": "用 Tavily 语义搜索网页，返回标题/链接/摘要/相关度分数。用于专用工具未覆盖的实时信息、新闻或通用知识查询。",
-      "name": "tavily_search",
-      "parameters": {
-        "properties": {
-          "max_results": {
-            "description": "返回结果数，默认 5，最大 20",
-            "type": "integer"
-          },
-          "query": {
-            "description": "搜索关键词",
-            "type": "string"
-          },
-          "search_depth": {
-            "description": "搜索深度：basic / advanced",
-            "type": "string"
-          }
+    "description": "用 Tavily 语义搜索网页，返回标题/链接/摘要/相关度分数。用于专用工具未覆盖的实时信息、新闻或通用知识查询。",
+    "name": "tavily_search",
+    "parameters": {
+      "properties": {
+        "max_results": {
+          "description": "返回结果数，默认 5，最大 20",
+          "type": "integer"
         },
-        "required": [
-          "query"
-        ],
-        "type": "object"
-      }
-    },
-    "type": "function"
+        "query": {
+          "description": "搜索关键词",
+          "type": "string"
+        },
+        "search_depth": {
+          "description": "搜索深度：basic / advanced",
+          "type": "string"
+        }
+      },
+      "required": [
+        "query"
+      ],
+      "type": "object"
+    }
   },
   "train_ticket_query": {
-    "function": {
-      "description": "查询跨城火车票(车次/时间/票价/余票)",
-      "name": "train_ticket_query",
-      "parameters": {
-        "properties": {
-          "date": {
-            "type": "string"
-          },
-          "from_city": {
-            "type": "string"
-          },
-          "to_city": {
-            "type": "string"
-          }
+    "description": "查询跨城火车票(车次/时间/票价/余票)",
+    "name": "train_ticket_query",
+    "parameters": {
+      "properties": {
+        "date": {
+          "type": "string"
         },
-        "required": [
-          "date",
-          "from_city",
-          "to_city"
-        ],
-        "type": "object"
-      }
-    },
-    "type": "function"
+        "from_city": {
+          "type": "string"
+        },
+        "to_city": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "date",
+        "from_city",
+        "to_city"
+      ],
+      "type": "object"
+    }
   },
   "translate": {
-    "function": {
-      "description": "翻译文本，自动检测源语言，翻译成目标语言",
-      "name": "translate",
-      "parameters": {
-        "properties": {
-          "text": {
-            "description": "要翻译的文本",
-            "type": "string"
-          },
-          "to_lang": {
-            "description": "目标语言代码，如 en(英语)/zh(中文)/ja(日语)/ko(韩语)，默认 en",
-            "type": "string"
-          }
+    "description": "翻译文本，自动检测源语言，翻译成目标语言",
+    "name": "translate",
+    "parameters": {
+      "properties": {
+        "text": {
+          "description": "要翻译的文本",
+          "type": "string"
         },
-        "required": [
-          "text"
-        ],
-        "type": "object"
-      }
-    },
-    "type": "function"
+        "to_lang": {
+          "description": "目标语言代码，如 en(英语)/zh(中文)/ja(日语)/ko(韩语)，默认 en",
+          "type": "string"
+        }
+      },
+      "required": [
+        "text"
+      ],
+      "type": "object"
+    }
   },
   "weather_query": {
-    "function": {
-      "description": "查询城市未来天气（最多 7 天预报），city 支持中文名/英文名/adcode",
-      "name": "weather_query",
-      "parameters": {
-        "properties": {
-          "city": {
-            "description": "城市名（中文/英文）或 adcode",
-            "type": "string"
-          },
-          "days": {
-            "description": "预报天数，最多 7 天",
-            "type": "integer"
-          }
+    "description": "查询城市未来天气（最多 7 天预报），city 支持中文名/英文名/adcode",
+    "name": "weather_query",
+    "parameters": {
+      "properties": {
+        "city": {
+          "description": "城市名（中文/英文）或 adcode",
+          "type": "string"
         },
-        "required": [
-          "city"
-        ],
-        "type": "object"
-      }
-    },
-    "type": "function"
+        "days": {
+          "description": "预报天数，最多 7 天",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "city"
+      ],
+      "type": "object"
+    }
   }
 }

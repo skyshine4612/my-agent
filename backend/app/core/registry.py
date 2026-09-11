@@ -9,7 +9,8 @@ from typing import Callable
 def _openai_safe_schema(schema: dict) -> dict:
     """把 pydantic 生成的 schema 收拾成 OpenAI function calling 能吃的形式。
 
-    两处清理：递归去掉 pydantic 塞的 title（冗余且会撑大 prompt）；
+    三处清理：递归去掉 pydantic 塞的 title（冗余且会撑大 prompt）；
+    去掉根节点 description（pydantic 复制模型 docstring 而来，与工具级 description 文本重复）；
     把 Optional 产生的 anyOf:[{type:X},{type:null}] 压平成 {type:X}（OpenAI 对 anyOf 支持有限）。
     """
     def walk(node):
