@@ -1,7 +1,7 @@
 # app/tools/system.py
 # 系统工具：get_skill（按需加载业务规则正文）。
 # 工具用 langchain @tool 定义（schema 由 pydantic 从函数签名生成），经 registry.register_tool 注册。
-# name 的 enum 约束用动态 Literal 承载：业务清单是启动时扫描 skills/ 得到的，不可硬编码字面量。
+# name 的 enum 约束用动态 Literal 承载（清单为空时退化为 str，见下）：业务清单是启动时扫描 skills/ 得到的，不可硬编码字面量。
 from typing import Annotated, Literal
 
 from langchain_core.tools import tool
@@ -17,7 +17,12 @@ def register_system_tools(registry, skill_names):
         registry:    ToolRegistry，工具注册表
         skill_names: 业务名列表（get_skill 的 name 参数 enum，约束 LLM 只能取已注册业务）
     """
-    SkillName = Literal[tuple(skill_names)]
+    if skill_names:
+        SkillName = Literal[tuple(skill_names)]
+    else:
+        # 空清单时 Literal[()] 会让 pydantic 建模抛 AssertionError，而 service 在 import 期构造，等于启动崩溃。
+        # 退化为 str：无 enum 约束，模型传任何值都落到下面「未知业务」分支，与旧 schema 的 enum:[] 一样不可用于选值。
+        SkillName = str
 
     @tool
     async def get_skill(
