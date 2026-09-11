@@ -6,6 +6,31 @@ from dataclasses import dataclass
 from typing import Callable
 
 
+def _openai_safe_schema(schema: dict) -> dict:
+    """把 pydantic 生成的 schema 收拾成 OpenAI function calling 能吃的形式。
+
+    两处清理：递归去掉 pydantic 塞的 title（冗余且会撑大 prompt）；
+    把 Optional 产生的 anyOf:[{type:X},{type:null}] 压平成 {type:X}（OpenAI 对 anyOf 支持有限）。
+    """
+    def walk(node):
+        if isinstance(node, dict):
+            node.pop("title", None)
+            variants = node.get("anyOf")
+            if isinstance(variants, list):
+                non_null = [v for v in variants if v.get("type") != "null"]
+                if len(non_null) == 1:
+                    node.pop("anyOf", None)
+                    node.update(walk(non_null[0]))
+                    return node
+            return {k: walk(v) for k, v in node.items()}
+        if isinstance(node, list):
+            return [walk(v) for v in node]
+        return node
+
+    schema.pop("title", None)
+    return walk(schema)
+
+
 @dataclass
 class Tool:
     """单个工具的元信息 + 可调用函数。
@@ -44,6 +69,16 @@ class ToolRegistry:
         """
         self._tools[name] = Tool(name, description, parameters, fn, label)
 
+    def register_tool(self, tool, label=""):
+        """从 langchain tool 对象注册：schema 由 pydantic 生成，执行走 tool.ainvoke。
+
+        存 tool 对象而非底层函数：ainvoke 返回的仍是结构化原始对象（v1 不再包装成
+        ToolMessage），截断与 spill 判断拿得到结构；同时白拿 pydantic 校验——
+        类型强转、缺必填报错、多余参数静默忽略。
+        """
+        params = _openai_safe_schema(tool.args_schema.model_json_schema())
+        self._tools[tool.name] = Tool(tool.name, tool.description, params, tool, label)
+
     def get(self, name):
         """按名字取回工具对象。"""
         return self._tools[name]
@@ -71,8 +106,13 @@ class ToolRegistry:
         而 `str()` 会把结构信息压平丢失。
         """
         t = self._tools[name]
-        # 解包参数字典调用工具函数，拿到原始结果（可能是普通值，也可能是协程）
-        res = t.fn(**arguments)
+        fn = t.fn
+        # langchain tool 对象：走 ainvoke 调用（拿到的仍是结构化原始对象，另白拿 pydantic 校验）
+        if hasattr(fn, "ainvoke"):
+            return await fn.ainvoke(arguments)
+        # 老式普通函数（Task 4 转换完其余工具后这条分支删除）：
+        # 解包参数字典调用，拿到原始结果（可能是普通值，也可能是协程）
+        res = fn(**arguments)
         # 若结果是可等待对象（协程/异步函数），则 await 取出真实结果
         if inspect.isawaitable(res):
             res = await res
