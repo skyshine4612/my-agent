@@ -29,7 +29,7 @@ class FakeWeatherDS:
 @pytest.mark.asyncio
 async def test_holiday_calendar():
     fn = make_holiday_calendar(FakeHolidayDS())
-    r = await fn(date="2026-10-01")
+    r = await fn.ainvoke({"date": "2026-10-01"})
     assert r["holidays"][0]["name"] == "国庆节"
 
 
@@ -37,7 +37,7 @@ async def test_holiday_calendar():
 async def test_holiday_calendar_requires_date_month_or_year():
     """holiday_calendar 的 date/month/year 三选一：都不传时返回错误提示而非抛异常。"""
     fn = make_holiday_calendar(FakeHolidayDS())
-    r = await fn()
+    r = await fn.ainvoke({})
     assert "error" in r
 
 
@@ -45,7 +45,7 @@ async def test_holiday_calendar_requires_date_month_or_year():
 async def test_weather_query_default_days():
     """weather_query 的 days 有默认值：只传 city 不传 days 时不应抛 TypeError。"""
     fn = make_weather_query(FakeWeatherDS())
-    res = await fn(city="成都")
+    res = await fn.ainvoke({"city": "成都"})
     assert res[0]["day_weather"] == "晴"
 
 
@@ -62,14 +62,14 @@ class FakeUapisDS:
 @pytest.mark.asyncio
 async def test_translate():
     fn = make_translate(FakeUapisDS())
-    r = await fn(text="你好", to_lang="en")
+    r = await fn.ainvoke({"text": "你好", "to_lang": "en"})
     assert r["translate"] == "HELLO"
 
 
 @pytest.mark.asyncio
 async def test_hotboard():
     fn = make_hotboard(FakeUapisDS())
-    r = await fn(type="weibo")
+    r = await fn.ainvoke({"type": "weibo"})
     assert r["list"][0]["title"] == "热搜1"
 
 
@@ -89,19 +89,19 @@ class FakeRecipeDS:
 @pytest.mark.asyncio
 async def test_recipe_search():
     fn = make_recipe_search(FakeRecipeDS())
-    r = await fn(keyword="宫保鸡丁")
+    r = await fn.ainvoke({"keyword": "宫保鸡丁"})
     assert r["items"][0]["title"] == "宫保鸡丁"
 
 
 @pytest.mark.asyncio
 async def test_recipe_detail():
     fn = make_recipe_detail(FakeRecipeDS())
-    r = await fn(id="333")
+    r = await fn.ainvoke({"id": "333"})
     assert r["ingredients"][0] == "鸡腿 2个"
 
 
 @pytest.mark.asyncio
 async def test_ingredient_nutrition():
     fn = make_ingredient_nutrition(FakeRecipeDS())
-    r = await fn(keyword="鸡胸肉")
+    r = await fn.ainvoke({"keyword": "鸡胸肉"})
     assert r["calory"] == "118"
