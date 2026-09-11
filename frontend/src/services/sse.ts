@@ -1,21 +1,29 @@
 // services/sse.ts —— SSE 流式消费
-function getClientId(): string {
-    let id = localStorage.getItem('client_id')
-    if (!id) {
-        id = crypto.randomUUID();
-        localStorage.setItem('client_id', id)
+import {getAccessToken} from '@/services/supabase'
+
+// 401：登录态已失效，调用方据此清会话并引导重新登录
+export class AuthExpiredError extends Error {
+    constructor() {
+        super('登录已失效，请重新登录')
     }
-    return id
 }
 
 // 向后端发起流式对话，逐条解析 SSE 事件并通过 onEvent 回调返回
 export async function chatStream(message: string, conversationId: string | null, onEvent: (ev: any) => void) {
+    // 登录凭证：后端按 JWT 的 sub 判定用户身份
+    const token = await getAccessToken()
+    const headers: Record<string, string> = {'Content-Type': 'application/json'}
+    if (token) headers.Authorization = `Bearer ${token}`
+
     const resp = await fetch('/api/agent/chat', {
         method: 'POST',
-        // 用户隔离 header 与请求体
-        headers: {'Content-Type': 'application/json', 'X-User-Id': getClientId()},
+        headers,
         body: JSON.stringify({message, conversation_id: conversationId})
     })
+    // 出错的响应体不是 SSE，先拦下来，避免下游把错误 JSON 当事件流解析
+    if (resp.status === 401) throw new AuthExpiredError()
+    if (!resp.ok) throw new Error(`请求失败（HTTP ${resp.status}）`)
+
     const reader = resp.body!.getReader()
     const decoder = new TextDecoder()
     let buf = ''

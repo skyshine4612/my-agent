@@ -7,5 +7,5 @@ RUN pip install --no-cache-dir \
     "sse-starlette>=2.0.0" "python-dotenv>=1.0.0"
 COPY app ./app
 EXPOSE 8000
-# DB_PATH 由 compose 注入，默认落到挂载卷 /app/data
+# 数据库与 JWT 密钥由挂载的 /app/.env 提供（SUPABASE_DATABASE_URL / SUPABASE_JWT_SECRET）
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

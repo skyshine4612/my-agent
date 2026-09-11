@@ -1,64 +1,53 @@
 # app/core/memory/long_term.py
 # 长期记忆存储：long_term_memory 表，跨会话持久偏好，按 user_id 隔离，超容量按 importance 淘汰。
-import asyncio
 import logging
-from datetime import datetime
 
-from app.core.memory.db import connect
+from app.core.db import rls_conn
 
 logger = logging.getLogger(__name__)
+
+
+def _affected(status: str) -> int:
+    """从 asyncpg 的 DML 状态串（如 'DELETE 3'）里取受影响行数。"""
+    return int(status.rsplit(" ", 1)[-1]) if status else 0
+
 
 class LongTermMemory:
     """长期记忆：存储从对话中提炼出的偏好/事实（long_term_memory），超过容量上限时按 importance 淘汰。"""
 
-    def __init__(self, db_path, max_facts=100):
-        # 先建表，再保存容量上限
-        self.db_path = db_path
+    def __init__(self, max_facts=100):
+        # 只记容量上限；表结构由 deploy/schema.sql 建，store 不做任何启动期 IO
         self.max_facts = max_facts
-        self._init()
-
-    def _conn(self):
-        return connect(self.db_path)
-
-    def _init(self):
-        # 建 long_term_memory 表（IF NOT EXISTS 保证幂等）
-        with self._conn() as c:
-            c.execute("""
-            CREATE TABLE IF NOT EXISTS long_term_memory(
-                id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT, fact TEXT, importance REAL, created_at TEXT)
-            """)
 
     async def add_facts(self, user_id, facts):
         """批量写入多条事实，并在写入后执行容量淘汰：超限时删除 importance 最低的条目。"""
 
-        def r():
-            with self._conn() as c:
-                for f in facts:
-                    c.execute("INSERT INTO long_term_memory(user_id,fact,importance,created_at) VALUES(?,?,?,?)",
-                              (user_id, f["fact"], f.get("importance", 0.5), datetime.now().isoformat()))
-                # 容量淘汰：仅当「当前用户自己」的 facts 超过 max_facts 时，删除该用户 importance 最低（importance 相同时最早创建）的多余条目。
-                # 三重 user_id 过滤实现按用户隔离淘汰，绝不触碰其他用户的数据、不挤占他人配额。
-                cur = c.execute(
-                    "DELETE FROM long_term_memory WHERE user_id=? AND id IN (SELECT id FROM long_term_memory WHERE user_id=? ORDER BY importance ASC, created_at ASC LIMIT max(0,(SELECT COUNT(*) FROM long_term_memory WHERE user_id=?)-?))",
-                    (user_id, user_id, user_id, self.max_facts))
-                return len(facts), cur.rowcount
-
-        inserted, deleted = await asyncio.to_thread(r)
+        async with rls_conn(user_id) as conn:
+            await conn.executemany(
+                "insert into long_term_memory(user_id, fact, importance) values($1, $2, $3)",
+                [(user_id, f["fact"], f.get("importance", 0.5)) for f in facts])
+            # 容量淘汰：仅当「当前用户自己」的 facts 超过 max_facts 时，删除该用户 importance 最低（importance 相同时最早创建）的多余条目。
+            # 三重 user_id 过滤实现按用户隔离淘汰，绝不触碰其他用户的数据、不挤占他人配额。
+            # GREATEST 而非 max：max 在 Postgres 里是聚合函数，不是 SQLite 那样的两参数标量函数。
+            status = await conn.execute(
+                "delete from long_term_memory where user_id=$1 and id in ("
+                "  select id from long_term_memory where user_id=$1"
+                "  order by importance asc, created_at asc"
+                "  limit greatest(0, (select count(*) from long_term_memory where user_id=$1) - $2)"
+                ")", user_id, self.max_facts)
+        inserted, deleted = len(facts), _affected(status)
         if deleted:
             logger.info("[记忆:long_term] 写入 %d 条长期记忆，容量淘汰 %d 条（importance 最低）", inserted, deleted)
         else:
             logger.info("[记忆:long_term] 写入 %d 条长期记忆", inserted)
 
     async def get_all(self, user_id):
-        """返回某用户的全部事实（按 importance 降序，fact 原样不截断，供语义去重匹配）。"""
-
-        def r():
-            with self._conn() as c:
-                return [dict(x) for x in c.execute(
-                    "SELECT fact,importance FROM long_term_memory WHERE user_id=? ORDER BY importance DESC",
-                    (user_id,))]
-
-        return await asyncio.to_thread(r)
+        """返回某用户的全部事实（按 importance 降序，fact 原样不截断），供记忆弹窗展示。"""
+        async with rls_conn(user_id) as conn:
+            rows = await conn.fetch(
+                "select fact, importance from long_term_memory where user_id=$1 "
+                "order by importance desc", user_id)
+        return [dict(r) for r in rows]
 
     async def recall(self, user_id, top_n=20):
         """按 importance 降序取前 top_n 条事实，返回 [{"fact","importance"}]。
@@ -66,24 +55,18 @@ class LongTermMemory:
         与 get_all 的区别：recall 供组装 long_term_hint 使用，有数量上限（top_n），避免提示词被历史偏好撑爆；
         无硬阈值，importance 仅用于 add_facts 内的容量淘汰与这里的排序。
         """
-
-        def r():
-            with self._conn() as c:
-                return [dict(x) for x in c.execute(
-                    "SELECT fact,importance FROM long_term_memory WHERE user_id=? ORDER BY importance DESC LIMIT ?",
-                    (user_id, top_n)).fetchall()]
-
-        result = await asyncio.to_thread(r)
+        async with rls_conn(user_id) as conn:
+            rows = await conn.fetch(
+                "select fact, importance from long_term_memory where user_id=$1 "
+                "order by importance desc limit $2", user_id, top_n)
+        result = [dict(r) for r in rows]
         logger.info("[记忆:long_term] 召回长期记忆 %d 条（top_n=%d）", len(result), top_n)
         return result
 
     async def update_importance(self, user_id, fact, importance):
         """更新某条已存在事实的 importance（语义去重时提升其权重而非新增重复条目）。"""
-
-        def r():
-            with self._conn() as c:
-                c.execute("UPDATE long_term_memory SET importance=? WHERE user_id=? AND fact=?",
-                          (importance, user_id, fact))
-
-        await asyncio.to_thread(r)
+        async with rls_conn(user_id) as conn:
+            await conn.execute(
+                "update long_term_memory set importance=$1 where user_id=$2 and fact=$3",
+                importance, user_id, fact)
         logger.info("[记忆:long_term] 语义去重：提升已有 fact importance=%.2f（%.50s）", importance, fact)

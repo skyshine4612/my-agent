@@ -135,6 +135,7 @@ async def test_run_stream_spills_oversize_result(tmp_path):
     ])
     reg = FakeRegistry({"big": "x" * 5000})
     store = ToolResultStore(str(tmp_path / "results"))
+    current_user_id.set("u1")  # spill 按 current_user_id 分目录，读回要用同一个
     a = Agent(name="t", system_prompt="s", tools=["big"], llm=llm)
     await a.run_stream("go", [], reg, on_event=None, conversation_id="conv1", tool_result_store=store)
     tool_msgs = [m for m in llm.calls[1] if m["role"] == "tool"]
@@ -142,7 +143,7 @@ async def test_run_stream_spills_oversize_result(tmp_path):
     assert "read_file" in content  # 提示含 read_file/grep
     m = re.search(r"完整结果存到 (\S+)，", content)
     rel = m.group(1)
-    seg = await store.read(rel, 0, 6000, user_id="anonymous")
+    seg = await store.read(rel, 0, 6000, user_id="u1")
     assert seg["total"] == 5000
     assert seg["content"] == "x" * 5000
 

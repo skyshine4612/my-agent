@@ -1,21 +1,12 @@
-// services/api.ts —— axios 封装 + 用户隔离 header
+// services/api.ts —— axios 封装 + 登录凭证注入
 import axios from 'axios'
-
-// 获取（或首次生成）用户唯一标识，用于后端按用户隔离数据
-function getClientId(): string {
-    let id = localStorage.getItem('client_id')
-    // 不存在则用 crypto.randomUUID 生成并持久化到 localStorage
-    if (!id) {
-        id = crypto.randomUUID();
-        localStorage.setItem('client_id', id)
-    }
-    return id
-}
+import {getAccessToken} from '@/services/supabase'
 
 const api = axios.create({baseURL: '/api', timeout: 120000})
-// 统一注入用户隔离 header：每个请求都带上 X-User-Id
-api.interceptors.request.use(config => {
-    config.headers['X-User-Id'] = getClientId();
+// 统一注入登录凭证：后端按 JWT 的 sub 判定用户身份
+api.interceptors.request.use(async config => {
+    const token = await getAccessToken()
+    if (token) config.headers.Authorization = `Bearer ${token}`
     return config
 })
 

@@ -7,7 +7,7 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 
-# SQLite 数据库（数据由挂载卷 /app/data 持久化，不打包进镜像）
+# 遗留的本地数据库文件（数据已在 Supabase Postgres，不打包进镜像）
 *.db
 *.db-journal
 

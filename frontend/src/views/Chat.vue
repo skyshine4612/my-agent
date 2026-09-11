@@ -2,14 +2,18 @@
 // Chat.vue —— 通用对话主界面：左侧窄会话列表 + 中间对话区
 // 负责 SSE 事件分发（conversation_id/token/tool_call/tool_result/done）与会话管理
 import { computed, onMounted, ref } from 'vue'
+import { useRouter } from 'vue-router'
 import { Plus } from '@element-plus/icons-vue'
 import { useConversationStore } from '@/stores/conversation'
-import { chatStream } from '@/services/sse'
+import { useAuthStore } from '@/stores/auth'
+import { chatStream, AuthExpiredError } from '@/services/sse'
 import { listConversations, getConversation, deleteConversation, getLongTermMemory, getShortTermMemory } from '@/services/api'
 import ChatPanel from '@/components/ChatPanel.vue'
 import type { ChatMessage, ToolEvent, LongTermMemory, ShortTermMemoryRecord } from '@/types'
 
 const convStore = useConversationStore()
+const auth = useAuthStore()
+const router = useRouter()
 
 // 聊天消息列表
 const messages = ref<ChatMessage[]>([])
@@ -122,12 +126,24 @@ async function send(text: string) {
           break
       }
     })
-  } catch {
+  } catch (e) {
+    // 登录态失效：清掉本地会话，由路由守卫把用户送回登录页
+    if (e instanceof AuthExpiredError) {
+      await auth.signOut()
+      await router.replace({ name: 'login' })
+      return
+    }
     pushAssistantText('抱歉，本次请求失败，请稍后重试。')
   } finally {
     streaming.value = false
     phase.value = ''
   }
+}
+
+// 退出登录：清会话后回登录页
+async function logout() {
+  await auth.signOut()
+  await router.replace({ name: 'login' })
 }
 
 // 新对话：重置会话状态
@@ -290,6 +306,10 @@ onMounted(async () => {
         <p v-if="!convStore.conversations.length" class="conv__empty">暂无会话</p>
       </nav>
 
+      <div class="side-user">
+        <span class="side-user__mail" :title="auth.displayName">{{ auth.displayName }}</span>
+        <button class="side-user__out" @click="logout">退出</button>
+      </div>
     </aside>
 
     <!-- 中间对话区：核心，占主导 -->
@@ -419,6 +439,37 @@ onMounted(async () => {
   color: var(--text-secondary);
   font-size: 13px;
   padding: 8px;
+}
+/* 侧栏底部：当前账号 + 退出登录 */
+.side-user {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 8px 0;
+  border-top: 1px solid var(--border);
+}
+.side-user__mail {
+  flex: 1;
+  min-width: 0;
+  font-size: 12px;
+  color: var(--text-secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.side-user__out {
+  flex-shrink: 0;
+  padding: 4px 8px;
+  font-size: 12px;
+  color: var(--text-secondary);
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  cursor: pointer;
+}
+.side-user__out:hover {
+  color: var(--accent-strong);
+  border-color: var(--accent);
 }
 .memory-empty {
   color: var(--text-secondary);

@@ -49,10 +49,12 @@ class AgentService:
     """
 
     def __init__(self):
-        # 会话历史 + 短期记忆 + 长期记忆，共享同一 SQLite（路径可配置，容器内挂载 ./data）
-        self.conversation_store = ConversationStore(settings.db_path)
-        self.short_term_memory = ShortTermMemory(settings.db_path)
-        self.long_term_memory = LongTermMemory(settings.db_path)
+        # 会话历史 + 短期记忆 + 长期记忆：三者共用 app.core.db 的进程级连接池。
+        # store 只持有引用、不做启动期 IO（表结构由 deploy/schema.sql 建），
+        # 因此 service 作为模块级单例在 import 时构造、连接池在 lifespan 里稍后建立，两者互不阻塞。
+        self.conversation_store = ConversationStore()
+        self.short_term_memory = ShortTermMemory()
+        self.long_term_memory = LongTermMemory()
         # 工具结果地址索引：超长结果写临时文件，read_file/grep 按需读；本轮结束即清，避免堆积
         self.tool_result_store = ToolResultStore(settings.result_dir)
         # LLM 客户端
@@ -119,7 +121,7 @@ class AgentService:
         conv_id = await self._ensure_conversation(user_id, conv_id, message)
         yield {"type": "conversation_id", "conversation_id": conv_id}
         # 落库本轮用户消息
-        await self.conversation_store.add_message(conv_id, "user", message)
+        await self.conversation_store.add_message(user_id, conv_id, "user", message)
 
         system, history, summary_hint, agent = await self._prepare_context(user_id, conv_id)
 
@@ -148,10 +150,10 @@ class AgentService:
                 answer = state.answer
                 # 先落库完整答案（流式输出之前）：即使客户端中途刷新、SSE 流被中断，历史里也已存有本轮完整回复
                 await self.conversation_store.add_message(
-                    conv_id, "assistant",
+                    user_id, conv_id, "assistant",
                     json.dumps({"content": answer, "tools": state.tools}, ensure_ascii=False))
                 # 补写本轮到短期记忆（按 ReAct 轮次），让「记忆」页立即显示最新一轮
-                await self.memory.append_turn(conv_id, message, answer, state.rounds)
+                await self.memory.append_turn(user_id, conv_id, message, answer, state.rounds)
                 # 流式输出最终答案：拆小块逐块上发（此时已过 critic 校验，保证只输出一段干净答案）
                 for j in range(0, len(answer), 40):
                     await queue.put({"type": "token", "content": answer[j:j + 40]})
@@ -175,7 +177,7 @@ class AgentService:
         """无会话则新建（首次对话）并回写标题；客户端传入他人 conv_id 时当作首次对话重建，杜绝跨用户写入。"""
         if conv_id is None or not await self.conversation_store.belongs_to(user_id, conv_id):
             conv_id = await self.conversation_store.create_conversation(user_id)
-            await self.conversation_store.update_title(conv_id, message[:20])
+            await self.conversation_store.update_title(user_id, conv_id, message[:20])
         return conv_id
 
     async def _prepare_context(self, user_id, conv_id):

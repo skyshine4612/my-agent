@@ -25,9 +25,11 @@ class FakeStreamingLLM:
         return ""
 
 
-def test_service_assembles_and_tools_non_empty(tmp_path, monkeypatch):
-    """AgentService 装配成功（会话历史/短期/长期记忆/llm/ds 就位），扁平工具注册表非空。"""
-    monkeypatch.setattr(settings, "db_path", str(tmp_path / "svc.db"))
+def test_service_assembles_and_tools_non_empty():
+    """AgentService 装配成功（会话历史/短期/长期记忆/llm/ds 就位），扁平工具注册表非空。
+
+    store 的 __init__ 不做任何 IO（表结构由数据库侧建），因此这里不需要数据库 fixture。
+    """
     svc = AgentService()
     assert svc.conversation_store is not None
     assert svc.short_term_memory is not None
@@ -41,9 +43,8 @@ def test_service_assembles_and_tools_non_empty(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_chat_stream_flow(tmp_path, monkeypatch):
+async def test_chat_stream_flow(user_id):
     """chat_stream 用 fake LLM 跑通：产出 conversation_id/token/done 事件，并落库结构化 assistant 消息。"""
-    monkeypatch.setattr(settings, "db_path", str(tmp_path / "svc.db"))
     svc = AgentService()
     svc.llm = FakeStreamingLLM()
 
@@ -52,33 +53,32 @@ async def test_chat_stream_flow(tmp_path, monkeypatch):
 
     svc.memory.extract_facts = noop  # 摘掉异步 LTM 提炼，避免 fire-and-forget task 悬挂
 
-    events = [e async for e in svc.chat_stream("u1", None, "成都三日游")]
+    events = [e async for e in svc.chat_stream(user_id, None, "成都三日游")]
     types = [e["type"] for e in events]
     assert "conversation_id" in types
     assert "token" in types
     assert types[-1] == "done"
 
     conv_id = next(e["conversation_id"] for e in events if e["type"] == "conversation_id")
-    history = await svc.conversation_store.get_history("u1", conv_id)
+    history = await svc.conversation_store.get_history(user_id, conv_id)
     assert [h["role"] for h in history] == ["user", "assistant"]
     saved = json.loads(history[-1]["content"])
     assert saved["content"] == "你好，成都"
     assert saved["tools"] == []
     # 短期记忆应包含本轮 user + assistant（修正 _assemble_history 滞后一轮的问题）
-    records = await svc.short_term_memory.get_records(conv_id)
+    records = await svc.short_term_memory.get_records(user_id, conv_id)
     assert [r["role"] for r in records] == ["user", "assistant"]
     assert records[0]["content"] == "成都三日游"
     assert records[1]["content"] == "你好，成都"
 
 
 @pytest.mark.asyncio
-async def test_registry_built_once_and_reused_across_requests(tmp_path, monkeypatch):
+async def test_registry_built_once_and_reused_across_requests(user_id, monkeypatch):
     """registry 在 __init__ 一次 build 并缓存，chat_stream 复用缓存，不每请求重建（不泄漏 MCP 数据源）。
 
     通过 spy register_travel_tools 的调用次数验证：register_travel_tools 内联 new 的
     Train/Flight MCP 数据源（其 __init__ 会创建从不 close 的 httpx 客户端）只在启动时 new 一次。
     """
-    monkeypatch.setattr(settings, "db_path", str(tmp_path / "svc.db"))
     register_calls = []
     orig = travel_tools.register_travel_tools
 
@@ -98,8 +98,8 @@ async def test_registry_built_once_and_reused_across_requests(tmp_path, monkeypa
 
     svc.memory.extract_facts = noop
 
-    [e async for e in svc.chat_stream("u1", None, "第一次请求")]
-    [e async for e in svc.chat_stream("u1", None, "第二次请求")]
+    [e async for e in svc.chat_stream(user_id, None, "第一次请求")]
+    [e async for e in svc.chat_stream(user_id, None, "第二次请求")]
     assert len(register_calls) == 1  # 两次 chat_stream 不再触发 register_tools
     assert svc.registry is cached  # 复用同一个 registry 实例
 
@@ -156,9 +156,8 @@ class SlowFastRegistry:
 
 
 @pytest.mark.asyncio
-async def test_tool_result_pairs_by_call_id_same_name_parallel(tmp_path, monkeypatch):
+async def test_tool_result_pairs_by_call_id_same_name_parallel(user_id):
     """同名工具并行且乱序完成时，tool_result 按 tool_call_id 精确配对 summary，不串。"""
-    monkeypatch.setattr(settings, "db_path", str(tmp_path / "svc.db"))
     svc = AgentService()
     svc.llm = SameNameStreamLLM()
     svc.registry = SlowFastRegistry()
@@ -168,9 +167,9 @@ async def test_tool_result_pairs_by_call_id_same_name_parallel(tmp_path, monkeyp
 
     svc.memory.extract_facts = noop
 
-    events = [e async for e in svc.chat_stream("u1", None, "帮我搜两个景点")]
+    events = [e async for e in svc.chat_stream(user_id, None, "帮我搜两个景点")]
     conv_id = next(e["conversation_id"] for e in events if e["type"] == "conversation_id")
-    history = await svc.conversation_store.get_history("u1", conv_id)
+    history = await svc.conversation_store.get_history(user_id, conv_id)
     saved = json.loads(history[-1]["content"])
     tools = saved["tools"]
     # 两条同名工具都落库，且各自 summary 与入参一一对应（不被并发乱序串配）
@@ -197,9 +196,8 @@ class RecordingLLM:
 
 
 @pytest.mark.asyncio
-async def test_assemble_history_no_recompression(tmp_path, monkeypatch):
+async def test_assemble_history_no_recompression(user_id, tmp_path, monkeypatch):
     """压缩物理删除早期回合：压缩后再次 assemble 不重复压缩（删除即增量，无需 marker）。"""
-    monkeypatch.setattr(settings, "db_path", str(tmp_path / "svc.db"))
     monkeypatch.setattr(settings, "result_dir", str(tmp_path / "results"))
     monkeypatch.setattr(settings, "llm_context_budget", 100)  # 小预算强制早期回合压缩
     svc = AgentService()
@@ -207,35 +205,34 @@ async def test_assemble_history_no_recompression(tmp_path, monkeypatch):
     svc.llm = llm
     svc.memory.llm = llm
 
-    cid = await svc.conversation_store.create_conversation("u1")
+    cid = await svc.conversation_store.create_conversation(user_id)
     # 写 4 个回合到短期记忆表（每回合 user + assistant），远超小预算，必然触发早期回合压缩
     for i in range(4):
-        await svc.memory.append_turn(cid, f"用户问题{i}" + "长" * 40, f"助手回答{i}" + "长" * 40)
+        await svc.memory.append_turn(user_id, cid, f"用户问题{i}" + "长" * 40, f"助手回答{i}" + "长" * 40)
 
     # 第一次 assemble：触发压缩，摘要浓缩调用一次
-    await svc.memory.assemble_history("u1", cid)
+    await svc.memory.assemble_history(user_id, cid)
     assert llm.complete_calls == 1
 
     # 第二次 assemble：早期回合已被物理删除，不应再压缩
-    await svc.memory.assemble_history("u1", cid)
+    await svc.memory.assemble_history(user_id, cid)
     assert llm.complete_calls == 1  # 仍为 1，未重复压缩
 
 
 @pytest.mark.asyncio
-async def test_assemble_history_restores_structured_tool_messages(tmp_path, monkeypatch):
+async def test_assemble_history_restores_structured_tool_messages(user_id, tmp_path, monkeypatch):
     """append_turn 写结构化回合后，assemble_history 从短期记忆表还原成 tool_calls + role=tool 消息。"""
-    monkeypatch.setattr(settings, "db_path", str(tmp_path / "svc.db"))
     monkeypatch.setattr(settings, "result_dir", str(tmp_path / "results"))
     svc = AgentService()
     svc.llm = FakeStreamingLLM()
 
-    cid = await svc.conversation_store.create_conversation("u1")
+    cid = await svc.conversation_store.create_conversation(user_id)
     # 一轮 tool_calls（OpenAI 格式）
     rounds = [[{"id": "c1", "type": "function",
                 "function": {"name": "菜谱做法", "arguments": '{"name": "宫保鸡丁"}'}}]]
-    await svc.memory.append_turn(cid, "第一天详细菜谱", "第一天做法", rounds)
+    await svc.memory.append_turn(user_id, cid, "第一天详细菜谱", "第一天做法", rounds)
 
-    recent, summary = await svc.memory.assemble_history("u1", cid)
+    recent, summary = await svc.memory.assemble_history(user_id, cid)
 
     # recent 结构化：user + assistant(tool_calls) + tool + assistant(最终答案)
     assert [m["role"] for m in recent] == ["user", "assistant", "tool", "assistant"]
@@ -246,7 +243,7 @@ async def test_assemble_history_restores_structured_tool_messages(tmp_path, monk
     assert recent[3]["content"] == "第一天做法"
 
     # 短期记忆表存结构化记录（tool 占位不落表，仅 user + assistant(tool_calls) + assistant 答案）
-    records = await svc.short_term_memory.get_records(cid)
+    records = await svc.short_term_memory.get_records(user_id, cid)
     assert [r["role"] for r in records] == ["user", "assistant", "assistant"]
     assert records[2]["content"] == "第一天做法"
 
@@ -270,13 +267,12 @@ class SlowStreamingLLM:
 
 
 @pytest.mark.asyncio
-async def test_disconnect_still_persists_answer(tmp_path, monkeypatch):
+async def test_disconnect_still_persists_answer(user_id):
     """客户端生成中途断开（不消费完 SSE），后端仍应跑完整轮并落库 assistant 答案。
 
     模拟刷新：消费到 conversation_id + 下一个事件后 aclose（= 断开 SSE），
     然后轮询等待后台落库，断言历史里出现 assistant 消息。
     """
-    monkeypatch.setattr(settings, "db_path", str(tmp_path / "svc.db"))
     svc = AgentService()
     svc.llm = SlowStreamingLLM()
 
@@ -285,7 +281,7 @@ async def test_disconnect_still_persists_answer(tmp_path, monkeypatch):
 
     svc.memory.extract_facts = noop
 
-    agen = svc.chat_stream("u1", None, "成都三日游")
+    agen = svc.chat_stream(user_id, None, "成都三日游")
     # 消费 conversation_id 事件，拿到会话 id
     first = await agen.__anext__()
     conv_id = first["conversation_id"]
@@ -297,10 +293,10 @@ async def test_disconnect_still_persists_answer(tmp_path, monkeypatch):
     # 轮询等待后台 worker 完成落库
     history = []
     for _ in range(100):
-        history = await svc.conversation_store.get_history("u1", conv_id)
+        history = await svc.conversation_store.get_history(user_id, conv_id)
         if len(history) >= 2:
             break
-        await asyncio.sleep(0.02)
+        await asyncio.sleep(0.05)
     assert [h["role"] for h in history] == ["user", "assistant"]
     saved = json.loads(history[-1]["content"])
     assert saved["content"] == "你好，成都"

@@ -13,14 +13,15 @@
 - **长结果地址索引 + 历史会话压缩**：工具结果超阈值时完整结果写临时文件，模型用 `read_file`/`grep` 按需读回；历史会话按 running summary 压缩——一个会话的短期记忆 = 累积摘要 + 最近几轮原文 + 完整历史文件，上下文到阈值才触发，早期答案压成摘要、最近几轮保留原文，跨轮引用靠 `read_file` 读回，既避免截断丢信息，也避免模型凭标题编造细节。
 - **记忆查看**：输入框旁「记忆」入口，弹窗内 tab 切换长期偏好与当前会话的短期记忆（摘要 + 最近几轮对话）。
 - **SSE 流式对话**：逐字输出答案，实时展示工具调用进度；完整回复在流式输出前已落库，刷新后自动恢复会话与历史。
-- **用户隔离**：通过 `X-User-Id` 请求头按用户隔离会话与记忆数据。
+- **账号登录 + 用户隔离**：Supabase Auth（GoTrue）注册/登录，前端持 JWT 调后端；后端本地 HS256 验签取用户身份，数据层按 `user_id` 过滤 **且** 每条查询都在 `role=authenticated` 事务里跑，由 Postgres RLS 策略兜底。
 
 ## 技术栈
 
 | 层 | 技术                                                                                    |
 |---|-----------------------------------------------------------------------------------------|
-| 后端 | Python 3.11+ · FastAPI · pydantic-settings · openai SDK · mcp · sse-starlette · sqlite3 · tiktoken |
-| 前端 | Vue 3 · Vite · TypeScript · Element Plus · Pinia · marked + DOMPurify                   |
+| 后端 | Python 3.11+ · FastAPI · pydantic-settings · openai SDK · mcp · sse-starlette · asyncpg · PyJWT · tiktoken |
+| 前端 | Vue 3 · Vite · TypeScript · Element Plus · Pinia · supabase-js · marked + DOMPurify      |
+| 存储 / 身份 | 自托管 Supabase（Postgres + GoTrue），业务表全开 RLS                              |
 | LLM | 阿里云百炼 DashScope（`qwen3.7-plus`，OpenAI 兼容协议）                                 |
 | 部署 | Docker + docker-compose · nginx                                                         |
 
@@ -31,7 +32,7 @@ my-agent/
 ├── backend/
 │   ├── app/
 │   │   ├── api/routes/        # 路由：SSE 对话 + 会话管理
-│   │   ├── core/              # 核心：agent(ReAct)/llm/critic/registry/memory(三层记忆)/prompts/skills
+│   │   ├── core/              # 核心：agent(ReAct)/llm/critic/registry/memory(三层记忆)/db(连接池+RLS)/auth(JWT)/prompts/skills
 │   │   ├── datasource/        # 数据源：MCP（12306/机票）+ HTTP（高德/UAPIS/Tavily）
 │   │   ├── models/            # Pydantic 请求模型
 │   │   ├── prompts/           # 提示词 .md（system/grounding/critic）
@@ -45,16 +46,36 @@ my-agent/
 │   └── run.py                 # 开发启动入口
 ├── frontend/
 │   └── src/
-│       ├── views/Chat.vue     # 主界面（SSE 事件分发 + 会话管理 + 记忆弹窗）
+│       ├── views/             # Login.vue（登录/注册）+ Chat.vue（SSE 事件分发 + 会话管理 + 记忆弹窗）
 │       ├── components/        # ChatPanel（markdown + 工具气泡）
-│       ├── services/          # api.ts / sse.ts
-│       ├── stores/            # Pinia
+│       ├── services/          # api.ts / sse.ts / supabase.ts
+│       ├── router/            # 路由 + 登录守卫
+│       ├── stores/            # Pinia（auth / conversation）
 │       └── types/             # TS 类型定义
 ├── docker-compose.yml
 └── README.md
 ```
 
 ## 快速开始
+
+### 前置：自托管 Supabase
+
+存储与登录都依赖 Supabase，需先把它跑起来（[官方自托管指引](https://supabase.com/docs/guides/self-hosting/docker)）：
+
+```bash
+git clone --depth 1 https://github.com/supabase/supabase
+cd supabase/docker
+cp .env.example .env
+sh ./utils/generate-keys.sh     # 生成 JWT_SECRET / ANON_KEY / SERVICE_ROLE_KEY 等
+docker compose up -d            # 起完整栈，Kong 网关默认 8000 端口
+```
+
+拿到 `docker/.env` 里的 `JWT_SECRET` 与 `ANON_KEY`，并在 Studio（Kong 的 `/`）里建两个库：
+
+- 主库 `postgres` 的 `public` schema：4 张业务表（`conversations` / `messages` / `short_term_memory` / `long_term_memory`）+ 各自的 RLS 策略。
+- 测试库 `agent_test`：建最小 `auth` 桩（`auth.users(id uuid primary key)` + `auth.uid()`）后套同样的 DDL，用于跑 pytest。
+
+> 这套 DDL 与策略就是 `backend/tests/conftest.py` 里的 `AUTH_STUB_SQL` / `BUSINESS_SQL`（测试库由它自动建）。主库按同一份语句在 Studio 里执行即可。
 
 ### 本地开发
 
@@ -73,17 +94,20 @@ uv sync                 # 安装依赖
 uv run python run.py    # 启动于 http://0.0.0.0:8000（reload）
 ```
 
-> 未配置 `LLM_API_KEY` 时后端仍可启动，但对话返回空内容；填入 key 后重启即可。
+> 未配 `SUPABASE_DATABASE_URL` 时启动会因连接池建不起来而报错；未配置 `LLM_API_KEY` 时后端仍可启动，但对话返回空内容。
 
-**3. 启动前端**（需 Node 22+）
+**3. 配置并启动前端**（需 Node 22+）
 
 ```bash
 cd frontend
+cp .env.example .env    # 填 VITE_SUPABASE_URL / VITE_SUPABASE_ANON_KEY
 npm install
 npm run dev             # 启动于 http://127.0.0.1:5173，/api 代理到 8000
 ```
 
-浏览器访问前端地址即可对话。
+浏览器访问前端地址，注册账号后即可对话。
+
+> `VITE_` 前缀的变量在构建时被内联进产物，改完 `.env` 需重启 dev server / 重新 build。
 
 ### Docker 部署
 
@@ -92,7 +116,8 @@ docker compose up --build
 ```
 
 - 前端 nginx 对外唯一入口 `:80`，反代 `/api`（含 SSE）到后端 `:8000`。
-- 后端读取挂载的 `./backend/.env`（密钥不写进 compose），SQLite 持久化到 `./data`。
+- 后端读取挂载的 `./backend/.env`（密钥不写进 compose），数据全在 Supabase Postgres，容器本身不需要持久化卷。
+- 前端在**构建时**读取 `./frontend/.env`，所以构建前必须先备好该文件（含 `VITE_SUPABASE_URL`）。
 
 ## 配置说明
 
@@ -112,7 +137,9 @@ docker compose up --build
 | `UAPIS_API_KEY` | UAPIS 令牌（节假日/翻译/热榜/菜谱/营养；天气接口免费无需 key） | 空                                                  |
 | `TAVILY_API_KEY` | Tavily API Key（搜索/网页提取） | 空                                                  |
 | `AMAP_API_KEY` | 高德 Web 服务 Key（POI/推荐菜） | 空                                                  |
-| `DB_PATH` | SQLite 数据库文件路径 | `app.db`                                            |
+| `SUPABASE_DATABASE_URL` | 主库 `postgres` 的连接串（`postgresql://postgres:...@<host>:5432/postgres`） | 空 |
+| `SUPABASE_TEST_DATABASE_URL` | 测试库 `agent_test` 的连接串，未配置时跳过需要真实 Postgres 的用例 | 空 |
+| `SUPABASE_JWT_SECRET` | 与 Supabase `docker/.env` 的 `JWT_SECRET` 完全一致，本地 HS256 验签用 | 空 |
 | `LLM_CONTEXT_BUDGET` | 工作记忆 token 预算上限（超限淘汰最老 + LLM 摘要兜底） | `128000`                                            |
 | `TRUNCATE_LIMIT` | 工具结果字符串截断阈值（超限完整结果写文件，read_file/grep 按需读） | `4000`                                              |
 | `RESULT_DIR` | 工具结果地址索引的落盘目录（本轮用完即删） | `results`                                           |
@@ -129,10 +156,19 @@ docker compose up --build
 | `UAPIS_API_KEY` | [UAPIS 开放接口平台](https://uapis.cn) → 注册后控制台（[uapis.cn/console](https://uapis.cn/console)）「API keys」标签页 |
 | `TAVILY_API_KEY` | [Tavily](https://app.tavily.com) → 注册登录后「API Keys」页 |
 | `AMAP_API_KEY` | [高德开放平台](https://lbs.amap.com) → 控制台 → 应用管理 → 创建应用添加 Key（Web 服务） |
+| `SUPABASE_DATABASE_URL` / `SUPABASE_JWT_SECRET` | 自托管 Supabase 的 `docker/.env`（`POSTGRES_PASSWORD` / `JWT_SECRET`）拼出，端口默认 `5432` |
+
+`frontend/.env` 支持的配置项：
+
+| 变量 | 说明 | 默认值 |
+|---|---|---|
+| `VITE_SUPABASE_URL` | 浏览器直连 Supabase 的地址（Kong 网关，自托管默认 `http://localhost:8000`） | 空 |
+| `VITE_SUPABASE_ANON_KEY` | Supabase 匿名公钥，取自 `docker/.env` 的 `ANON_KEY`（**不是** `SERVICE_ROLE_KEY`） | 空 |
+| `VITE_AMAP_WEB_JS_KEY` | 高德 Web 端 JS Key（地图组件用） | 空 |
 
 ## API 概览
 
-所有接口以 `/api` 为前缀，通过请求头 `X-User-Id` 识别用户（缺省 `anonymous`）。
+所有接口以 `/api` 为前缀，通过请求头 `Authorization: Bearer <access_token>` 识别用户（后端本地 HS256 验签取 `sub`，缺失或失效一律 401）。
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
@@ -153,7 +189,7 @@ uv run pytest                          # 全部测试
 uv run pytest tests/test_llm.py -k stream   # 按关键字筛选
 ```
 
-测试不依赖真实 LLM 与网络：用 `Fake*LLM` 注入 service，并用 `monkeypatch` 隔离 SQLite 到临时目录。
+测试不依赖真实 LLM 与网络：用 `Fake*LLM` 注入 service，数据层连真实 Postgres 测试库 `agent_test`（`SUPABASE_TEST_DATABASE_URL`，`tests/conftest.py` 负责建表与逐用例清表）；未配该变量时相关用例整体 skip。
 
 ## 如何扩展新业务
 

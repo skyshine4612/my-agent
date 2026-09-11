@@ -6,8 +6,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 多业务对话式 Agent 平台，前后端分离：
 
-- **backend/**：FastAPI 应用，实现「通用 ReAct agent → 工具调用 → critic 事实校验」链路。真实数据：高德（POI/推荐菜，Web 服务 API）、天气/节假日/翻译/热榜/菜谱/营养（UAPIS，天气最多 7 天预报）、搜索（Tavily）经 HTTP 直连；12306 火车票经 ModelScope 托管 MCP；机票直连 variflight 官方 MCP，LLM 默认接阿里云百炼 DashScope（`qwen3.7-plus`）。
-- **frontend/**：Vue 3 + Vite + Element Plus + Pinia 的单页应用，通用对话界面（会话列表 + 流式聊天 + 工具调用气泡）。
+- **backend/**：FastAPI 应用，实现「通用 ReAct agent → 工具调用 → critic 事实校验」链路。真实数据：高德（POI/推荐菜，Web 服务 API）、天气/节假日/翻译/热榜/菜谱/营养（UAPIS，天气最多 7 天预报）、搜索（Tavily）经 HTTP 直连；12306 火车票经 ModelScope 托管 MCP；机票直连 variflight 官方 MCP，LLM 默认接阿里云百炼 DashScope（`qwen3.7-plus`）。持久化全在自托管 Supabase 的 Postgres（`asyncpg` + RLS），身份用 Supabase Auth（GoTrue）。
+- **frontend/**：Vue 3 + Vite + Element Plus + Pinia 的单页应用，登录页 + 通用对话界面（会话列表 + 流式聊天 + 工具调用气泡）。
 
 架构已从「旅行专用」链路收敛为「通用 agent + 标准 skill」两段式（见下）。
 
@@ -23,8 +23,8 @@ uv run pytest tests/test_llm.py::test_llm_contract   # 跑单个测试
 ```
 
 - 测试配置在 `backend/pyproject.toml`：`asyncio_mode = "auto"`（async 测试无需 `@pytest.mark.asyncio`，但现有测试仍显式加了），`testpaths = ["tests"]`。
-- 测试模式：不依赖真实 LLM / 网络，用 `Fake*LLM` 类注入 `service.llm`，并用 `monkeypatch.setattr(settings, "db_path", str(tmp_path / "x.db"))` 隔离 SQLite。
-- 配置：复制 `backend/.env.example` → `backend/.env` 填真实 key；未配 `LLM_API_KEY` 时后端仍可启动（`FallbackLLM` 返回空内容）。
+- 测试模式：不依赖真实 LLM / 网络，用 `Fake*LLM` 类注入 `service.llm`；数据层连真实 Postgres 测试库 `agent_test`（`SUPABASE_TEST_DATABASE_URL` 由 `tests/conftest.py` 的 `db` fixture 建池并在用例间清表），未配该变量时相关用例整体 skip。
+- 配置：复制 `backend/.env.example` → `backend/.env` 填真实 key；未配 `LLM_API_KEY` 时后端仍可启动（`FallbackLLM` 返回空内容），未配 `SUPABASE_DATABASE_URL` 时启动会因建池失败而报错。
 
 前端（在 `frontend/` 目录下）：
 
@@ -65,7 +65,7 @@ api/routes/chat.py  →  services/agent_service.py  →  core/agent.py (ReAct �
 
 2. **ToolRegistry 只在启动时装配一次**：`AgentService.__init__` 里 `_build_registry()` 一次性 `new` 所有数据源并缓存到 `self.registry`。原因：`Train12306DataSource` / `FlightVariflightDataSource` 及各 HTTP 数据源（UAPIS/Tavily/高德 Web）的 `__init__` 会创建从不 `close()` 的 httpx 客户端，若每请求重建会导致连接泄漏。**新增工具时注意保持这个「启动时装配一次」的模式**。
 
-3. **用户隔离**：所有路由从请求头 `X-User-Id`（缺省 `anonymous`）解析用户身份，透传给 `ConversationStore` / `LongTermMemory`，所有读写/删除/淘汰都按 `user_id` 过滤，防止跨用户读写注入。前端在 localStorage 生成 `client_id` 并通过 header 注入（`services/api.ts` 的 axios 拦截器 + `sse.ts` 手动加 header）。
+3. **用户隔离 = 登录 + RLS**：前端用 `supabase-js` 直连 GoTrue 登录/注册，拿到 JWT 后以 `Authorization: Bearer` 调后端；后端 `core/auth.py` 的 `get_current_user` 用 `SUPABASE_JWT_SECRET` 做本地 HS256 验签，取 `sub` 作为 `user_id`（未带/失效一律 401，无 `anonymous` 兜底）。数据侧是**双保险**：业务方法显式带 `user_id` 条件，同时每条查询都跑在 `core/db.py` 的 `rls_conn(user_id)` 事务里——事务内 `set_config('role','authenticated')` + 注入 `request.jwt.claims`（复刻 PostgREST 行为），让 RLS 策略真正生效。**注意 `postgres`/`service_role` 是 `BYPASSRLS` 角色，直连裸池跑查询策略完全不执行**，所以业务查询必须走 `rls_conn`，裸池 `admin_conn` 只给测试基础设施用。
 
 4. **SSE 事件协议**：后端 `chat.py` 用 `sse-starlette` 的 `EventSourceResponse(gen(), sep="\n")`，`sep="\n"` 是刻意的——默认 `\r\n` 会导致前端按 `\n\n` 分帧永远匹配不到。事件 `type` 有：`conversation_id` / `token` / `tool_call` / `tool_result` / `status` / `done`。`tool_call` 与 `tool_result` 都携带 `id`（tool_call_id）：同名工具并行且乱序完成时，前端/后端按 `id` 而非工具名或队列顺序配对 summary，避免串配。
 
@@ -75,11 +75,11 @@ api/routes/chat.py  →  services/agent_service.py  →  core/agent.py (ReAct �
 
 7. **数据源分层**：两个基类——`datasource/mcp_base.py` 的 `McpDataSource` 封装 MCP 的「懒加载持久 session + 超时 + 失效重建」（12306 / 机票继承）；`datasource/http_base.py` 的 `HttpDataSource` 封装 httpx 异步客户端（高德 Web / UAPIS / Tavily 继承）。`amap_web.py` 把高德返回解析成约定结构（纯函数 `parse_poi_list` / `parse_weather` 便于单测）。
 
-8. **配置**：`app/config.py` 用 pydantic-settings 从 `backend/.env` 读取（`LLM_*`、`MODELSCOPE_TOKEN`、各 `*_MCP_URL`、`UAPIS_API_KEY`、`TAVILY_API_KEY`、`AMAP_API_KEY`、`VARIFLIGHT_API_KEY`、`DB_PATH`）。容器内通过 compose 挂载 `./backend/.env` 到 `/app/.env`，密钥类参数不写进 compose。
+8. **配置**：`app/config.py` 用 pydantic-settings 从 `backend/.env` 读取（`LLM_*`、`MODELSCOPE_TOKEN`、各 `*_MCP_URL`、`UAPIS_API_KEY`、`TAVILY_API_KEY`、`AMAP_API_KEY`、`VARIFLIGHT_API_KEY`、`SUPABASE_DATABASE_URL`、`SUPABASE_TEST_DATABASE_URL`、`SUPABASE_JWT_SECRET`）。容器内通过 compose 挂载 `./backend/.env` 到 `/app/.env`，密钥类参数不写进 compose。前端另有 `frontend/.env`（`VITE_SUPABASE_URL` / `VITE_SUPABASE_ANON_KEY` / `VITE_AMAP_WEB_JS_KEY`），`VITE_` 前缀的变量在 `npm run build` 时被内联进产物，所以 Docker 构建前必须先备好该文件。
 
 9. **子 Agent 委派（上下文隔离）**（`tools/sub_agent.py`）：顶层 agent 可用 `call_sub_agent` 工具把复杂子任务（如查交通、查景点）委派给独立上下文的子 Agent——子 Agent 历史为空、只吃 `task`，业务规则由它按需 `get_skill` 加载，跑完只回传最终答案摘要，主 agent 的上下文不被大量工具结果淹没。子 Agent 内部工具调用不上报前端（`on_event=None`），前端只显示「委派子任务」一个气泡。当前为单层委派（子 Agent 工具集不含 `call_sub_agent`，避免无限下钻）。子 Agent 分配独立 `sub_conversation_id`（uuid）隔离工具结果地址索引（spill 目录），任务结束（含异常）即清理，不与主会话/其他子 Agent 串扰。
 
-10. **三层记忆 + token 预算 + 三层压缩**（`core/memory/` 包）：工作记忆（本轮工具结果，内存，每次问答即丢）+ 短期记忆（`short_term_memory` 表，喂 LLM 的跨轮上下文权威源：1 条 summary 摘要 + 结构化消息序列（user / assistant 含 tool_calls / tool），跨轮持久）+ 长期记忆（`long_term_memory` 表，按 `user_id` 跨会话）+ 会话历史（`conversation.py`，messages/conversations 仅前端展示）。记忆编排统一在 `memory/manager.py` 的 `MemoryManager`（组装/压缩/写回/提炼），四个 store 由 `AgentService` 创建后共享；SQLite 连接统一走 `memory/db.py`（WAL + busy_timeout，防并发写锁）。token 预算用 `tiktoken`（cl100k_base）真实计数，失败回退启发式（`token_utils.py`）。短期记忆超 token 预算时早期回合压成累积摘要（存表 + 落盘 `_history.txt`）；长期记忆 fire-and-forget 只提炼本轮 user 消息（per-user 锁串行，靠去重时 importance 提升体现「稳定」）；工作记忆单个结果超长时 spill（结构化截断 + 文件地址索引），多结果累积超预算时成对淘汰最老 + LLM 蒸馏兜底（蒸馏失败降级为拼接截断，不炸整轮）。命名约定：工作/短期/长期记忆用 `working`/`short_term`/`long_term`，会话历史用 `conversation`，禁止 `session` 等混用。
+10. **三层记忆 + token 预算 + 三层压缩**（`core/memory/` 包）：工作记忆（本轮工具结果，内存，每次问答即丢）+ 短期记忆（`short_term_memory` 表，喂 LLM 的跨轮上下文权威源：1 条 summary 摘要 + 结构化消息序列（user / assistant 含 tool_calls / tool），跨轮持久）+ 长期记忆（`long_term_memory` 表，按 `user_id` 跨会话）+ 会话历史（`conversation.py`，messages/conversations 仅前端展示）。记忆编排统一在 `memory/manager.py` 的 `MemoryManager`（组装/压缩/写回/提炼），四个 store 由 `AgentService` 创建后共享；四张表的连接统一走 `core/db.py`（asyncpg 连接池，lifespan 里建池/关池，业务查询走 `rls_conn` 切角色开事务）。四个 store 的 `__init__` 一律零 IO——进程级单例 `service` 在 import 时就构造 store，而连接池要到 lifespan 才建，任何构造期建表/连库都会直接炸。token 预算用 `tiktoken`（cl100k_base）真实计数，失败回退启发式（`token_utils.py`）。短期记忆超 token 预算时早期回合压成累积摘要（存表 + 落盘 `_history.txt`）；长期记忆 fire-and-forget 只提炼本轮 user 消息（per-user 锁串行，靠去重时 importance 提升体现「稳定」）；工作记忆单个结果超长时 spill（结构化截断 + 文件地址索引），多结果累积超预算时成对淘汰最老 + LLM 蒸馏兜底（蒸馏失败降级为拼接截断，不炸整轮）。命名约定：工作/短期/长期记忆用 `working`/`short_term`/`long_term`，会话历史用 `conversation`，禁止 `session` 等混用。
 
 11. **工具结果地址索引（spill-to-file）**（`core/memory/tool_result.py` + `tools/file.py`）：工具结果超 `truncate_limit`（默认 4000 字符）时，完整结果写临时文件 `result_dir/<user_id>/<conversation_id>/<uuid>.txt`，窗口只放「预览 + 文件路径提示」，模型用 `read_file(path, offset, limit)`（顺序读 + 未读完进度提示）与 `grep(pattern, path)`（正则搜 + 位置/上下文片段）两个**写死的安全工具**按需读回被省略的部分。path 经路径白名单校验（拒绝 `..`/绝对路径穿越），按 `current_user_id`（`core/context.py` 的 contextvar）隔离目录。生命周期：spill 文件本轮结束即清（保留 `_history.txt`），`delete_conversation` 删该会话目录时统一清理；子 Agent 同样写文件、子任务结束即清。这是对「纯截断」的升级——被截掉的部分不再是永久丢失，而是可读回。
 
@@ -90,7 +90,10 @@ api/routes/chat.py  →  services/agent_service.py  →  core/agent.py (ReAct �
 - `views/Chat.vue`：主界面，负责 SSE 事件分发（`conversation_id`/`token`/`tool_call`/`tool_result`/`status`/`done`）与会话管理。
 - 记忆以弹窗形式内置于 `views/Chat.vue`：输入框旁「记忆」入口，`el-tabs` 切换长期记忆（跨会话偏好）与短期记忆（摘要 + 最近几轮对话）。
 - `components/ChatPanel.vue`：渲染 markdown（`marked` + `DOMPurify` 防 XSS）+ 工具气泡 + 输入框。
-- `services/sse.ts`：手写 `fetch` 流式解析 SSE（规范化换行后按 `\n\n` 分帧，处理多字节字符切断）。
-- `services/api.ts`：axios 封装，统一注入 `X-User-Id`。
+- `services/supabase.ts`：Supabase 客户端单例 + `getAccessToken()`（`getSession` 会自动刷新即将过期的 token），是前端取登录凭证的唯一出口。
+- `services/sse.ts`：手写 `fetch` 流式解析 SSE（规范化换行后按 `\n\n` 分帧，处理多字节字符切断）；注入 `Authorization: Bearer`，401 抛 `AuthExpiredError` 由调用方引导重新登录。
+- `services/api.ts`：axios 封装，请求拦截器异步取 token 注入 `Authorization: Bearer`。
+- `stores/auth.ts`：Pinia store，GoTrue 会话 + 登录/注册/登出；`init()` 读初始会话并订阅 `onAuthStateChange`。**用户面对的是用户名登录**——GoTrue 只认 email/phone，`signIn`/`signUp` 收到的用户名在 store 内拼成 `<用户名>@my-agent.local` 再提交（`USERNAME_DOMAIN`），所以 `auth.users.email` 存的是这个假邮箱；`displayName` 反向剥掉后缀供界面展示。
 - `stores/conversation.ts`：Pinia store，会话列表 + 当前会话 id。
+- `router/index.ts`：`/`（需登录）+ `/login`，全局 `beforeEach` 守卫等 `auth.init()` 完成后按会话有无双向重定向。
 - 历史 assistant 消息在库里存成 JSON `{"content", "tools"}`，前端 `historyToMessages` 还原为 markdown + 工具气泡。

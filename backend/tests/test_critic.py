@@ -152,8 +152,10 @@ class ScriptedStreamLLM:
 
 
 def _make_svc(tmp_path, monkeypatch, llm):
-    """构造带假 LLM 的 service，并摘掉异步 LTM 提炼、mock 天气数据源避免真实网络。"""
-    monkeypatch.setattr(settings, "db_path", str(tmp_path / "svc.db"))
+    """构造带假 LLM 的 service，并摘掉异步 LTM 提炼、mock 天气数据源避免真实网络。
+
+    数据库由 db fixture 提供（连 agent_test），result_dir 仍隔离到 tmp_path。
+    """
     monkeypatch.setattr(settings, "result_dir", str(tmp_path / "results"))
     # mock 天气数据源：返回短数据，避免真实 UAPIS 网络调用，也避免大结果触发短期记忆的 LLM 精炼
     async def fake_weather(self, city, days=7):
@@ -170,7 +172,7 @@ def _make_svc(tmp_path, monkeypatch, llm):
 
 
 @pytest.mark.asyncio
-async def test_critic_triggers_on_hard_data(tmp_path, monkeypatch):
+async def test_critic_triggers_on_hard_data(user_id, tmp_path, monkeypatch):
     """触发条件：调用硬数据工具（weather_query）才触发 critic。"""
     llm = ScriptedStreamLLM([
         [{"type": "end",
@@ -178,12 +180,12 @@ async def test_critic_triggers_on_hard_data(tmp_path, monkeypatch):
         [{"type": "content", "text": "成都明天晴"}, {"type": "end", "tool_calls": None}],
     ])
     svc = _make_svc(tmp_path, monkeypatch, llm)
-    [e async for e in svc.chat_stream("u1", None, "成都天气")]
+    [e async for e in svc.chat_stream(user_id, None, "成都天气")]
     assert len(llm.chat_calls) == 1  # weather_query 是硬数据工具，critic 被触发
 
 
 @pytest.mark.asyncio
-async def test_critic_skips_without_hard_data(tmp_path, monkeypatch):
+async def test_critic_skips_without_hard_data(user_id, tmp_path, monkeypatch):
     """触发条件：只调非硬数据工具（poi_search）不触发 critic。"""
     llm = ScriptedStreamLLM([
         [{"type": "end", "tool_calls": [
@@ -191,12 +193,12 @@ async def test_critic_skips_without_hard_data(tmp_path, monkeypatch):
         [{"type": "content", "text": "宽窄巷子"}, {"type": "end", "tool_calls": None}],
     ])
     svc = _make_svc(tmp_path, monkeypatch, llm)
-    [e async for e in svc.chat_stream("u1", None, "成都景点")]
+    [e async for e in svc.chat_stream(user_id, None, "成都景点")]
     assert llm.chat_calls == []  # poi_search 非硬数据，不触发 critic
 
 
 @pytest.mark.asyncio
-async def test_critic_corrects_answer_when_rejected(tmp_path, monkeypatch):
+async def test_critic_corrects_answer_when_rejected(user_id, tmp_path, monkeypatch):
     """ok=false 分支：critic 拒绝后，复用第一轮工具结果，用 complete 直接生成修正答案（不重新调工具）。"""
     llm = ScriptedStreamLLM([
         # 第一轮生成：调 weather_query 后给出含编造票价的回答
@@ -206,9 +208,9 @@ async def test_critic_corrects_answer_when_rejected(tmp_path, monkeypatch):
     ], critic_response='{"ok":false,"issues":[{"claim":"机票100元","problem":"编造票价","correction":"删除票价"}]}',
         complete_response="成都明天晴")
     svc = _make_svc(tmp_path, monkeypatch, llm)
-    events = [e async for e in svc.chat_stream("u1", None, "成都天气")]
+    events = [e async for e in svc.chat_stream(user_id, None, "成都天气")]
     conv_id = next(e["conversation_id"] for e in events if e["type"] == "conversation_id")
-    history = await svc.conversation_store.get_history("u1", conv_id)
+    history = await svc.conversation_store.get_history(user_id, conv_id)
     saved = json.loads(history[-1]["content"])
     assert saved["content"] == "成都明天晴"  # 修正后的回答被落库
     assert len(llm.chat_calls) == 1  # critic 调一次

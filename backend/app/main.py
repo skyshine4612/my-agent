@@ -5,6 +5,8 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from app.api.routes import chat, conversation, memory
+from app.config import settings
+from app.core.db import close_pool, init_pool
 from app.core.logging import setup_logging
 from app.services.agent_service import service
 
@@ -14,10 +16,15 @@ setup_logging()
 
 @asynccontextmanager
 async def lifespan(app):
-    """应用生命周期：service 是模块级单例（import 时已预加载所有数据源与 LLM 客户端），
-    启动阶段无需额外初始化；关闭阶段统一优雅关闭所有长连接（httpx / MCP session）。"""
+    """应用生命周期：启动阶段建连接池，关闭阶段统一优雅关闭所有长连接（httpx / MCP session）。
+
+    service 是模块级单例，import 时已构造（只存引用、不做数据库 IO），
+    因此连接池可以晚于 service 建立——真正的库访问都发生在请求处理阶段。
+    """
+    await init_pool(settings.supabase_database_url)
     yield
     await service.close()
+    await close_pool()
 
 
 # 创建 FastAPI 应用实例

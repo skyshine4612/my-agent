@@ -96,14 +96,16 @@ class MemoryManager:
         self._extract_locks: dict[str, asyncio.Lock] = {}
 
     async def delete_conversation(self, user_id, conv_id):
-        """删除会话及其消息，并清理该会话的短期记忆与工具结果地址索引；归属校验失败返回 False。"""
+        """删除会话及其消息，并清理该会话的工具结果地址索引；归属校验失败返回 False。
+
+        短期记忆随 conversations 外键级联删除，但 spill 文件在磁盘上、级联删不到，需显式清理。
+        """
         ok = await self.conversation_store.delete_conversation(user_id, conv_id)
         if ok:
-            await self.short_term_memory.clear_conversation(conv_id)
             await self.tool_result_store.delete_conversation(conv_id, user_id)
         return ok
 
-    async def append_turn(self, conv_id, user_message, answer, rounds=None):
+    async def append_turn(self, user_id, conv_id, user_message, answer, rounds=None):
         """把本轮完整回合写进短期记忆表：user + 每轮 assistant(tool_calls) + assistant(答案)。
 
         rounds 是 ReAct 每轮的 tool_calls 列表（[[tc, ...], ...]），按轮次各存一条 assistant(tool_calls)；
@@ -117,7 +119,7 @@ class MemoryManager:
                             "content": json.dumps({"tool_calls": calls}, ensure_ascii=False),
                             "tool_call_id": None})
         records.append({"role": "assistant", "content": answer, "tool_call_id": None})
-        await self.short_term_memory.append_records(conv_id, records)
+        await self.short_term_memory.append_records(user_id, conv_id, records)
 
     async def assemble_history(self, user_id, conv_id):
         """组装短期记忆（summary 摘要 + 结构化消息序列），返回 (messages, summary)。
@@ -126,7 +128,7 @@ class MemoryManager:
         超预算时按「整回合」压缩早期回合（序列化 + 蒸馏累积摘要 + 物理删除早期消息）。
         """
         budget = int(settings.llm_context_budget * settings.history_budget_ratio)
-        records = await self.short_term_memory.get_records(conv_id)
+        records = await self.short_term_memory.get_records(user_id, conv_id)
         old_summary = next((r["content"] for r in records if r["role"] == "summary"), None)
         raw_msgs = []
         for r in records:
@@ -163,7 +165,7 @@ class MemoryManager:
             if summary:
                 write_records.append({"role": "summary", "content": summary, "tool_call_id": None})
             write_records.extend(_record_from_msg(m) for m in recent if m["role"] != "tool")
-            await self.short_term_memory.replace_records(conv_id, write_records)
+            await self.short_term_memory.replace_records(user_id, conv_id, write_records)
         return recent, summary
 
     async def extract_facts(self, user_id, user_message):

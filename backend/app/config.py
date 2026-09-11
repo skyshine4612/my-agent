@@ -33,8 +33,12 @@ class Settings(BaseSettings):
     tavily_api_key: str = ""
     # 高德 Web 服务 API Key（restapi.amap.com 的路线规划等，区别于 ModelScope 高德 MCP）
     amap_api_key: str = ""
-    # SQLite 数据库文件路径
-    db_path: str = "app.db"
+    # Supabase Postgres 连接串（应用主库 postgres 的 public schema，与 auth schema 同库）
+    supabase_database_url: str = ""
+    # 测试库连接串（agent_test：内含最小 auth 桩，不跑 GoTrue，DDL 与主库完全一致）
+    supabase_test_database_url: str = ""
+    # Supabase JWT 密钥（与 supabase/docker 的 .env 中 JWT_SECRET 完全一致，本地 HS256 验签用）
+    supabase_jwt_secret: str = ""
     # 工作记忆 token 预算上限：每次 LLM 调用前估算上下文，超预算淘汰最老交互 + LLM 摘要兜底
     # 应 ≤ 模型上下文上限（qwen3.7-plus 为 1M）并预留输出余量（128K）；取 128K 平衡成本与长上下文能力
     llm_context_budget: int = 128000

@@ -34,5 +34,8 @@ results/
 # superpowers 工作区
 .superpowers/
 
+# 设计文档：本地保留，不入库
+docs/
+
 # claude
 .claude/
