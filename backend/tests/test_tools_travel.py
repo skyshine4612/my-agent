@@ -35,7 +35,7 @@ class FakeFlightDS:
 @pytest.mark.asyncio
 async def test_poi_search():
     fn = make_poi_search(FakeDS())
-    pois = await fn(keywords="景点", city="成都")
+    pois = await fn.ainvoke({"keywords": "景点", "city": "成都"})
     assert pois[0]["name"] == "宽窄巷子"
 
 
@@ -43,26 +43,26 @@ async def test_poi_search():
 async def test_poi_search_without_city():
     """poi_search 的 city 可选：不传 city 时全局搜索不抛 TypeError。"""
     fn = make_poi_search(FakeDS())
-    pois = await fn(keywords="景点")
+    pois = await fn.ainvoke({"keywords": "景点"})
     assert pois[0]["name"] == "宽窄巷子"
 
 
 @pytest.mark.asyncio
 async def test_poi_detail():
     fn = make_poi_detail(FakeDS())
-    r = await fn(id="B001")
+    r = await fn.ainvoke({"id": "B001"})
     assert r["tag"] == "龙井虾仁,脆皮大肠"
 
 
 @pytest.mark.asyncio
 async def test_train_ticket_query():
     fn = make_train_ticket_query(FakeTrainDS())
-    r = await fn(date="2026-08-30", from_city="成都", to_city="北京")
+    r = await fn.ainvoke({"date": "2026-08-30", "from_city": "成都", "to_city": "北京"})
     assert "G101" in r and "553" in r
 
 
 @pytest.mark.asyncio
 async def test_flight_query():
     fn = make_flight_query(FakeFlightDS())
-    r = await fn(date="2026-08-30", from_city="成都", to_city="北京")
+    r = await fn.ainvoke({"date": "2026-08-30", "from_city": "成都", "to_city": "北京"})
     assert "CA123" in r and "1200" in r
