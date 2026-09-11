@@ -5,6 +5,7 @@
 import json
 import logging
 
+from app.core.memory.metrics import bump
 from app.core.token_utils import estimate_tokens
 
 logger = logging.getLogger(__name__)
@@ -107,6 +108,7 @@ class WorkingMemory:
         except Exception as e:
             logger.warning("[记忆:working] LLM 蒸馏失败，回退拼接截断：%s", e)
         # 降级兜底：把被淘汰单元序列化后拼接截断，保留尽量多的原始信息
+        bump("working_distill_fallbacks")
         degraded = "；".join(m["content"] for m in serialized)
         return degraded[:2000]
 
@@ -132,7 +134,9 @@ class WorkingMemory:
         # 未淘汰任何单元（理论上超预算时不会发生，防御性兜底），原样返回
         if not removed:
             return window
+        bump("working_evicted_units", len(removed))
         # 被淘汰单元批量 LLM 蒸馏成一段摘要，替代原始交互放回窗口最前（保留语义、不裸删）
+        bump("working_distill_calls")
         summary = await self._distill(removed)
         result = [{"role": "system", "content": "[早期交互摘要] " + summary}] + self._flatten(kept)
         logger.info("[记忆:working] 淘汰完成：移除 %d 条消息蒸馏成摘要，窗口降至约 %d token",

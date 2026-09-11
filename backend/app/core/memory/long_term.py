@@ -5,6 +5,7 @@ import logging
 
 from app.core.db import rls_conn
 from app.core.embedding import embed_batched, get_embedding, to_vector_literal
+from app.core.memory.metrics import bump
 
 logger = logging.getLogger(__name__)
 
@@ -112,4 +113,5 @@ class LongTermMemory:
             await conn.execute(
                 "update long_term_memory set importance=$1 where user_id=$2 and fact=$3",
                 importance, user_id, fact)
+        bump("dedup_hits")
         logger.info("[记忆:long_term] 语义去重：提升已有 fact importance=%.2f（%.50s）", importance, fact)

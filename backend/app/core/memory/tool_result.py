@@ -9,6 +9,8 @@ import uuid
 import logging
 from pathlib import Path
 
+from app.core.memory.metrics import bump
+
 logger = logging.getLogger(__name__)
 
 
@@ -44,6 +46,7 @@ class ToolResultStore:
             full.write_text(content, encoding="utf-8")
 
         await asyncio.to_thread(r)
+        bump("spill_writes")
         logger.info("[记忆:tool_result] 完整结果 spill 写文件：%s（%d 字符）", rel_path, len(content))
         return rel_path
 
