@@ -28,6 +28,8 @@ def _openai_safe_schema(schema: dict) -> dict:
         return node
 
     schema.pop("title", None)
+    # pydantic 把模型 docstring 复制成根节点 description，与工具级 description 文本重复，清掉
+    schema.pop("description", None)
     return walk(schema)
 
 

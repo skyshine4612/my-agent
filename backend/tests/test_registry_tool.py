@@ -1,5 +1,5 @@
 # tests/test_registry_tool.py
-# register_tool：从 langchain tool 提取 schema，执行仍走底层函数拿原始结果。
+# register_tool：从 langchain tool 提取 schema，执行走 tool.ainvoke，拿到的仍是结构化原始结果。
 import pytest
 from langchain_core.tools import tool
 
