@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 多业务对话式 Agent 平台，前后端分离：
 
-- **backend/**：FastAPI 应用，实现「通用 ReAct agent → 工具调用 → critic 事实校验」链路。真实数据：高德（POI/推荐菜，Web 服务 API）、天气/节假日/翻译/热榜/菜谱/营养（UAPIS，天气最多 7 天预报）、搜索（Tavily）经 HTTP 直连；12306 火车票经 ModelScope 托管 MCP；机票直连 variflight 官方 MCP，LLM 默认接阿里云百炼 DashScope（`qwen3.7-plus`）。持久化全在自托管 Supabase 的 Postgres（`asyncpg` + RLS），身份用 Supabase Auth（GoTrue）。
+- **backend/**：FastAPI 应用，实现「通用 ReAct agent → 工具调用 → critic 事实校验」链路。真实数据：高德（POI/推荐菜，Web 服务 API）、天气/节假日/翻译/热榜/菜谱/营养（UAPIS，天气最多 7 天预报）、搜索（Tavily）经 HTTP 直连；12306 火车票经 ModelScope 托管 MCP；机票直连 variflight 官方 MCP，LLM 默认接阿里云百炼 DashScope（`qwen3.7-plus`）。持久化全在自托管 Supabase 的 Postgres（`asyncpg` + RLS），身份用 Supabase Auth（GoTrue）。另有本地知识库（RAG）：攻略语料切块后用 `text-embedding-v4` 向量化入库（pgvector），`search_knowledge` 工具按余弦相似度检索。
 - **frontend/**：Vue 3 + Vite + Element Plus + Pinia 的单页应用，登录页 + 通用对话界面（会话列表 + 流式聊天 + 工具调用气泡）。
 
 架构已从「旅行专用」链路收敛为「通用 agent + 标准 skill」两段式（见下）。
@@ -25,6 +25,7 @@ uv run pytest tests/test_llm.py::test_llm_contract   # 跑单个测试
 - 测试配置在 `backend/pyproject.toml`：`asyncio_mode = "auto"`（async 测试无需 `@pytest.mark.asyncio`，但现有测试仍显式加了），`testpaths = ["tests"]`。
 - 测试模式：不依赖真实 LLM / 网络，用 `Fake*LLM` 类注入 `service.llm`；数据层连真实 Postgres 测试库 `agent_test`（`SUPABASE_TEST_DATABASE_URL` 由 `tests/conftest.py` 的 `db` fixture 建池并在用例间清表），未配该变量时相关用例整体 skip。
 - 配置：复制 `backend/.env.example` → `backend/.env` 填真实 key；未配 `LLM_API_KEY` 时后端仍可启动（`FallbackLLM` 返回空内容），未配 `SUPABASE_DATABASE_URL` 时启动会因建池失败而报错。
+- 知识库的「抓取网址」入口依赖 Playwright 浏览器，首次需 `uv run playwright install chromium`（约 700MB，含完整 chromium + headless shell）。直连 `cdn.playwright.dev` 在国内约 27KB/s 且频繁断流，加镜像快约 600 倍：`PLAYWRIGHT_DOWNLOAD_HOST=https://cdn.npmmirror.com/binaries/playwright uv run playwright install chromium`。未装时粘贴文本 / 上传文件入口照常可用，只有抓网址会失败。
 
 前端（在 `frontend/` 目录下）：
 
@@ -50,7 +51,7 @@ docker compose up --build   # 前端 nginx 对外 :80，反代 /api → backend:
 api/routes/chat.py  →  services/agent_service.py  →  core/agent.py (ReAct 循环)
   POST /api/agent/chat    AgentService.chat_stream         Agent.run_stream
   (SSE 流)                装配会话历史/短期·长期记忆/LLM/工具/技能  → core/registry.py (工具执行)
-                          + critic 校验 + LTM 提炼            → core/llm.py (LLM 客户端)
+                          + 知识库检索 + critic 校验 + LTM 提炼  → core/llm.py (LLM 客户端)
 ```
 
 - **`app/services/agent_service.py`**：核心编排器，进程级单例 `service`（路由层直接 `import` 复用）。`chat_stream` 依次做：会话归属校验/新建 → 落库用户消息 → LTM 召回偏好 → 组装历史 → 注入 system prompt（含可用业务清单 + 事实规范 + 今天日期）→ 驱动 `Agent.run_stream` → critic 校验 → 落库结构化 assistant 消息 → 流式输出答案 → fire-and-forget 提炼长期记忆。记忆的组装/压缩/提炼委托给 `core/memory/manager.py` 的 `MemoryManager`。
@@ -75,20 +76,23 @@ api/routes/chat.py  →  services/agent_service.py  →  core/agent.py (ReAct �
 
 7. **数据源分层**：两个基类——`datasource/mcp_base.py` 的 `McpDataSource` 封装 MCP 的「懒加载持久 session + 超时 + 失效重建」（12306 / 机票继承）；`datasource/http_base.py` 的 `HttpDataSource` 封装 httpx 异步客户端（高德 Web / UAPIS / Tavily 继承）。`amap_web.py` 把高德返回解析成约定结构（纯函数 `parse_poi_list` / `parse_weather` 便于单测）。
 
-8. **配置**：`app/config.py` 用 pydantic-settings 从 `backend/.env` 读取（`LLM_*`、`MODELSCOPE_TOKEN`、各 `*_MCP_URL`、`UAPIS_API_KEY`、`TAVILY_API_KEY`、`AMAP_API_KEY`、`VARIFLIGHT_API_KEY`、`SUPABASE_DATABASE_URL`、`SUPABASE_TEST_DATABASE_URL`、`SUPABASE_JWT_SECRET`）。容器内通过 compose 挂载 `./backend/.env` 到 `/app/.env`，密钥类参数不写进 compose。前端另有 `frontend/.env`（`VITE_SUPABASE_URL` / `VITE_SUPABASE_ANON_KEY` / `VITE_AMAP_WEB_JS_KEY`），`VITE_` 前缀的变量在 `npm run build` 时被内联进产物，所以 Docker 构建前必须先备好该文件。
+8. **配置**：`app/config.py` 用 pydantic-settings 从 `backend/.env` 读取（`LLM_*`、`EMBEDDING_*`、`VISION_*`、`MODELSCOPE_TOKEN`、各 `*_MCP_URL`、`UAPIS_API_KEY`、`TAVILY_API_KEY`、`AMAP_API_KEY`、`VARIFLIGHT_API_KEY`、`SUPABASE_DATABASE_URL`、`SUPABASE_TEST_DATABASE_URL`、`SUPABASE_JWT_SECRET`）。`EMBEDDING_API_KEY`/`VISION_API_KEY`/`VISION_MODEL` 留空即复用 `llm_*`（同一 DashScope 账号），`EMBEDDING_DIMENSIONS` 必须与建表的 `vector(N)` 一致，换 embedding 模型时两处要一起改。容器内通过 compose 挂载 `./backend/.env` 到 `/app/.env`，密钥类参数不写进 compose。前端另有 `frontend/.env`（`VITE_SUPABASE_URL` / `VITE_SUPABASE_ANON_KEY` / `VITE_AMAP_WEB_JS_KEY`），`VITE_` 前缀的变量在 `npm run build` 时被内联进产物，所以 Docker 构建前必须先备好该文件。
 
 9. **子 Agent 委派（上下文隔离）**（`tools/sub_agent.py`）：顶层 agent 可用 `call_sub_agent` 工具把复杂子任务（如查交通、查景点）委派给独立上下文的子 Agent——子 Agent 历史为空、只吃 `task`，业务规则由它按需 `get_skill` 加载，跑完只回传最终答案摘要，主 agent 的上下文不被大量工具结果淹没。子 Agent 内部工具调用不上报前端（`on_event=None`），前端只显示「委派子任务」一个气泡。当前为单层委派（子 Agent 工具集不含 `call_sub_agent`，避免无限下钻）。子 Agent 分配独立 `sub_conversation_id`（uuid）隔离工具结果地址索引（spill 目录），任务结束（含异常）即清理，不与主会话/其他子 Agent 串扰。
 
-10. **三层记忆 + token 预算 + 三层压缩**（`core/memory/` 包）：工作记忆（本轮工具结果，内存，每次问答即丢）+ 短期记忆（`short_term_memory` 表，喂 LLM 的跨轮上下文权威源：1 条 summary 摘要 + 结构化消息序列（user / assistant 含 tool_calls / tool），跨轮持久）+ 长期记忆（`long_term_memory` 表，按 `user_id` 跨会话）+ 会话历史（`conversation.py`，messages/conversations 仅前端展示）。记忆编排统一在 `memory/manager.py` 的 `MemoryManager`（组装/压缩/写回/提炼），四个 store 由 `AgentService` 创建后共享；四张表的连接统一走 `core/db.py`（asyncpg 连接池，lifespan 里建池/关池，业务查询走 `rls_conn` 切角色开事务）。四个 store 的 `__init__` 一律零 IO——进程级单例 `service` 在 import 时就构造 store，而连接池要到 lifespan 才建，任何构造期建表/连库都会直接炸。token 预算用 `tiktoken`（cl100k_base）真实计数，失败回退启发式（`token_utils.py`）。短期记忆超 token 预算时早期回合压成累积摘要（存表 + 落盘 `_history.txt`）；长期记忆 fire-and-forget 只提炼本轮 user 消息（per-user 锁串行，靠去重时 importance 提升体现「稳定」）；工作记忆单个结果超长时 spill（结构化截断 + 文件地址索引），多结果累积超预算时成对淘汰最老 + LLM 蒸馏兜底（蒸馏失败降级为拼接截断，不炸整轮）。命名约定：工作/短期/长期记忆用 `working`/`short_term`/`long_term`，会话历史用 `conversation`，禁止 `session` 等混用。
+10. **三层记忆 + token 预算 + 三层压缩**（`core/memory/` 包）：工作记忆（本轮工具结果，内存，每次问答即丢）+ 短期记忆（`short_term_memory` 表，喂 LLM 的跨轮上下文权威源：1 条 summary 摘要 + 结构化消息序列（user / assistant 含 tool_calls / tool），跨轮持久）+ 长期记忆（`long_term_memory` 表，按 `user_id` 跨会话，每条 fact 入库时向量化）+ 会话历史（`conversation.py`，messages/conversations 仅前端展示）。记忆编排统一在 `memory/manager.py` 的 `MemoryManager`（组装/压缩/写回/提炼），四个 store 由 `AgentService` 创建后共享；四张表的连接统一走 `core/db.py`（asyncpg 连接池，lifespan 里建池/关池，业务查询走 `rls_conn` 切角色开事务）。四个 store 的 `__init__` 一律零 IO——进程级单例 `service` 在 import 时就构造 store，而连接池要到 lifespan 才建，任何构造期建表/连库都会直接炸。token 预算用 `tiktoken`（cl100k_base）真实计数，失败回退启发式（`token_utils.py`）。短期记忆超 token 预算时早期回合压成累积摘要（存表 + 落盘 `_history.txt`）；长期记忆 fire-and-forget 只提炼本轮 user 消息（per-user 锁串行），召回按本轮问题语义检索（`recall(user_id, query=...)`，向量链路失败回退 importance 排序），写入前与该用户已有 fact 做语义去重（余弦 ≥ 0.85 视为同一条，取较大 importance 提升而非新增）；工作记忆单个结果超长时 spill（结构化截断 + 文件地址索引），多结果累积超预算时成对淘汰最老 + LLM 蒸馏兜底（蒸馏失败降级为拼接截断，不炸整轮）。命名约定：工作/短期/长期记忆用 `working`/`short_term`/`long_term`，会话历史用 `conversation`，禁止 `session` 等混用。
 
 11. **工具结果地址索引（spill-to-file）**（`core/memory/tool_result.py` + `tools/file.py`）：工具结果超 `truncate_limit`（默认 4000 字符）时，完整结果写临时文件 `result_dir/<user_id>/<conversation_id>/<uuid>.txt`，窗口只放「预览 + 文件路径提示」，模型用 `read_file(path, offset, limit)`（顺序读 + 未读完进度提示）与 `grep(pattern, path)`（正则搜 + 位置/上下文片段）两个**写死的安全工具**按需读回被省略的部分。path 经路径白名单校验（拒绝 `..`/绝对路径穿越），按 `current_user_id`（`core/context.py` 的 contextvar）隔离目录。生命周期：spill 文件本轮结束即清（保留 `_history.txt`），`delete_conversation` 删该会话目录时统一清理；子 Agent 同样写文件、子任务结束即清。这是对「纯截断」的升级——被截掉的部分不再是永久丢失，而是可读回。
 
 12. **短期记忆组装 + 压缩（running summary）**（`memory/manager.py` + `short_term.py`）：一个会话的短期记忆直接存 `short_term_memory` 表（多行：1 条 `summary` + 结构化消息序列 `user / assistant(含 tool_calls) / tool`），是喂 LLM 的跨轮上下文的权威源，**不依赖 messages 表**（messages/conversations 仅前端展示）。每轮生成后 `append_turn` 把本轮按 ReAct 轮次写进表（user + 每轮 assistant(tool_calls) + tool×N 占位 + assistant 答案，tool 结果不存、content 空串）；组装时预算驱动（`llm_context_budget * history_budget_ratio`，默认 50%）：早期回合压成累积摘要（序列化 + 蒸馏 + 追加 `_history.txt`），并**物理删除**早期消息（删除即增量，无 `compressed_through` marker），最近几轮保留。摘要注入 system prompt，最近几轮结构化消息作为短期记忆注入对话，拼上下文 = system「`[摘要] {summary}\n[完整历史存到 {path}，可用 read_file 读]`」+ 最近几轮结构化消息 + 本轮工作记忆（工具结果）。这样模型跨轮能看到「查过哪些工具、什么参数」，对没查过的对象重新调工具（grounding 强制每轮重新调）；被压缩的早期回合答案落盘 `_history.txt` 可 `read_file` 读回。
 
+13. **本地知识库（RAG）**（`core/knowledge.py` + `core/ingest.py` + `core/vision.py` + `tools/knowledge.py`）：`documents` 表存切块后的攻略语料（`chunk_index` 按来源聚合、`source_url` 是文档唯一标识），写入时用 `text-embedding-v4` 向量化，检索走 `match_documents(query_embedding, match_count)` 按余弦相似度取 top-k（`1 - (embedding <=> query)`）。知识库记的是**用户自己收录的资料**，含 POI 接口给不出的细节（具体店名、营业时间、避坑经验），所以优先级高于通用查询工具——这条写进了 `prompts/grounding.md`（硬性规则，永远可见），`skills/travel/SKILL.md` 里另有一条讲与专用工具的分工。**注意规则不能只写在 SKILL.md 里**：短问题（如「河坊街有什么吃的」）不会触发 `get_skill`，业务规则正文压根不加载，只有 grounding 里的才总能生效。建库管道只在「知识库弹窗」触发、对话时一律不爬：粘贴文本/上传文件直接入库，URL 走 `ingest.py` 的 Playwright（跑完 JS 再取 DOM，攻略站多是前端渲染）+ HTMLParser 提取正文，图片位置留占位符、正文提取后回填多模态描述（`vision.py`，默认复用 `llm_model`，`VISION_MODEL` 可切独立模型）——知识库是文本语义检索，图片不转成文字就搜不到。降级策略与长期记忆**相反**：知识库 embed 失败直接抛（没向量就检索不到，必须让调用方知道），长期记忆 embed 失败降级为 `embedding=NULL` + importance 排序。`documents` 表策略是 `using(true)`（全局共享，不按 user 隔离），但读写仍走 `rls_conn`。图片采集有三个必踩的坑：地址要先用页面 URL 补全（CDN 普遍写协议相对 `//host/a.jpg`，只认 `http(s)://` 开头会一张都采不到），请求要带浏览器 UA 与页面 Referer（图床按这两项做防盗链，缺了直接 403），svg 一律跳过（图标/logo，送模型只会得到噪声）。另外维基媒体有独立反爬（robot policy + TLS 指纹，curl 能过而 httpx 过不去），正文抓得到但图会被 403，属站点策略而非代码缺陷。
+
 ### 前端结构
 
 - `views/Chat.vue`：主界面，负责 SSE 事件分发（`conversation_id`/`token`/`tool_call`/`tool_result`/`status`/`done`）与会话管理。
 - 记忆以弹窗形式内置于 `views/Chat.vue`：输入框旁「记忆」入口，`el-tabs` 切换长期记忆（跨会话偏好）与短期记忆（摘要 + 最近几轮对话）。
+- 知识库同样是 `views/Chat.vue` 里的弹窗（`components/KnowledgeDialog.vue`，入口与「记忆」并列）：`el-radio-group` 切换粘贴文本 / 上传文件 / 抓取网址三种入库方式，另一个 tab 是已入库文档列表（按来源聚合，可整篇删除）。
 - `components/ChatPanel.vue`：渲染 markdown（`marked` + `DOMPurify` 防 XSS）+ 工具气泡 + 输入框。
 - `services/supabase.ts`：Supabase 客户端单例 + `getAccessToken()`（`getSession` 会自动刷新即将过期的 token），是前端取登录凭证的唯一出口。
 - `services/sse.ts`：手写 `fetch` 流式解析 SSE（规范化换行后按 `\n\n` 分帧，处理多字节字符切断）；注入 `Authorization: Bearer`，401 抛 `AuthExpiredError` 由调用方引导重新登录。

@@ -39,3 +39,23 @@ export async function getLongTermMemory() {
 export async function getShortTermMemory(id: string) {
     return (await api.get(`/memory/short-term/${id}`)).data
 }
+
+// 知识库文档列表（按来源聚合，含块数）
+export async function listDocuments() {
+    return (await api.get('/knowledge/documents')).data
+}
+
+// 粘贴文本入库（文件也走这条：前端读成文本后当正文提交）
+export async function ingestText(content: string, title: string) {
+    return (await api.post('/knowledge/text', {content, title})).data
+}
+
+// 抓取网址正文入库（后端用无头浏览器打开页面，插图会转成文字描述）
+export async function ingestUrl(url: string) {
+    return (await api.post('/knowledge/url', {url})).data
+}
+
+// 按来源删除整篇文档的所有片段
+export async function deleteDocument(sourceUrl: string) {
+    return (await api.delete('/knowledge/documents', {params: {source_url: sourceUrl}})).data
+}

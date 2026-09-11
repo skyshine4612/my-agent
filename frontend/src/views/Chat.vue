@@ -9,6 +9,7 @@ import { useAuthStore } from '@/stores/auth'
 import { chatStream, AuthExpiredError } from '@/services/sse'
 import { listConversations, getConversation, deleteConversation, getLongTermMemory, getShortTermMemory } from '@/services/api'
 import ChatPanel from '@/components/ChatPanel.vue'
+import KnowledgeDialog from '@/components/KnowledgeDialog.vue'
 import type { ChatMessage, ToolEvent, LongTermMemory, ShortTermMemoryRecord } from '@/types'
 
 const convStore = useConversationStore()
@@ -221,6 +222,9 @@ function shortDate(iso: string): string {
   return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`
 }
 
+// 知识库弹窗：添加资料（粘贴/文件/网址）与已入库列表都在组件内部，这里只管开关
+const knowledgeVisible = ref(false)
+
 // —— 记忆弹窗（长期/短期 tab 切换）——
 // 入口在 ChatPanel 的发送按钮左侧；短期记忆跟随当前会话，长期记忆为全局偏好
 const memoryVisible = ref(false)
@@ -314,7 +318,8 @@ onMounted(async () => {
 
     <!-- 中间对话区：核心，占主导 -->
     <section class="chat__main">
-      <ChatPanel :messages="messages" :streaming="streaming" :thinking="thinking" :phase="phase" @send="send" @open-memory="openMemory" />
+      <ChatPanel :messages="messages" :streaming="streaming" :thinking="thinking" :phase="phase"
+                 @send="send" @open-memory="openMemory" @open-knowledge="knowledgeVisible = true" />
     </section>
 
     <!-- 记忆弹窗：长期（全局偏好）/短期（当前会话 running summary）tab 切换 -->
@@ -341,6 +346,9 @@ onMounted(async () => {
         </el-tab-pane>
       </el-tabs>
     </el-dialog>
+
+    <!-- 知识库弹窗：与「记忆」并列，管理检索用的攻略语料 -->
+    <KnowledgeDialog v-model="knowledgeVisible" />
   </div>
 </template>
 

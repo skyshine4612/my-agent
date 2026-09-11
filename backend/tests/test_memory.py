@@ -1,8 +1,28 @@
 # tests/test_memory.py
 # 会话历史 + 长期记忆的契约测试：连 agent_test 跑真实 Postgres，验证两层存储与跨用户隔离
+import json
+
 import pytest
 
-from app.core.memory import ConversationStore, LongTermMemory
+from app.core.memory import ConversationStore, LongTermMemory, ShortTermMemory, ToolResultStore
+from app.core.memory.manager import MemoryManager
+
+
+class _BrokenEmbedder:
+    """永远失败的 embedder：验证 embedding 服务不可用时长期记忆的降级路径。"""
+
+    async def embed(self, texts):
+        raise RuntimeError("embedding 服务不可用")
+
+
+class _FakeExtractLLM:
+    """只实现 complete 的假 LLM：无论输入什么都返回预设的 facts（供提炼链路测试）。"""
+
+    def __init__(self, facts):
+        self._facts = facts
+
+    async def complete(self, messages):
+        return json.dumps({"facts": self._facts}, ensure_ascii=False)
 
 
 @pytest.mark.asyncio
@@ -22,9 +42,9 @@ async def test_conversation_roundtrip(user_id, make_user):
 
 
 @pytest.mark.asyncio
-async def test_long_term_recall(user_id, make_user):
-    """recall 按 importance 降序取前 top_n 条，且按 user_id 隔离。"""
-    l = LongTermMemory(max_facts=10)
+async def test_long_term_recall(user_id, make_user, fake_embedder):
+    """不带 query 的 recall 按 importance 降序取前 top_n 条，且按 user_id 隔离。"""
+    l = LongTermMemory(max_facts=10, embedder=fake_embedder)
     await l.add_facts(user_id, [{"fact": "a", "importance": 0.3},
                                 {"fact": "b", "importance": 0.9},
                                 {"fact": "c", "importance": 0.5}])
@@ -34,9 +54,58 @@ async def test_long_term_recall(user_id, make_user):
 
 
 @pytest.mark.asyncio
-async def test_long_term_prune(user_id, make_user):
+async def test_long_term_semantic_recall(user_id, fake_embedder):
+    """带 query 的 recall 走语义检索：相关的那条排到前面，压过 importance 排序。"""
+    l = LongTermMemory(embedder=fake_embedder)
+    await l.add_facts(user_id, [{"fact": "偏好经济型酒店", "importance": 0.3},
+                                {"fact": "喜欢自然风光", "importance": 0.9}])
+    # 无 query：纯 importance 排序，自然风光在前
+    assert [f["fact"] for f in await l.recall(user_id, top_n=2)] == ["喜欢自然风光", "偏好经济型酒店"]
+    # 有 query：经济型那条语义更近，排第一
+    hits = await l.recall(user_id, query="帮我订个经济型的酒店", top_n=2)
+    assert hits[0]["fact"] == "偏好经济型酒店"
+
+
+@pytest.mark.asyncio
+async def test_long_term_semantic_recall_user_isolation(user_id, make_user, fake_embedder):
+    """语义检索同样按 user 隔离，检索不到别人的偏好。"""
+    l = LongTermMemory(embedder=fake_embedder)
+    await l.add_facts(await make_user(), [{"fact": "偏好经济型酒店", "importance": 0.9}])
+    assert await l.recall(user_id, query="经济型酒店", top_n=5) == []
+
+
+@pytest.mark.asyncio
+async def test_long_term_degrades_without_embedding(user_id):
+    """embedding 不可用时长期记忆仍可用：写入降级为无向量，召回回退 importance 排序。"""
+    l = LongTermMemory(embedder=_BrokenEmbedder())
+    await l.add_facts(user_id, [{"fact": "喜欢自然风光", "importance": 0.9},
+                                {"fact": "偏好经济型酒店", "importance": 0.3}])
+    assert [f["fact"] for f in await l.get_all(user_id)] == ["喜欢自然风光", "偏好经济型酒店"]
+    # 语义检索会失败，但 recall 吞掉异常后退回 importance，不返回空
+    hits = await l.recall(user_id, query="自然风光", top_n=5)
+    assert [f["fact"] for f in hits] == ["喜欢自然风光", "偏好经济型酒店"]
+
+
+@pytest.mark.asyncio
+async def test_extract_facts_dedups_semantically(user_id, fake_embedder, tmp_path):
+    """提炼时语义去重：措辞不同但同一偏好的 fact 不再新增，改为提升已有条目的 importance。"""
+    l = LongTermMemory(embedder=fake_embedder)
+    await l.add_facts(user_id, [{"fact": "偏好经济型酒店", "importance": 0.5}])
+    manager = MemoryManager(ConversationStore(), ShortTermMemory(), l,
+                            ToolResultStore(str(tmp_path)),
+                            _FakeExtractLLM([{"fact": "订酒店要经济型", "importance": 0.9}]))
+
+    await manager.extract_facts(user_id, "帮我订个经济型的酒店")
+
+    facts = await l.get_all(user_id)
+    assert len(facts) == 1                          # 没有新增重复条目
+    assert facts[0]["importance"] == 0.9            # 改为把已有条目的 importance 提到较大值
+
+
+@pytest.mark.asyncio
+async def test_long_term_prune(user_id, make_user, fake_embedder):
     """验证长期记忆的 importance 淘汰与用户隔离"""
-    l = LongTermMemory(max_facts=2)
+    l = LongTermMemory(max_facts=2, embedder=fake_embedder)
     await l.add_facts(user_id, [{"fact": "a", "importance": 0.9}, {"fact": "b", "importance": 0.3},
                                 {"fact": "c", "importance": 0.5}])
     facts = await l.get_all(user_id)
@@ -45,9 +114,9 @@ async def test_long_term_prune(user_id, make_user):
 
 
 @pytest.mark.asyncio
-async def test_long_term_prune_user_isolation(make_user):
+async def test_long_term_prune_user_isolation(make_user, fake_embedder):
     """验证容量淘汰按 user_id 隔离：A 超限淘汰时不影响 B 的高分 facts 数量与内容"""
-    l = LongTermMemory(max_facts=2)
+    l = LongTermMemory(max_facts=2, embedder=fake_embedder)
     a, b = await make_user(), await make_user()
     # 用户 B 先存入高分事实，作为隔离基准
     await l.add_facts(b, [{"fact": "B-important", "importance": 0.99}])

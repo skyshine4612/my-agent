@@ -1,0 +1,71 @@
+# tests/test_knowledge.py
+# 知识库集成测试：切块入库 + 语义检索 + 跨用户共享，走真实 Postgres 的 documents 表。
+# 向量由 FakeEmbedder 给（见 conftest），绕开真实 embedding API；排序可预期，真实语义质量由端到端验证。
+from app.core.knowledge import KnowledgeStore
+
+
+async def test_ingest_chunks_and_lists(db, user_id, fake_embedder):
+    """多段文本按段落切块入库，list_documents 能按来源聚合出该文档。"""
+    store = KnowledgeStore(embedder=fake_embedder)
+    n = await store.ingest(user_id, "西湖很好玩。\n\n火锅也很好吃。\n\n长城很长。",
+                           title="杭州攻略", source_url="http://example.com/hz")
+    assert n == 3
+
+    docs = await store.list_documents(user_id)
+    assert len(docs) == 1
+    assert docs[0]["title"] == "杭州攻略"
+    assert docs[0]["chunks"] == 3
+
+
+async def test_ingest_empty_text_writes_nothing(db, user_id, fake_embedder):
+    """纯空白文本切不出块，不写库也不报错。"""
+    store = KnowledgeStore(embedder=fake_embedder)
+    assert await store.ingest(user_id, "   \n\n  ", title="空") == 0
+    assert await store.list_documents(user_id) == []
+
+
+async def test_search_ranks_by_similarity(db, user_id, fake_embedder):
+    """检索按余弦相似度降序：问西湖，西湖那块必须排第一。"""
+    store = KnowledgeStore(embedder=fake_embedder)
+    await store.ingest(user_id, "西湖值得去。\n\n火锅值得吃。\n\n长城值得爬。", title="攻略")
+
+    hits = await store.search(user_id, "西湖怎么玩", top_k=3)
+    assert len(hits) == 3
+    assert "西湖" in hits[0]["content"]
+    assert hits[0]["similarity"] > hits[1]["similarity"]
+
+
+async def test_search_respects_top_k(db, user_id, fake_embedder):
+    """top_k 限制返回条数。"""
+    store = KnowledgeStore(embedder=fake_embedder)
+    await store.ingest(user_id, "西湖值得去。\n\n火锅值得吃。\n\n长城值得爬。", title="攻略")
+    assert len(await store.search(user_id, "西湖", top_k=1)) == 1
+
+
+async def test_search_empty_library(db, user_id, fake_embedder):
+    """空库检索返回空列表，不报错。"""
+    assert await KnowledgeStore(embedder=fake_embedder).search(user_id, "西湖", top_k=3) == []
+
+
+async def test_knowledge_is_shared_across_users(db, user_id, make_user, fake_embedder):
+    """知识库是全局共享的：A 入库的内容，B 也能检索到（策略是 using(true)，不按 user 隔离）。"""
+    store = KnowledgeStore(embedder=fake_embedder)
+    other = await make_user()
+    await store.ingest(user_id, "西湖的断桥在冬天最美。", title="杭州攻略")
+
+    hits = await store.search(other, "西湖", top_k=3)
+    assert len(hits) == 1
+    assert hits[0]["title"] == "杭州攻略"
+
+
+async def test_delete_by_source_removes_all_chunks(db, user_id, fake_embedder):
+    """按来源删除会清掉该文档的所有块，不留残片。"""
+    store = KnowledgeStore(embedder=fake_embedder)
+    await store.ingest(user_id, "西湖很好玩。\n\n火锅也很好吃。", source_url="http://example.com/a")
+    await store.ingest(user_id, "长城很长。", source_url="http://example.com/b")
+
+    assert await store.delete_by_source(user_id, "http://example.com/a") == 2
+    docs = await store.list_documents(user_id)
+    assert len(docs) == 1
+    assert docs[0]["source_url"] == "http://example.com/b"
+    assert docs[0]["chunks"] == 1

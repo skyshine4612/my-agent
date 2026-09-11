@@ -2,7 +2,6 @@
 # 记忆管理器：统一编排短期记忆（组装/压缩/写回）与长期记忆（提炼/去重），
 # 把记忆相关逻辑从 AgentService 抽出，AgentService 只持有 store 并委托编排。
 import asyncio
-import difflib
 import json
 import logging
 
@@ -11,10 +10,9 @@ from app.core.token_utils import estimate_tokens
 
 logger = logging.getLogger(__name__)
 
-
-def _similar(a: str, b: str, threshold: float = 0.7) -> bool:
-    """简单字符串相似度：用 difflib.SequenceMatcher 判断两条 fact 是否语义相近（去重用）。"""
-    return difflib.SequenceMatcher(None, a, b).ratio() > threshold
+# 长期记忆去重的余弦相似度阈值：同一偏好的不同措辞一般能到 0.85 以上，
+# 阈值再低就容易把「喜欢自然风光」和「喜欢历史古迹」并成一条。
+_DEDUP_THRESHOLD = 0.85
 
 
 def _expand_record(rec):
@@ -185,13 +183,12 @@ class MemoryManager:
                 new_facts = data.get("facts", [])
                 if not new_facts:
                     return
-                existing = await self.long_term_memory.get_all(user_id)
                 to_add = []
                 for nf in new_facts:
                     fact_text = nf.get("fact", "")
                     importance = nf.get("importance", 0.5)
-                    # 语义去重：与已有 fact 相似则更新其 importance（取较大值），否则标记为新增
-                    matched = next((ex for ex in existing if _similar(fact_text, ex["fact"])), None)
+                    # 语义去重：检索最相近的已有 fact，相似度超阈值就提升其 importance（取较大值），否则算新增
+                    matched = await self._find_similar(user_id, fact_text)
                     if matched:
                         await self.long_term_memory.update_importance(user_id, matched["fact"],
                                                                       max(matched["importance"], importance))
@@ -204,6 +201,21 @@ class MemoryManager:
                 # 提炼失败不影响主对话流程，记录 warning 便于发现数据质量回归
                 # （如 LLM 返回字符串型 importance 触发 max(float, str) 的 TypeError 也会走到这里）
                 logger.warning("[memory] 提炼长期记忆失败 user=%s：%s", user_id, e)
+
+    async def _find_similar(self, user_id, fact_text):
+        """在已有长期记忆里找与 fact_text 语义最近的一条，相似度不到阈值则返回 None。
+
+        检索失败一律按「新增」处理：最坏是多存一条近似事实，
+        比抛异常让整轮提炼失败轻得多（长期记忆允许降级，不依赖 embedding 可用）。
+        """
+        try:
+            hits = await self.long_term_memory.search(user_id, fact_text, top_k=1)
+        except Exception as e:
+            logger.warning("[memory] 去重检索失败，本条按新增处理：%s", e)
+            return None
+        if hits and hits[0]["similarity"] >= _DEDUP_THRESHOLD:
+            return hits[0]
+        return None
 
     async def _update_summary(self, old_summary, compressed_text):
         """LLM 把「旧摘要 + 更早对话」浓缩成新的累积摘要；失败回退字符串拼接。

@@ -11,6 +11,7 @@ from app.config import settings
 from app.core.agent import Agent
 from app.core.context import current_user_id
 from app.core.critic import run_critic
+from app.core.knowledge import KnowledgeStore
 from app.core.llm import get_llm
 from app.core.memory import ConversationStore, LongTermMemory, ShortTermMemory, ToolResultStore
 from app.core.memory.manager import MemoryManager
@@ -22,6 +23,7 @@ from app.core.token_utils import estimate_tokens
 from app.datasource.amap_web import AmapWebDataSource
 from app.tools import register_all_tools
 from app.tools.file import register_file_tools
+from app.tools.knowledge import register_knowledge_tools
 from app.tools.sub_agent import make_call_sub_agent
 
 logger = logging.getLogger(__name__)
@@ -55,6 +57,8 @@ class AgentService:
         self.conversation_store = ConversationStore()
         self.short_term_memory = ShortTermMemory()
         self.long_term_memory = LongTermMemory()
+        # 知识库：全局共享的攻略语料，与长期记忆共用同一个 embedder 单例
+        self.knowledge = KnowledgeStore()
         # 工具结果地址索引：超长结果写临时文件，read_file/grep 按需读；本轮结束即清，避免堆积
         self.tool_result_store = ToolResultStore(settings.result_dir)
         # LLM 客户端
@@ -83,6 +87,8 @@ class AgentService:
         self._datasources.extend(register_all_tools(registry, amap_web_ds, [s["name"] for s in self.skills]))
         # read_file/grep 工具：地址索引的按需读出口（需要 tool_result_store，故在 service 层注册）
         register_file_tools(registry, self.tool_result_store)
+        # search_knowledge：知识库语义检索（需要 knowledge store，同理由 service 层注册）
+        register_knowledge_tools(registry, self.knowledge)
         # 注册 call_sub_agent（子 Agent 委派，需要 llm + skill 清单 + 工具结果地址索引，只能在 service 层注册）
         sub_agent_fn = make_call_sub_agent(self.llm, registry, [s["name"] for s in self.skills],
                                            settings.llm_context_budget,
@@ -123,7 +129,7 @@ class AgentService:
         # 落库本轮用户消息
         await self.conversation_store.add_message(user_id, conv_id, "user", message)
 
-        system, history, summary_hint, agent = await self._prepare_context(user_id, conv_id)
+        system, history, summary_hint, agent = await self._prepare_context(user_id, conv_id, message)
 
         # 事件队列：worker 在独立 task 里跑完整轮（生成→critic→落库→记忆→token 输出），
         # 主协程只负责从 queue 取事件转发 SSE。客户端刷新断开只会取消主协程（转发），
@@ -180,11 +186,12 @@ class AgentService:
             await self.conversation_store.update_title(user_id, conv_id, message[:20])
         return conv_id
 
-    async def _prepare_context(self, user_id, conv_id):
+    async def _prepare_context(self, user_id, conv_id, message):
         """准备阶段：召回长期记忆 + 组装短期历史 + 渲染 system prompt，返回 (system, history, summary_hint, agent)。"""
-        # 长期记忆召回：按 importance 降序取前 20 条，按 token 预算截断（占 long_term_hint_ratio），
-        # 避免历史偏好无限挤占留给对话的预算；文案由 render_long_term_hint 集中拼装。
-        facts = await self.long_term_memory.recall(user_id, top_n=20)
+        # 长期记忆召回：按本轮问题语义检索最相关的 20 条（向量链路不可用时回退 importance 排序），
+        # 再按 token 预算截断（占 long_term_hint_ratio），避免历史偏好无限挤占留给对话的预算；
+        # 文案由 render_long_term_hint 集中拼装。
+        facts = await self.long_term_memory.recall(user_id, query=message, top_n=20)
         hint_budget = int(settings.llm_context_budget * settings.long_term_hint_ratio)
         hint_parts = []
         hint_used = 0
