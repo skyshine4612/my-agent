@@ -25,7 +25,7 @@ class FakeTavilyDS:
 async def test_tavily_search_strips_raw_fields():
     """tavily_search 精简返回：只留 title/url/content/score，剔除原始正文。"""
     fn = make_tavily_search(FakeTavilyDS())
-    r = await fn(query="北京旅游")
+    r = await fn.ainvoke({"query": "北京旅游"})
     assert r["results"][0]["title"] == "北京旅游"
     assert r["results"][0]["url"] == "https://x.com"
 
@@ -33,5 +33,5 @@ async def test_tavily_search_strips_raw_fields():
 @pytest.mark.asyncio
 async def test_tavily_extract():
     fn = make_tavily_extract(FakeTavilyDS())
-    r = await fn(urls=["https://x.com"])
+    r = await fn.ainvoke({"urls": ["https://x.com"]})
     assert r["results"][0]["raw_content"] == "正文"

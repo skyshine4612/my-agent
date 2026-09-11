@@ -1,5 +1,12 @@
 # app/tools/system.py
 # 系统工具：get_skill（按需加载业务规则正文）。
+# 工具用 langchain @tool 定义（schema 由 pydantic 从函数签名生成），经 registry.register_tool 注册。
+# name 的 enum 约束用动态 Literal 承载：业务清单是启动时扫描 skills/ 得到的，不可硬编码字面量。
+from typing import Annotated, Literal
+
+from langchain_core.tools import tool
+from pydantic import Field
+
 from app.core.skills import get_skill_body
 
 
@@ -10,21 +17,14 @@ def register_system_tools(registry, skill_names):
         registry:    ToolRegistry，工具注册表
         skill_names: 业务名列表（get_skill 的 name 参数 enum，约束 LLM 只能取已注册业务）
     """
+    SkillName = Literal[tuple(skill_names)]
 
-    async def get_skill(name: str) -> str:
-        """按业务名返回对应 skill 的规划规则正文；未知业务返回提示。"""
+    @tool
+    async def get_skill(
+        name: Annotated[SkillName, Field(description="业务名")],
+    ) -> str:
+        """获取指定业务的规划规则正文（如旅行规划规则）。处理某业务任务前只需调用一次，规则正文加载后会保留在上下文中，不要重复调用。"""
         body = get_skill_body(name)
         return body if body else f"未知业务：{name}"
 
-    # description（何时调）与 parameters（入参 schema，name 用 enum 约束只能取已注册业务）直接传给 register
-    registry.register(
-        "get_skill",
-        "获取指定业务的规划规则正文（如旅行规划规则）。处理某业务任务前只需调用一次，规则正文加载后会保留在上下文中，不要重复调用。",
-        {
-            "type": "object",
-            "properties": {"name": {"type": "string", "enum": skill_names, "description": "业务名"}},
-            "required": ["name"],
-        },
-        get_skill,
-        "读取业务规则",
-    )
+    registry.register_tool(get_skill, "读取业务规则")
