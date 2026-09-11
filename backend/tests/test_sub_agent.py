@@ -31,5 +31,5 @@ async def test_call_sub_agent_returns_answer(tmp_path):
     registry.register("get_skill", "读取业务规则", {"type": "object", "properties": {}}, get_skill, "读取业务规则")
 
     fn = make_call_sub_agent(FakeSubLLM(), registry, ["travel"], 32000)
-    result = await fn(task="查北京到上海的火车票")
+    result = await fn.ainvoke({"task": "查北京到上海的火车票"})
     assert result["answer"] == "子任务完成"

@@ -91,11 +91,10 @@ class AgentService:
         # search_knowledge：知识库语义检索（需要 knowledge store，同理由 service 层注册）
         register_knowledge_tools(registry, self.knowledge)
         # 注册 call_sub_agent（子 Agent 委派，需要 llm + skill 清单 + 工具结果地址索引，只能在 service 层注册）
-        sub_agent_fn = make_call_sub_agent(self.llm, registry, [s["name"] for s in self.skills],
-                                           settings.llm_context_budget,
-                                           self.tool_result_store)
-        registry.register("call_sub_agent", sub_agent_fn.description, sub_agent_fn.parameters, sub_agent_fn,
-                          "委派子任务")
+        sub_agent_tool = make_call_sub_agent(self.llm, registry, [s["name"] for s in self.skills],
+                                             settings.llm_context_budget,
+                                             self.tool_result_store)
+        registry.register_tool(sub_agent_tool, "委派子任务")
         return registry
 
     async def close(self):
