@@ -79,11 +79,10 @@ def _lc_tool_call(tc):
 
 
 class EventScriptChatModel(BaseChatModel):
-    """把事件式假 LLM 的 stream_chat 脚本适配成 langchain 模型（图化后主循环由 create_agent 驱动）。
+    """把事件式假 LLM 的 stream_chat 脚本适配成 langchain 模型（主循环由 create_agent 驱动）。
 
-    content 事件拼成答案文本、end 事件的 tool_calls 转 langchain 形状；主循环与 critic 现在共用这
-    一个模型实例，故这里顺带数「下了几次结论」（CriticVerdict 工具调用）——旧断言的 idx 是调用序数，
-    共用一个实例后不再等于「critic 调了几次」，换成结论次数与旧断言语义严格等价。
+    content 事件拼成答案文本、end 事件的 tool_calls 转 langchain 形状；主循环与 critic 共用这一个模型
+    实例，故这里数的是「下了几次结论」（模型返回 CriticVerdict 工具调用的次数），而不是模型被调了几次。
     """
 
     llm: Any = None

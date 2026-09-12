@@ -25,7 +25,7 @@ class FakeSubLLM:
 
 
 class SubChatModel(BaseChatModel):
-    """子 Agent 的假 langchain 模型（图化后子 Agent 的循环由 create_agent 驱动）：直接回答案、不调工具。"""
+    """子 Agent 的假 langchain 模型（子 Agent 的循环由 create_agent 驱动）：直接回答案、不调工具。"""
 
     @property
     def _llm_type(self):

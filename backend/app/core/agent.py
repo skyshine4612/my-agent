@@ -151,22 +151,20 @@ class _ToolExecMiddleware(AgentMiddleware):
 
 class _WorkingMemoryMiddleware(AgentMiddleware):
     """工作记忆中间件：每轮模型调用前按 token 预算淘汰最老的工具交互（超预算时 LLM 蒸馏成摘要兜底），
-    并把「模型所见窗口」复位成旧循环的布局。
+    并把「模型所见窗口」复位成「固定头 → 淘汰摘要 → 保留窗口 → 本轮用户指令」。
 
     淘汰只裁剪「本轮可变窗口」——最后一条 user 消息之后的消息，即本轮的工具交互；
-    固定头（system prompt / 历史摘要）与短期记忆（历史原文）不参与淘汰，与旧实现一致。
+    固定头（system prompt / 历史摘要）与短期记忆（历史原文）不参与淘汰。
 
-    布局复位：旧循环每轮重建 `fixed + short_term + working + [user_msg]`，故模型所见是
-    「固定头 → 淘汰摘要 → 保留窗口 → 本轮用户指令」。图化后 state 只追加（用户指令停在原位、
-    摘要只能追加到末尾），这套顺序只在「模型所见」这一层复位 —— 不改 state，
-    否则 rounds / 落库 / 淘汰单元切分都会跟着漂。
+    布局复位只在「模型所见」这一层做，不动 state：state 只追加（用户指令停在原位、摘要只能追加到
+    末尾），若为了凑顺序去改 state，rounds / 落库 / 淘汰单元切分都会跟着漂。
     """
 
     def __init__(self, wm=None):
         super().__init__()
         self.wm = wm
         # 蒸馏摘要不进 state：它由本 middleware 持有，只用于拼接模型所见窗口，
-        # 这样下一轮喂给 fit 的窗口仍是旧的 [摘要] + 保留单元，淘汰单元与计数器口径不变
+        # 这样下一轮喂给 fit 的窗口就是 [摘要] + 保留单元，淘汰单元与计数器口径不变
         self.summary = None
 
     async def abefore_model(self, state, runtime):
@@ -177,7 +175,7 @@ class _WorkingMemoryMiddleware(AgentMiddleware):
         start = max((i for i, m in enumerate(messages) if isinstance(m, HumanMessage)), default=-1)
         window = list(messages[start + 1:])
         # WorkingMemory 的既有实现处理 OpenAI 形状的 dict，故先转形状；
-        # 上轮淘汰留下的摘要按旧实现置于窗口最前，fit 才能在超预算时先淘汰它
+        # 上轮淘汰留下的摘要置于窗口最前，fit 才能在超预算时先淘汰它
         converted = convert_to_openai_messages(window)
         if self.summary:
             converted = [{"role": "system", "content": self.summary}] + converted
@@ -203,7 +201,7 @@ class _WorkingMemoryMiddleware(AgentMiddleware):
         if not humans:
             return await handler(request)
         last_user = humans[-1]
-        # 旧布局：固定头与历史 → 淘汰摘要 → 保留窗口 → 本轮用户指令（末尾）
+        # 模型所见布局：固定头与历史 → 淘汰摘要 → 保留窗口 → 本轮用户指令（末尾）
         ordered = (messages[:last_user]
                    + ([SystemMessage(content=self.summary)] if self.summary else [])
                    + messages[last_user + 1:]
@@ -220,7 +218,7 @@ class Agent:
         system_prompt:   系统提示词，注入每轮对话的最前
         tools:           本 Agent 可调用的工具名列表
         llm:             LLM 客户端（实现 LLMClient 接口，含 chat / complete / stream_chat）——
-                         工作记忆蒸馏与 critic 修正仍走它，主循环的模型调用改走 model
+                         工作记忆蒸馏与 critic 修正走它，主循环的模型调用走 model
         model:           langchain 模型实例（create_agent 驱动主循环）
         max_iters:       单次 run_stream 的 ReAct 最大迭代轮数，防止无限循环
     """
@@ -294,16 +292,15 @@ class Agent:
             #  故必须边跑边收，不能等跑完再从最终 state 里找）
             async for mode, payload in graph.astream(
                     {"messages": inputs},
-                    # 限额按「任务」计，一轮 ReAct 占 3 个：abefore_model 钩子 + 模型 + 工具
-                    # （实测 max_iters=3 时 limit=9 恰好跑满 3 轮模型 + 3 次工具执行，limit=8 只跑满 2 轮），
-                    # 故取 3 * max_iters —— 跑满 max_iters 轮后下一次钩子即触顶抛 GraphRecursionError，
-                    # 与旧循环「跑满 max_iters 轮仍每轮调工具」的落点一致
+                    # 限额按「任务」计，一轮 ReAct 占 3 个：abefore_model 钩子 + 模型 + 工具，
+                    # 故取 3 * max_iters —— 刚好允许跑满 max_iters 轮，之后下一次钩子即触顶抛
+                    # GraphRecursionError，落到兜底文案
                     config={"recursion_limit": 3 * self.max_iters},
                     stream_mode=["messages", "values"]):
                 if mode == "messages":
                     chunk, meta = payload
                     # LLM 开始流式产出（思考或答案）时发一次 status，让前端显示「整理中」，覆盖生成期的长静默；
-                    # 工具消息出现即视为进入下一轮，重置标记（对齐旧循环「每轮首个内容块发一次」）
+                    # 工具消息出现即视为进入下一轮，重置标记（每轮首个内容块只发一次）
                     if isinstance(chunk, ToolMessage):
                         status_sent = False
                     elif isinstance(chunk, AIMessage) and meta.get("langgraph_node") == "model":
@@ -323,9 +320,9 @@ class Agent:
                         else:
                             answer = last.content if isinstance(last.content, str) else ""
         except GraphRecursionError:
-            # 达到 max_iters 仍未收敛（每轮都在调工具）：落到下面与旧循环相同的兜底文案
+            # 达到 max_iters 仍未收敛（每轮都在调工具）：落到下面的兜底文案
             logger.warning("[Agent:%s] 达到 %d 轮上限仍未收敛，返回兜底文案", self.name, self.max_iters)
-        # 判空用 None 而非空串：不调工具轮次即使 content 为空也算收敛（旧循环同样返回空串），
+        # 判空用 None 而非空串：不调工具轮次即使 content 为空也算收敛（返回空串），
         # 只有「跑满 max_iters 仍每轮调工具」才落到下面的兜底文案
         if answer is not None:
             # 最终答案按小块上发（前端逐块渲染，保持流式感）

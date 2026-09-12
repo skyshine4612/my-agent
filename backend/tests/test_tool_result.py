@@ -27,7 +27,7 @@ def _lc_tool_call(tc):
 
 
 class EventScriptChatModel(BaseChatModel):
-    """把事件式假 LLM 的 stream_chat 脚本适配成 langchain 模型（图化后主循环由 create_agent 驱动）。
+    """把事件式假 LLM 的 stream_chat 脚本适配成 langchain 模型（主循环由 create_agent 驱动）。
 
     content 事件拼成答案文本、end 事件的 tool_calls 转 langchain 形状；传给 stream_chat 的 messages
     转回 OpenAI 形状，故本文件里对 llm.calls 的断言逐字不变。

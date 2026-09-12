@@ -1,7 +1,7 @@
 # tests/test_agent.py
 # Agent ReAct 循环契约测试：最终答案累积、工具调用并行、结构化截断。
 # 用 ScriptedLLM 预设 tool_calls 序列、FakeRegistry 模拟工具执行，不依赖真实 API。
-# 主循环图化后由 create_agent 驱动，模型入口是 langchain 模型（EventScriptChatModel 把逐轮事件脚本适配进来）。
+# 主循环由 create_agent 驱动，模型入口是 langchain 模型（EventScriptChatModel 把逐轮事件脚本适配进来）。
 import asyncio
 import json
 from types import SimpleNamespace
@@ -24,7 +24,7 @@ def _lc_tool_call(tc):
 
 
 class EventScriptChatModel(BaseChatModel):
-    """把事件式假 LLM 的 stream_chat 脚本适配成 langchain 模型（图化后主循环由 create_agent 驱动）。
+    """把事件式假 LLM 的 stream_chat 脚本适配成 langchain 模型（主循环由 create_agent 驱动）。
 
     content 事件拼成答案文本、end 事件的 tool_calls 转 langchain 形状；传给 stream_chat 的 messages
     转回 OpenAI 形状，故本文件里对 llm.calls 的断言逐字不变。
@@ -205,7 +205,7 @@ async def test_run_stream_parallel_tools_keep_order():
 
 @pytest.mark.asyncio
 async def test_run_stream_struct_truncates_tool_result():
-    """验证 run_stream 工具结果按结构化截断（str 4000）替代旧 4000 字符硬截断，并追加 [已截断]。"""
+    """验证 run_stream 工具结果按结构化截断（str 4000）回填窗口，并追加 [已截断]。"""
     llm = StreamingLLM([
         [{"type": "end", "tool_calls": [{"id": "1", "function": {"name": "big", "arguments": "{}"}}]}],
         [{"type": "content", "text": "ok"}, {"type": "end", "tool_calls": None}],
@@ -258,8 +258,8 @@ async def test_parallel_tool_calls_keep_order_and_ids():
 async def test_model_sees_user_message_last():
     """模型所见窗口的布局：本轮用户指令在最末尾。
 
-    旧循环每轮重建 `fixed + short_term + working + [user_msg]`，用户指令刻意压在最后；图化后 state 只追加，
-    故这条顺序由 _WorkingMemoryMiddleware.awrap_model_call 在「模型所见」这一层复位 —— 它直接决定模型
+    用户指令压在最后是刻意设计（保持最新、不被淘汰）；state 只追加，故这条顺序由
+    _WorkingMemoryMiddleware.awrap_model_call 在「模型所见」这一层复位 —— 它直接决定模型
     实际读到的 prompt，丢了等于静默改了提示词。
     """
     llm = StreamingLLM([
@@ -328,7 +328,7 @@ async def test_default_max_iters_is_20_rounds():
     """默认 max_iters = 20，且真能跑满 20 轮 —— 图侧 recursion_limit = 3 * max_iters = 60。
 
     一轮 ReAct 在限额里占 3 个任务（abefore_model 钩子 + 模型 + 工具），故上限必须是 3 * max_iters：
-    取 2 * max_iters 时实测只跑满 13 轮就触顶，比旧循环的 20 轮少 7 轮工具执行。
+    少一档就凑不满 max_iters 轮，多一档会把多出来的模型调用放进去。
     """
     assert Agent(name="t", system_prompt="s").max_iters == 20
     llm = StreamingLLM([
@@ -344,10 +344,10 @@ async def test_default_max_iters_is_20_rounds():
 
 @pytest.mark.asyncio
 async def test_model_sees_distilled_summary_before_kept_window():
-    """淘汰轮的布局：蒸馏摘要在保留窗口之前（旧实现 `working = [摘要] + 保留单元`），用户指令仍在最后。
+    """淘汰轮的布局：蒸馏摘要在保留窗口之前，用户指令仍在最后。
 
     摘要位置不是纯显示问题：窗口布局变了，_units() 的切分跟着变，之后每轮的淘汰对象与
-    working_evicted_units / working_distill_calls 就会偏离旧实现。
+    working_evicted_units / working_distill_calls 就会跟着变。
     """
     llm = StreamingLLM([
         [{"type": "end", "tool_calls": [{"id": "c1", "function": {"name": "big", "arguments": "{}"}}]}],
