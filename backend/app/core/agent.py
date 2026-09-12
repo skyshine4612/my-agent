@@ -171,7 +171,8 @@ class _CriticMiddleware(AgentMiddleware):
     """critic 回路中间件：ReAct 循环收口（after_agent）时做事实校验，不通过则复用本轮已查到的
     工具结果定向改写，改写后回头再校验，直到通过或达 max_rewrite 上限。
 
-    环对本钩子之外完全不可见：校验与改写都是普通 async 调用，不新增图节点、不占 recursion_limit。
+    环对本钩子之外完全不可见：校验与改写都是普通 async 调用，不新增图节点、
+    不额外占 recursion_limit（收口钩子自身那 1 步照常计）。
     触发条件与图外时代一致：本轮真的调用了硬数据工具（hard_results 由 _ToolExecMiddleware 累积）。
 
     此处不包 try/except：run_critic 内部已吞掉三条 fail-open（超限 / 结论解析失败 / LLM 调用失败），

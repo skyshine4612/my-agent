@@ -643,8 +643,9 @@ async def test_after_agent_chain_runs_every_middleware_probe(monkeypatch):
 async def test_critic_is_last_after_agent_middleware(monkeypatch):
     """护栏：真实装配出的 middleware 链里，最后一个带 after_agent 的中间件就是 critic。
 
-    收口链是「列表末尾 → 列表开头」的顺序，critic 必须保持在末尾才能在改写后仍是最先执行的那个；
-    把 critic 挪到非末尾位置（或在它之后再追加收口中间件）时本用例转红。
+    收口链是「列表末尾 → 列表开头」的顺序，critic 必须保持在末尾才能最先执行；
+    在它之后再追加一个带收口钩子的中间件时本用例转红（链里只有它一个收口中间件时，
+    它在列表里的位置不影响链，挪到列表开头仍绿）。
     """
     captured = {}
     _patch_create_agent(monkeypatch, capture=captured)
@@ -654,7 +655,9 @@ async def test_critic_is_last_after_agent_middleware(monkeypatch):
     a = Agent(name="t", system_prompt="s", tools=[_HARD_TOOL],
               model=EventScriptChatModel(llm=llm))
     await a.run_stream("成都天气", [], reg, critic=CriticConfig())
+    # 判据与框架一致：after_agent 或 aafter_agent 任一个被实现，就算一个收口中间件
     after_agent = [m for m in captured["chain"]
-                   if type(m).aafter_agent is not AgentMiddleware.aafter_agent]
+                   if type(m).after_agent is not AgentMiddleware.after_agent
+                   or type(m).aafter_agent is not AgentMiddleware.aafter_agent]
     assert after_agent, "middleware 链里应有一个带 after_agent 的收口中间件"
     assert isinstance(after_agent[-1], _CriticMiddleware)
