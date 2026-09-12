@@ -23,7 +23,8 @@ async def chat(req: ChatRequest, user_id: str = Depends(get_current_user)):
     async def gen():
         """事件生成器：把 chat_stream 的每个事件 dict 转成 SSE 的 {event, data} 结构。"""
         # 逐条消费 service 产出的事件流，event 用 type 字段、data 用 ensure_ascii=False 保留中文
-        async for ev in service.chat_stream(user_id, req.conversation_id, req.message):
+        async for ev in service.chat_stream(user_id, req.conversation_id, req.message,
+                                            files=[f.model_dump() for f in req.files]):
             yield {"event": ev["type"], "data": json.dumps(ev, ensure_ascii=False)}
 
     # sep="\n"：明确用 LF 作行分隔符，与前端 sse.ts 的 split('\n\n') 对齐

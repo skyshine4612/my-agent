@@ -84,9 +84,16 @@ function pickFile(e: Event) {
         </div>
 
         <template v-for="m in props.messages" :key="m.id">
-          <!-- 用户消息：右侧暖色气泡 -->
+          <!-- 用户消息：右侧暖色气泡（带附件时先在气泡里列出随这条消息发出的文件） -->
           <div v-if="m.role === 'user'" class="msg msg--user">
-            <div class="msg__bubble msg__bubble--user">{{ m.content }}</div>
+            <div class="msg__bubble msg__bubble--user">
+              <div v-if="m.files?.length" class="msg__files">
+                <span v-for="f in m.files" :key="f.file_id" class="msg__file" @click="emit('download', f)">
+                  {{ f.name }}（{{ formatSize(f.size) }}）
+                </span>
+              </div>
+              <span>{{ m.content }}</span>
+            </div>
           </div>
 
           <!-- 助手消息：工具进度（上）+ markdown 正文（下），按时间顺序「先查询、后回答」 -->
@@ -241,6 +248,24 @@ function pickFile(e: Event) {
   background: var(--accent-soft);
   color: var(--text);
   border-bottom-right-radius: 4px;
+}
+/* 用户消息里的附件：点一下按原文件下载回来（和工具产物一样走 blob，<a href> 带不上 Bearer）。
+   气泡整体是 pre-wrap，长文件名要自己兜住换行，别撑破气泡 */
+.msg__files {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 6px;
+}
+.msg__file {
+  font-size: 12px;
+  cursor: pointer;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 2px 10px;
+  max-width: 100%;
+  overflow-wrap: anywhere;
 }
 .msg__label {
   font-size: 12px;

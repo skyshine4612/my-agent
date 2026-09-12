@@ -43,8 +43,8 @@ function nextId(): string {
 const thinking = computed(() => streaming.value && !assistantOutput.value && !phase.value)
 
 // —— 消息构造辅助 ——
-function pushUser(text: string) {
-  messages.value.push({ id: nextId(), role: 'user', content: text })
+function pushUser(text: string, files: StoredFile[] = []) {
+  messages.value.push({ id: nextId(), role: 'user', content: text, files })
 }
 function pushAssistantText(text: string) {
   messages.value.push({ id: nextId(), role: 'assistant', content: text })
@@ -63,8 +63,10 @@ async function refreshConversations() {
 async function send(text: string) {
   const t = text.trim()
   if (!t || streaming.value) return
-  pushUser(t)
-  attached.value = []   // 消息发出，附件条收起（文件本身留在会话里）
+  // 附件挂到这条消息上：既随消息落库（刷新、切会话后仍看得见），也一并发给后端
+  const files = attached.value
+  pushUser(t, files)
+  attached.value = []   // 附件条收起，文件已经挂在这条消息上了
   streaming.value = true
   assistantOutput.value = false
   phase.value = ''
@@ -128,7 +130,7 @@ async function send(text: string) {
           // 本轮结束：无需额外处理，finally 里会复位 streaming
           break
       }
-    })
+    }, files)
   } catch (e) {
     // 登录态失效：清掉本地会话，由路由守卫把用户送回登录页
     if (e instanceof AuthExpiredError) {
@@ -184,7 +186,8 @@ async function selectConversation(id: string) {
   }
 }
 
-// 已上传但还没发消息的文件：输入区上方提示，发出消息后收起（文件本身留在会话里）
+// 已上传但还没发消息的文件：输入区上方提示，发出消息后挂到那条消息上（气泡里显示）。
+// 选择器是单选，所以这里最多一个元素；保持数组是因为它就是消息上 files 的形状（落库、SSE、气泡共用）
 const attached = ref<StoredFile[]>([])
 const uploading = ref(false)
 
@@ -200,6 +203,7 @@ async function handleUpload(file: File) {
       localStorage.setItem('current_conv_id', saved.conversation_id)
       await refreshConversations()
     }
+    // 一次只留一个：本轮要处理谁必须是确定的，后选的文件顶掉前一个（选择器本身就是单选）
     attached.value = [saved]
   } catch {
     pushAssistantText('文件上传失败：本期只收 .xlsx，单文件不超过 20MB。')
@@ -224,12 +228,13 @@ async function downloadArtifact(f: StoredFile) {
   }
 }
 
-// 后端历史消息 → 前端 ChatMessage（assistant 的 {content, tools} JSON 还原为 markdown + 工具气泡）
+// 后端历史消息 → 前端 ChatMessage（存成 JSON 的还原为文本 + 附件 / 工具气泡，纯文本按原样）
 function historyToMessages(history: { role: string; content: string }[]): ChatMessage[] {
   const out: ChatMessage[] = []
   for (const m of history) {
     if (m.role === 'user') {
-      out.push({ id: nextId(), role: 'user', content: m.content })
+      const parsed = parseUserContent(m.content)
+      out.push({ id: nextId(), role: 'user', content: parsed.content, files: parsed.files })
     } else {
       const parsed = parseAssistantContent(m.content)
       if (parsed) {
@@ -240,6 +245,21 @@ function historyToMessages(history: { role: string; content: string }[]): ChatMe
     }
   }
   return out
+}
+
+// 尝试把 user 消息解析为 {content, files} JSON（带附件的消息存 JSON；历史里的旧消息是纯文本，解析失败按纯文本）
+function parseUserContent(content: string): { content: string; files?: StoredFile[] } {
+  try {
+    const o = JSON.parse(content)
+    if (o && typeof o === 'object' && typeof o.content === 'string') {
+      // 过滤历史脏数据：files 里可能混入 null / 非对象 / file_id 非字符串的条目
+      const files = Array.isArray(o.files) ? o.files.filter((f: any) => f && typeof f.file_id === 'string') : []
+      return { content: o.content, files: files.length ? files : undefined }
+    }
+  } catch {
+    /* 非 JSON 文本，忽略 */
+  }
+  return { content }
 }
 
 // 尝试把 assistant 消息解析为 {content, tools} JSON（失败则返回 null，按纯文本处理）

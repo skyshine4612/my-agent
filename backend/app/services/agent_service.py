@@ -16,6 +16,7 @@ from app.core.memory import ConversationStore, LongTermMemory, ShortTermMemory, 
 from app.core.memory.manager import MemoryManager
 from app.core.memory.metrics import log_snapshot
 from app.core.prompts import (load_prompt, render_file_directory, render_history_summary,
+                              render_turn_files, render_user_message,
                               render_long_term_hint, render_system_prompt, today_hint)
 from app.core.registry import ToolRegistry
 from app.core.sandbox import SandboxClient
@@ -127,10 +128,11 @@ class AgentService:
             await self.file_store.delete_conversation(user_id, conv_id)
         return ok
 
-    async def chat_stream(self, user_id, conv_id, message):
+    async def chat_stream(self, user_id, conv_id, message, files=None):
         """SSE 流式对话主流程，依次产出事件：conversation_id → token/tool_call/tool_result → done。
 
         返回 AsyncIterator[dict]，每个 dict 的 "type" 字段标识事件类型。
+        files 是随本条消息发出的附件（[{file_id,name,size}]），只用于落库与前端展示。
         """
         # 设置请求级 user_id contextvar，供工具层（read_file/grep 按用户隔离读、
         # _ToolExecMiddleware 写文件）使用
@@ -141,10 +143,13 @@ class AgentService:
         # 工具层要按会话定位文件目录，与 user_id 一起注入请求级上下文
         current_conversation_id.set(conv_id)
         yield {"type": "conversation_id", "conversation_id": conv_id}
-        # 落库本轮用户消息
-        await self.conversation_store.add_message(user_id, conv_id, "user", message)
+        # 落库本轮用户消息；带附件时存 JSON，前端刷新、切会话后仍能显示这条消息传了哪个文件
+        # （不带附件仍存纯文本，历史里已存的旧消息也是纯文本，前端两种都要能解析）
+        stored = (json.dumps({"content": message, "files": files}, ensure_ascii=False)
+                  if files else message)
+        await self.conversation_store.add_message(user_id, conv_id, "user", stored)
 
-        history, summary_hint, agent = await self._prepare_context(user_id, conv_id, message)
+        history, summary_hint, agent = await self._prepare_context(user_id, conv_id, message, files)
 
         # 事件队列：worker 在独立 task 里跑完整轮（生成→critic→落库→记忆→token 输出），
         # 主协程只负责从 queue 取事件转发 SSE。客户端刷新断开只会取消主协程（转发），
@@ -172,8 +177,11 @@ class AgentService:
                 await self.conversation_store.add_message(
                     user_id, conv_id, "assistant",
                     json.dumps({"content": answer, "tools": state.tools}, ensure_ascii=False))
-                # 补写本轮到短期记忆（按 ReAct 轮次），让「记忆」页立即显示最新一轮
-                await self.memory.append_turn(user_id, conv_id, message, answer, state.rounds)
+                # 补写本轮到短期记忆（按 ReAct 轮次），让「记忆」页立即显示最新一轮；
+                # 附件折进 user 正文（而非只靠 system 的本轮块），下一轮追问「上次那个文件」才有事实可依
+                await self.memory.append_turn(user_id, conv_id,
+                                              render_user_message(message, files or []),
+                                              answer, state.rounds)
                 # 流式输出最终答案：拆小块逐块上发（此时已过 critic 校验，保证只输出一段干净答案）
                 for j in range(0, len(answer), 40):
                     await queue.put({"type": "token", "content": answer[j:j + 40]})
@@ -202,7 +210,7 @@ class AgentService:
             await self.conversation_store.update_title(user_id, conv_id, message[:20])
         return conv_id
 
-    async def _prepare_context(self, user_id, conv_id, message):
+    async def _prepare_context(self, user_id, conv_id, message, files=None):
         """准备阶段：召回长期记忆 + 组装短期历史 + 渲染 system prompt，返回 (history, summary_hint, agent)。"""
         # 长期记忆召回：按本轮问题语义检索最相关的 20 条（向量链路不可用时回退 importance 排序），
         # 再按 token 预算截断（占 long_term_hint_ratio），避免历史偏好无限挤占留给对话的预算；
@@ -222,6 +230,8 @@ class AgentService:
         # 可用业务清单（name + description）注入 system prompt；正文由 get_skill 工具按需加载
         skill_directory = "\n".join(f"- {s['name']}：{s['description']}" for s in self.skills)
         summary_hint = render_history_summary(summary, conv_id)
+        # 本轮上传件单列一块：这次要处理谁必须是事实，不能让模型从整会话清单里猜
+        turn_files = render_turn_files(files or [])
         # 本会话可用文件（上传件 + 脚本产物）：模型任何时候都看得见有哪些文件、file_id 是什么
         file_directory = render_file_directory(
             await self.file_store.list_files(user_id, conv_id, limit=10))
@@ -230,6 +240,7 @@ class AgentService:
             today=today_hint(),
             long_term_hint=render_long_term_hint(hint_parts),
             file_directory=file_directory,
+            turn_files=turn_files,
         )
         agent = Agent(name="assistant", system_prompt=system, tools=self.registry.list_names(),
                       model=self.chat_model)

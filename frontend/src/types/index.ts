@@ -22,11 +22,13 @@ export interface ToolEvent {
 }
 
 // 对话消息：前端聊天区的渲染单元
-// user 消息只含文本；assistant 消息 = markdown 文本 + 一串工具气泡
+// user 消息 = 文本 + 随消息发出的附件（附件随消息落库，刷新、切会话后仍在）
+// assistant 消息 = markdown 文本 + 一串工具气泡
 export interface ChatMessage {
     id: string
     role: 'user' | 'assistant'
     content: string
+    files?: StoredFile[]
     tools?: ToolEvent[]
 }
 

@@ -1,5 +1,6 @@
 // services/sse.ts —— SSE 流式消费
 import {getAccessToken} from '@/services/supabase'
+import type {StoredFile} from '@/types'
 
 // 401：登录态已失效，调用方据此清会话并引导重新登录
 export class AuthExpiredError extends Error {
@@ -9,7 +10,9 @@ export class AuthExpiredError extends Error {
 }
 
 // 向后端发起流式对话，逐条解析 SSE 事件并通过 onEvent 回调返回
-export async function chatStream(message: string, conversationId: string | null, onEvent: (ev: any) => void) {
+// files：随这条消息发出的附件，后端把它们落进用户消息，刷新、切会话后仍能显示
+export async function chatStream(message: string, conversationId: string | null, onEvent: (ev: any) => void,
+                                 files: StoredFile[] = []) {
     // 登录凭证：后端按 JWT 的 sub 判定用户身份
     const token = await getAccessToken()
     const headers: Record<string, string> = {'Content-Type': 'application/json'}
@@ -18,7 +21,7 @@ export async function chatStream(message: string, conversationId: string | null,
     const resp = await fetch('/api/agent/chat', {
         method: 'POST',
         headers,
-        body: JSON.stringify({message, conversation_id: conversationId})
+        body: JSON.stringify({message, conversation_id: conversationId, files})
     })
     // 出错的响应体不是 SSE，先拦下来，避免下游把错误 JSON 当事件流解析
     if (resp.status === 401) throw new AuthExpiredError()
