@@ -22,6 +22,10 @@ _HEADERS = {
 }
 # 小于这个体积的多半是图标/头像/占位图，转出来只会是噪声
 MIN_IMAGE_BYTES = 10 * 1024
+# 能进桶的图片类型 → 扩展名。**白名单**：扩展名要拿去定代理端点的 Content-Type，
+# 是 XSS 面的一部分（svg 是文本可执行的 XML，`<img>` 里不执行、直接导航会执行）；
+# 而 image/bmp 这类少见格式不值得为它多开一条回吐路径。
+ALLOWED_MIME = {"image/jpeg": "jpg", "image/png": "png", "image/webp": "webp", "image/gif": "gif"}
 
 _PROMPT = ("这是一张旅行攻略文章里的插图。用一两句中文描述画面内容，重点写对行程规划有用的信息："
            "景点或地标名称、建筑与自然景观特征、画面里的价格/时间/菜单等文字。"
@@ -77,7 +81,7 @@ def get_vision() -> VisionClient:
 
 
 async def _download(http: httpx.AsyncClient, url: str):
-    """下载图片，返回 (字节, mime)；下载失败、非图片、体积过小一律返回 None。"""
+    """下载图片，返回 (字节, mime)；下载失败、mime 不在白名单、体积过小一律返回 None。"""
     try:
         resp = await http.get(url, timeout=15, follow_redirects=True)
         resp.raise_for_status()
@@ -85,28 +89,33 @@ async def _download(http: httpx.AsyncClient, url: str):
         logger.info("[知识库] 图片下载失败，跳过 url=%s：%s", url, e)
         return None
     mime = resp.headers.get("content-type", "").split(";")[0].strip()
-    if not mime.startswith("image/") or len(resp.content) < MIN_IMAGE_BYTES:
+    if mime not in ALLOWED_MIME or len(resp.content) < MIN_IMAGE_BYTES:
         return None
     return resp.content, mime
 
 
-async def _describe_one(vision, http, url: str) -> str:
-    """下载并描述一张图；任何一步失败都返回空串，不影响其他图与整篇入库。"""
+async def _describe_one(vision, http, url: str) -> dict:
+    """下载并描述一张图；任何一步失败都返回空条目，不影响其他图与整篇入库。"""
     got = await _download(http, url)
     if got is None:
-        return ""
+        return {"desc": "", "data": None, "mime": ""}
+    data, mime = got
     try:
-        desc = await vision.describe(*got)
+        desc = await vision.describe(data, mime)
     except Exception as e:
         logger.info("[知识库] 图片描述失败，跳过 url=%s：%s", url, e)
-        return ""
-    # 模型自己判断没信息的图直接丢掉，别把「无有效信息」这五个字塞进正文
-    return "" if "无有效信息" in desc else desc
+        return {"desc": "", "data": None, "mime": ""}
+    # 模型自己判断没信息的图直接丢掉，别把「无有效信息」这五个字塞进正文。
+    # 字节一并丢：既不进正文就不该进桶。
+    if "无有效信息" in desc:
+        return {"desc": "", "data": None, "mime": ""}
+    return {"desc": desc, "data": data, "mime": mime}
 
 
-async def describe_images(urls: list[str], vision=None, referer: str = "") -> list[str]:
-    """并发描述多张图，返回与传入 urls 等长的列表（单张失败/无信息为空串）。
+async def describe_images(urls: list[str], vision=None, referer: str = "") -> list[dict]:
+    """并发描述多张图，返回与传入 urls 等长的列表，每项 {"desc", "data", "mime"}。
 
+    **返回字节而不只是描述**：原图要一起进 Storage，重下一次就是多一轮网络往返。
     vision 可注入（测试用 Fake），缺省用全局单例。
     referer 传页面地址：图床普遍做防盗链，不带 Referer 的请求会被回 403，抓不到图。
     """
