@@ -1,10 +1,16 @@
 # app/core/agent.py
-# Agent 基类：实现 ReAct 推理-行动循环（LLM 决策 → 工具调用 → 回填结果 → 再决策），
-# 工作记忆的 token 预算淘汰委托给 core/memory/working.py 的 WorkingMemory。
-import asyncio
+# Agent 基类：ReAct 推理-行动循环（LLM 决策 → 工具调用 → 回填结果 → 再决策）由 create_agent 图承载，
+# 工具执行（并行 + 结构化截断 + 地址索引落盘）与工作记忆 token 预算淘汰各落在一个中间件上。
 import json
 import logging
 from dataclasses import dataclass, field
+
+from langchain.agents import create_agent
+from langchain.agents.middleware import AgentMiddleware
+from langchain_core.messages import (AIMessage, HumanMessage, RemoveMessage,
+                                     SystemMessage, ToolMessage)
+from langchain_core.messages.utils import convert_to_openai_messages
+from langgraph.errors import GraphRecursionError
 
 from app.config import settings
 from app.core.context import current_user_id
@@ -59,6 +65,114 @@ def _needs_spill(raw, list_limit=15, dict_limit=20, str_limit=4000) -> bool:
     return len(str(raw)) > str_limit
 
 
+async def postprocess_tool_result(name, raw, tool_result_store, conversation_id, user_id):
+    """工具结果后处理：结构化截断 + 超限 spill，返回喂给模型的文本。
+
+    这份文本就是模型所见语料，critic 校验与修正重写复用同一份，故截断维度与提示文案与搬移前逐字一致。
+    抽成独立函数只为便于单测 —— middleware 只负责调它。
+    """
+    if name in NON_QUERY_TOOLS:
+        # 非查询结果工具（read_file/grep/get_skill/call_sub_agent）：返回内容原样回填，
+        # 不做结构化截断（读回片段/规则正文本身就是有界且需要完整的），也不触发地址索引
+        return str(raw)
+    text, note = _struct_truncate_to_str(raw, 20, 20, settings.truncate_limit)
+    # 地址索引：完整结果被截断（list 超20 / dict 超20键 / str 超阈值）时写临时文件，
+    # 窗口只放预览 + 文件路径，模型可 read_file/grep 读回被省略部分
+    if (tool_result_store is not None and conversation_id is not None
+            and _needs_spill(raw, list_limit=20, str_limit=settings.truncate_limit)):
+        path = await tool_result_store.write(conversation_id, user_id, str(raw))
+        parts = [note, f"完整结果存到 {path}"] if note else [f"完整结果存到 {path}"]
+        return f"{text}\n[{'; '.join(parts)}，可用 read_file/grep 读回剩余]"
+    if note:
+        return f"{text}[{note}]"
+    return text
+
+
+class _ToolExecMiddleware(AgentMiddleware):
+    """工具执行中间件：完全短路框架的工具执行路径，自己执行工具并回填 tool 消息。
+
+    为什么完全不调 handler：handler 就是真实执行路径（ToolNode → tool.ainvoke），
+    「先 handler 再自己执行」会让工具被执行两次 —— 对 train_ticket_query 这类外部配额工具是双倍消耗。
+    代价是绕过 ToolNode 的注入参数/内层错误处理/响应格式化，故这里自行复刻：
+    错误回填（异常转文本回喂 LLM，而非炸掉整轮）与 ToolMessage 自建。
+    """
+
+    def __init__(self, agent_name, registry, emit, conversation_id=None,
+                 tool_result_store=None, user_id=None):
+        super().__init__()
+        self.agent_name = agent_name
+        self.registry = registry
+        self.emit = emit
+        self.conversation_id = conversation_id
+        self.tool_result_store = tool_result_store
+        self.user_id = user_id
+
+    async def awrap_tool_call(self, request, handler):
+        # 工具未注册时 request.tool 为 None，退回框架路径；这条路径只会执行一次，不会双跑
+        if request.tool is None:
+            return await handler(request)
+        tc = request.tool_call
+        name = tc["name"]
+        # 框架已把 arguments 解析成 dict（旧实现是 json.loads(fn["arguments"] or "{}")）
+        args = tc.get("args") or {}
+        # 轮次只用于日志：state 里已产生 tool_calls 的 assistant 消息数即当前轮
+        round_no = max(1, sum(1 for m in request.state["messages"]
+                              if isinstance(m, AIMessage) and m.tool_calls))
+        logger.info("[Agent:%s] 第 %d 轮 调工具 %s（id=%s），参数 %s", self.agent_name, round_no, name, tc["id"],
+                    json.dumps(args, ensure_ascii=False))
+        await self.emit({"type": "tool_call", "agent": self.agent_name, "tool": name, "args": args,
+                         "id": tc["id"], "label": self.registry.label(name)})
+        # 通过 registry 真正执行工具，拿到结构化原始结果（call_raw 不做 str() 转换）；
+        # 失败时把错误回传给 LLM 而非让整轮崩溃（MCP 限流/网络抖动会抛异常）
+        try:
+            raw = await self.registry.call_raw(name, args)
+        except Exception as e:
+            logger.warning("[Agent:%s] 工具 %s 执行失败：%s", self.agent_name, name, e)
+            raw = f"工具执行失败：{e}"
+        text = await postprocess_tool_result(name, raw, self.tool_result_store,
+                                             self.conversation_id, self.user_id)
+        logger.info("[Agent:%s] 第 %d 轮 工具 %s 完成（id=%s），返回 %.120s",
+                    self.agent_name, round_no, name, tc["id"], text)
+        # result 字段是模型工作记忆里的截断版结果，供上层 critic 校验，保证校验语料与模型所见一致
+        await self.emit({"type": "tool_result", "agent": self.agent_name, "tool": name, "status": True,
+                         "result": text, "id": tc["id"], "label": self.registry.label(name)})
+        return ToolMessage(content=text, tool_call_id=tc["id"], name=name)
+
+
+class _WorkingMemoryMiddleware(AgentMiddleware):
+    """工作记忆中间件：每轮模型调用前按 token 预算淘汰最老的工具交互（超预算时 LLM 蒸馏成摘要兜底）。
+
+    只裁剪「本轮可变窗口」——最后一条 user 消息之后的消息，即本轮的工具交互；
+    固定头（system prompt / 历史摘要）与短期记忆（历史原文）不参与淘汰，与旧实现一致。
+    """
+
+    def __init__(self, wm):
+        super().__init__()
+        self.wm = wm
+
+    async def abefore_model(self, state, runtime):
+        messages = state["messages"]
+        # 窗口起点 = 最后一条 user 消息（本轮用户指令）：其后才是本轮工具交互
+        start = max((i for i, m in enumerate(messages) if isinstance(m, HumanMessage)), default=-1)
+        window = list(messages[start + 1:])
+        if not window:
+            return None
+        # WorkingMemory 的既有实现处理 OpenAI 形状的 dict，故先转形状再交给它裁剪
+        converted = convert_to_openai_messages(window)
+        fitted = await self.wm.fit(converted)
+        # 未超预算时 fit 原样返回入参本身，此时不改动 state
+        if fitted is converted:
+            return None
+        # 超预算：被淘汰的前缀（按单元成对淘汰，从最老开始）用 RemoveMessage 删除，
+        # 蒸馏摘要作独立 system 消息回填，保留语义、不裸删
+        summary = fitted[0] if fitted and fitted[0].get("role") == "system" else None
+        kept = len(fitted) - (1 if summary else 0)
+        updates = [RemoveMessage(id=m.id) for m in window[:len(window) - kept]]
+        if summary:
+            updates.append(SystemMessage(content=summary["content"]))
+        return {"messages": updates}
+
+
 @dataclass
 class Agent:
     """Agent 基类：把 LLM 推理与工具执行编排为 ReAct「思考-行动-观察」循环。
@@ -67,7 +181,8 @@ class Agent:
         name:            Agent 名称（用于日志与追踪）
         system_prompt:   系统提示词，注入每轮对话的最前
         tools:           本 Agent 可调用的工具名列表
-        llm:             LLM 客户端（实现 LLMClient 接口，含 chat / complete / stream_chat）
+        llm:             LLM 客户端（实现 LLMClient 接口，含 chat / complete / stream_chat）——
+                         工作记忆蒸馏与 critic 修正仍走它，主循环的模型调用改走 model
         model:           langchain 模型实例（create_agent 驱动主循环）
         max_iters:       单次 run_stream 的 ReAct 最大迭代轮数，防止无限循环
     """
@@ -81,16 +196,17 @@ class Agent:
     async def run_stream(self, user_message, history, registry, on_event=None,
                          conversation_id=None, context_budget=None,
                          tool_result_store=None, summary=None):
-        """以流式方式执行一次完整 ReAct 循环，返回最终累积文本答复。
+        """以流式方式执行一次完整 ReAct 循环，返回 (最终累积文本答复, 每轮 tool_calls)。
 
         流程：
-            - 通过 llm.stream_chat 逐 token 产出；调工具轮次的 content 是内部思考（thought），不上发前端；
+            - 循环由 create_agent 图承载：模型节点做决策，工具节点被 _ToolExecMiddleware 完全短路；
+            - 调工具轮次的 content 是内部思考（thought），不上发前端；
             - 仅最终答案（不调工具的轮次）经 on_event 发为 token 事件；
-            - 同一轮多个 tool_calls 用 asyncio.gather 并行执行，结果按原始顺序回填 tool 消息；
+            - 同一轮多个 tool_calls 由框架并行执行，tool 消息按原始顺序回填；
             - 工具结果回填前做结构化截断（list 前20 / dict 前20键 / str truncate_limit），
               tool_result 事件的 result 字段是模型工作记忆里的截断版结果，供上层 critic 校验，
               保证 critic 校验所用语料与模型生成答案时所见一致；
-            - 每轮后工作记忆按 token 预算淘汰最老交互（超预算时 LLM 蒸馏成摘要兜底）。
+            - 每轮模型调用前，_WorkingMemoryMiddleware 按 token 预算淘汰最老交互（超预算时 LLM 蒸馏成摘要兜底）。
 
         conversation_id：  工具结果地址索引的隔离维度（主会话或子会话 id）。
         context_budget：   工作记忆 token 预算，为 None 时不淘汰（保持原有无限累积行为）。
@@ -108,108 +224,74 @@ class Agent:
         logger.info("[Agent:%s] 开始执行（流式），输入：%.60s", self.name, user_message)
         # 工作记忆（预算淘汰器）：传入 llm 与预算时启用，否则禁用（不淘汰）
         wm = WorkingMemory(self.llm, context_budget) if context_budget else None
-        # 固定头：主 system 提示词（含 long_term_hint），永不淘汰；历史摘要作为独立 system 消息紧随其后
-        fixed = [{"role": "system", "content": self.system_prompt}]
+        # 输入消息：主 system 提示词（含 long_term_hint）由 create_agent 的 system_prompt 注入在最前、
+        # 永不淘汰；历史摘要作为独立 system 消息紧随其后（同旧 fixed=[system, summary]）；
+        # 之后拼短期记忆（最近几轮对话原文，持久，不参与淘汰）与当前用户指令
+        inputs = []
         if summary:
-            fixed.append({"role": "system", "content": summary})
-        # 短期记忆：最近几轮对话原文（持久，来自 messages 表，不参与工作记忆淘汰）
-        short_term = list(history)
-        # 工作记忆：本轮工具交互（易失，超预算时 WorkingMemory 淘汰最老交互）
-        working = []
-        # 当前用户指令：每轮拼在窗口之后，保持最新、不被淘汰
-        user_msg = {"role": "user", "content": user_message}
-        # 若本 Agent 声明了工具，则把工具名列表转成 OpenAI 工具 schema，供 LLM 决策是否调用
-        tool_schemas = registry.to_openai_schemas(self.tools) if self.tools else None
-        # 累积文本：只累积最终答案（不调工具轮次的 content）；调工具的思考（thought）是内部推理，
-        # 不计入回答、也不上发前端，避免把 agent 的自言自语当答案展示给用户。
-        full_text = ""
+            inputs.append(SystemMessage(content=summary))
+        inputs.extend(history)
+        inputs.append(HumanMessage(content=user_message))
+        # 工具取注册表里的 langchain tool 对象：create_agent 需要真工具对象，middleware 才拿得到
+        # request.tool；工具 schema 由工具自身的 args_schema 生成，与 to_openai_schemas 同源
+        tools = [registry.get(n).fn for n in self.tools] if self.tools else []
+        # 装配决策 A：本轮 new 一个 middleware 实例（带本轮 conversation_id / user_id），并在本轮内建图 ——
+        # conversation_id 每轮不同，挂成可变共享属性会在并发两轮对话时互相踩
+        middleware = [_ToolExecMiddleware(self.name, registry, emit,
+                                          conversation_id=conversation_id,
+                                          tool_result_store=tool_result_store,
+                                          user_id=current_user_id.get())]
+        if wm is not None:
+            middleware.append(_WorkingMemoryMiddleware(wm))
+        graph = create_agent(self.model, tools=tools, system_prompt=self.system_prompt,
+                             middleware=middleware)
         # 累积每轮的 tool_calls（ReAct 轮次）：供上层按轮次落库短期记忆（每轮一条 assistant(tool_calls)）
         rounds = []
-        # 进入 ReAct 循环：最多迭代 max_iters 轮，每轮完成一次「思考 → 行动 → 观察」
-        for i in range(self.max_iters):
-            messages = fixed + short_term + working + [user_msg]
-            round_text = ""
-            calls = None
-            status_sent = False
-            # 流式调 LLM：content 只累积到 round_text，不即时上发——只有确认本轮不再调工具时，
-            # 其内容才是面向用户的最终答案；调工具的轮次 content 是 thought，不上发前端。
-            async for event in self.llm.stream_chat(messages, tool_schemas):
-                if event.get("type") == "content":
-                    round_text += event.get("text", "")
-                    # LLM 开始流式产出（思考或答案）时发一次 status，让前端显示「整理中」，覆盖生成期的长静默
-                    if not status_sent:
-                        await emit({"type": "status", "status": "generating"})
-                        status_sent = True
-                elif event.get("type") == "end":
-                    calls = event.get("tool_calls")
-            # 无工具调用：本轮是最终答案，按小块上发（前端逐块渲染，保持流式感）并返回
-            if not calls:
-                full_text += round_text
-                for j in range(0, len(round_text), 40):
-                    await emit({"type": "token", "content": round_text[j:j + 40]})
-                logger.info("[Agent:%s] 本轮完成，返回最终答案（%d 字）", self.name, len(full_text))
-                return full_text, rounds
-            # 有工具调用：把本轮 assistant 回复（含 tool_calls）写入工作记忆，让后续轮次能看见完整上下文
-            working.append({"role": "assistant", "content": round_text, "tool_calls": calls})
-            rounds.append(calls)  # 记录本轮 tool_calls（按轮次），供短期记忆落库
-            logger.info("[Agent:%s] 第 %d 轮决定调用 %d 个工具：%s", self.name, i + 1, len(calls),
-                        ", ".join(tc["function"]["name"] for tc in calls))
-
-            # 并行执行本轮所有无依赖工具调用；gather 保持与 calls 相同的返回顺序
-            async def run_tool(tc):
-                """执行单个工具调用，上报 tool_call / tool_result 事件并返回回填项。
-
-                tool_call 与 tool_result 事件都携带 tc["id"]（工具调用唯一 id），供上层精确配对。
-                并行执行时工具按「完成先后」返回，tool_result 顺序与 tool_call 顺序并不一致，
-                故配对必须依赖 id 而非工具名或队列顺序，否则同名工具并发会错配 summary。
-                """
-                fn = tc["function"]
-                # 解析工具入参（JSON 字符串 → dict），入参缺失时兜底为空对象
-                args = json.loads(fn["arguments"] or "{}")
-                logger.info("[Agent:%s] 第 %d 轮 调工具 %s（id=%s），参数 %s", self.name, i + 1, fn["name"], tc["id"],
-                            json.dumps(args, ensure_ascii=False))
-                await emit({"type": "tool_call", "agent": self.name, "tool": fn["name"], "args": args, "id": tc["id"],
-                            "label": registry.label(fn["name"])})
-                # 通过 registry 真正执行工具，拿到结构化原始结果（call_raw 不做 str() 转换）；
-                # 失败时把错误回传给 LLM 而非让整个 run_stream 崩溃（MCP 限流/网络抖动会抛异常）。
-                try:
-                    raw = await registry.call_raw(fn["name"], args)
-                except Exception as e:
-                    logger.warning("[Agent:%s] 工具 %s 执行失败：%s", self.name, fn["name"], e)
-                    raw = f"工具执行失败：{e}"
-                # 回填工作记忆：结构化截断（list 前20 / dict 前20键 / str truncate_limit），
-                # 这份截断版结果就是模型所见语料；critic 校验与修正重写都复用它，保证语料一致。
-                # 放宽截断避免丢数据（天气 7 天、POI 前 20 个都保留），超长由 token 预算淘汰兜底
-                if fn["name"] in NON_QUERY_TOOLS:
-                    # 非查询结果工具（read_file/grep/get_skill/call_sub_agent）：返回内容原样回填，
-                    # 不做结构化截断（读回片段/规则正文本身就是有界且需要完整的），也不触发地址索引
-                    text = str(raw)
+        recorded = set()  # 已记录的轮次/答案消息 id：同一超步的 state 会在后续超步里重复出现，按 id 去重
+        answer = None  # 不调工具轮次的 content = 面向用户的最终答案（None = 尚未产出）
+        status_sent = False
+        try:
+            # 多模式流式：messages 拿模型的实时输出（发 status），values 拿每个超步的完整 state
+            # （读每轮 tool_calls 与最终答案——工作记忆淘汰会把早先的 assistant 消息从 state 里删掉，
+            #  故必须边跑边收，不能等跑完再从最终 state 里找）
+            async for mode, payload in graph.astream(
+                    {"messages": inputs},
+                    # create_agent 每轮「模型 + 工具」各占一个超步，N 轮需 2N：第 max_iters 轮的工具
+                    # 执行完仍要再调一次模型时即触顶抛 GraphRecursionError，与旧循环跑满 max_iters 对齐
+                    config={"recursion_limit": 2 * self.max_iters},
+                    stream_mode=["messages", "values"]):
+                if mode == "messages":
+                    chunk, meta = payload
+                    # LLM 开始流式产出（思考或答案）时发一次 status，让前端显示「整理中」，覆盖生成期的长静默；
+                    # 工具消息出现即视为进入下一轮，重置标记（对齐旧循环「每轮首个内容块发一次」）
+                    if isinstance(chunk, ToolMessage):
+                        status_sent = False
+                    elif isinstance(chunk, AIMessage) and meta.get("langgraph_node") == "model":
+                        text = chunk.content if isinstance(chunk.content, str) else ""
+                        if text and not status_sent:
+                            await emit({"type": "status", "status": "generating"})
+                            status_sent = True
                 else:
-                    text, note = _struct_truncate_to_str(raw, 20, 20, settings.truncate_limit)
-                    # 地址索引：完整结果被截断（list 超20 / dict 超20键 / str 超阈值）时写临时文件，
-                    # 窗口只放预览 + 文件路径，模型可 read_file/grep 读回被省略部分
-                    if (tool_result_store is not None and conversation_id is not None
-                            and _needs_spill(raw, list_limit=20, str_limit=settings.truncate_limit)):
-                        path = await tool_result_store.write(conversation_id, current_user_id.get(), str(raw))
-                        parts = [note, f"完整结果存到 {path}"] if note else [f"完整结果存到 {path}"]
-                        text = f"{text}\n[{'; '.join(parts)}，可用 read_file/grep 读回剩余]"
-                    elif note:
-                        text = f"{text}[{note}]"
-                logger.info("[Agent:%s] 第 %d 轮 工具 %s 完成（id=%s），返回 %.120s", self.name, i + 1, fn["name"], tc["id"], text)
-                await emit({"type": "tool_result", "agent": self.name, "tool": fn["name"],
-                            "status": True, "result": text, "id": tc["id"], "label": registry.label(fn["name"])})
-                # 返回带 tool_call_id 的回填项，供上层按原始顺序组装 tool 消息
-                return {"tool_call_id": tc["id"], "content": text}
-
-            results = await asyncio.gather(*(run_tool(tc) for tc in calls))
-            # 按 tool_calls 原始顺序回填 tool 消息：gather 已保序，这里按序追加即保证 tool_call_id 对齐
-            for r in results:
-                working.append({"role": "tool", "tool_call_id": r["tool_call_id"], "content": r["content"]})
-            # 每轮后：工作记忆按 token 预算淘汰最老交互（超预算时成对淘汰 + LLM 摘要兜底）；短期记忆不参与淘汰
-            if wm is not None:
-                working = await wm.fit(working)
-        # 达到 max_iters 仍未收敛（每轮都在调工具）时兜底返回：
-        # 有累积文本就用累积文本，否则给一句非空提示，避免最终输出空串
-        if full_text:
-            return full_text, rounds
+                    messages = payload["messages"]
+                    last = messages[-1] if messages else None
+                    # 每个超步的末尾消息：带 tool_calls 的 assistant 消息 = 一轮 ReAct（记录该轮 tool_calls）；
+                    # 不带 tool_calls 的 assistant 消息 = 最终答案轮
+                    if isinstance(last, AIMessage) and last.id not in recorded:
+                        recorded.add(last.id)
+                        if last.tool_calls:
+                            rounds.append(convert_to_openai_messages([last])[0]["tool_calls"])
+                        else:
+                            answer = last.content if isinstance(last.content, str) else ""
+        except GraphRecursionError:
+            # 达到 max_iters 仍未收敛（每轮都在调工具）：落到下面与旧循环相同的兜底文案
+            logger.warning("[Agent:%s] 达到 %d 轮上限仍未收敛，返回兜底文案", self.name, self.max_iters)
+        # 判空用 None 而非空串：不调工具轮次即使 content 为空也算收敛（旧循环同样返回空串），
+        # 只有「跑满 max_iters 仍每轮调工具」才落到下面的兜底文案
+        if answer is not None:
+            # 最终答案按小块上发（前端逐块渲染，保持流式感）
+            for j in range(0, len(answer), 40):
+                await emit({"type": "token", "content": answer[j:j + 40]})
+            logger.info("[Agent:%s] 本轮完成，返回最终答案（%d 字）", self.name, len(answer))
+            return answer, rounds
+        # 未收敛时兜底返回：给一句非空提示，避免最终输出空串
         return "抱歉，本轮查询了较多信息但未能整合成完整回答，请换个方式或精简需求后再试。", rounds

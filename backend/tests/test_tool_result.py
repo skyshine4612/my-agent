@@ -1,8 +1,16 @@
 # tests/test_tool_result.py
 # 地址索引契约测试：ToolResultStore 写文件/读/搜/删目录，read_file/grep 工具，run_stream spill 写文件。
+import json
 import re
+from types import SimpleNamespace
+from typing import Any
 
 import pytest
+from langchain_core.language_models import BaseChatModel
+from langchain_core.messages import AIMessage
+from langchain_core.messages.utils import convert_to_openai_messages
+from langchain_core.outputs import ChatGeneration, ChatResult
+from langchain_core.tools import tool
 
 from app.core.agent import Agent
 from app.core.context import current_user_id
@@ -10,6 +18,41 @@ from app.core.memory import ToolResultStore
 from app.core.memory.metrics import snapshot
 from app.core.registry import ToolRegistry
 from app.tools.file import register_file_tools
+
+
+def _lc_tool_call(tc):
+    """OpenAI 形状的 tool_call → langchain 形状（arguments JSON 串解析成 args dict）。"""
+    return {"id": tc["id"], "name": tc["function"]["name"],
+            "args": json.loads(tc["function"]["arguments"] or "{}")}
+
+
+class EventScriptChatModel(BaseChatModel):
+    """把事件式假 LLM 的 stream_chat 脚本适配成 langchain 模型（图化后主循环由 create_agent 驱动）。
+
+    content 事件拼成答案文本、end 事件的 tool_calls 转 langchain 形状；传给 stream_chat 的 messages
+    转回 OpenAI 形状，故本文件里对 llm.calls 的断言逐字不变。
+    """
+
+    llm: Any = None
+
+    @property
+    def _llm_type(self):
+        return "event-script"
+
+    def bind_tools(self, tools, **kwargs):
+        # 覆盖为原样返回自身：create_agent 在调用期才 bind_tools，裸 BaseChatModel 会抛 NotImplementedError
+        return self
+
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+        # 事件脚本是 async generator（stream_chat），只能走异步路径
+        raise NotImplementedError("EventScriptChatModel 只支持异步调用")
+
+    async def _agenerate(self, messages, stop=None, run_manager=None, **kwargs):
+        events = [e async for e in self.llm.stream_chat(convert_to_openai_messages(messages))]
+        content = "".join(e.get("text", "") for e in events if e.get("type") == "content")
+        calls = next((e.get("tool_calls") for e in events if e.get("type") == "end"), None)
+        return ChatResult(generations=[ChatGeneration(
+            message=AIMessage(content=content, tool_calls=[_lc_tool_call(tc) for tc in (calls or [])]))])
 
 
 class FakeRegistry:
@@ -23,11 +66,26 @@ class FakeRegistry:
         self.called.append((name, args))
         return self.r[name]
 
+    def get(self, name):
+        # create_agent 需要真工具对象（middleware 才拿得到 request.tool）；执行由 middleware 短路，不会真跑
+        return _StubTool(name)
+
     def to_openai_schemas(self, names):
         return []
 
     def label(self, name):
         return name
+
+
+def _StubTool(name):
+    """占位工具条目（与 ToolRegistry.get 返回的 Tool 同形）：fn 是同名 langchain tool。"""
+
+    @tool(name)
+    def _stub() -> str:
+        """占位工具。"""
+        return ""
+
+    return SimpleNamespace(fn=_stub)
 
 
 class StreamingLLM:
@@ -138,7 +196,7 @@ async def test_run_stream_spills_oversize_result(tmp_path):
     store = ToolResultStore(str(tmp_path / "results"))
     current_user_id.set("u1")  # spill 按 current_user_id 分目录，读回要用同一个
     spill_before = snapshot().get("spill_writes", 0)
-    a = Agent(name="t", system_prompt="s", tools=["big"], llm=llm)
+    a = Agent(name="t", system_prompt="s", tools=["big"], llm=llm, model=EventScriptChatModel(llm=llm))
     await a.run_stream("go", [], reg, on_event=None, conversation_id="conv1", tool_result_store=store)
     # 埋点增量：run_stream 的超长结果分支写一次文件
     assert snapshot().get("spill_writes", 0) == spill_before + 1
@@ -162,7 +220,7 @@ async def test_run_stream_spills_large_dict(tmp_path):
     # 2 个键，但 steps 每条 500 字符 × 20 条，str(dict) 超阈值
     reg = FakeRegistry({"big": {"title": "菜", "steps": [{"step": i, "text": "x" * 500} for i in range(20)]}})
     store = ToolResultStore(str(tmp_path / "results"))
-    a = Agent(name="t", system_prompt="s", tools=["big"], llm=llm)
+    a = Agent(name="t", system_prompt="s", tools=["big"], llm=llm, model=EventScriptChatModel(llm=llm))
     await a.run_stream("go", [], reg, on_event=None, conversation_id="conv1", tool_result_store=store)
     tool_msgs = [m for m in llm.calls[1] if m["role"] == "tool"]
     content = tool_msgs[0]["content"]

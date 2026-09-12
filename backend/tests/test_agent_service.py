@@ -3,12 +3,66 @@
 # 验证 service 装配成功、工具非空、chat_stream 用 fake LLM 跑通并产出 conversation_id/done 事件。
 import asyncio
 import json
+from types import SimpleNamespace
+from typing import Any
 
 import pytest
+from langchain_core.language_models import BaseChatModel
+from langchain_core.messages import AIMessage
+from langchain_core.messages.utils import convert_to_openai_messages
+from langchain_core.outputs import ChatGeneration, ChatResult
+from langchain_core.tools import tool
 
 from app.config import settings
 from app.services.agent_service import AgentService
 from app.tools import travel as travel_tools
+
+
+def _lc_tool_call(tc):
+    """OpenAI 形状的 tool_call → langchain 形状（arguments JSON 串解析成 args dict）。"""
+    return {"id": tc["id"], "name": tc["function"]["name"],
+            "args": json.loads(tc["function"]["arguments"] or "{}")}
+
+
+class EventScriptChatModel(BaseChatModel):
+    """把事件式假 LLM 的 stream_chat 脚本适配成 langchain 模型（图化后主循环由 create_agent 驱动）。
+
+    content 事件拼成答案文本、end 事件的 tool_calls 转 langchain 形状；主循环用 chat_model、
+    工作记忆与 critic 修正仍用 llm，故测试同时注入两者（同一份脚本）。
+    """
+
+    llm: Any = None
+
+    @property
+    def _llm_type(self):
+        return "event-script"
+
+    def bind_tools(self, tools, **kwargs):
+        # 覆盖为原样返回自身：create_agent 在调用期才 bind_tools，裸 BaseChatModel 会抛 NotImplementedError
+        return self
+
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+        # 事件脚本是 async generator（stream_chat），只能走异步路径
+        raise NotImplementedError("EventScriptChatModel 只支持异步调用")
+
+    async def _agenerate(self, messages, stop=None, run_manager=None, **kwargs):
+        events = [e async for e in self.llm.stream_chat(convert_to_openai_messages(messages))]
+        content = "".join(e.get("text", "") for e in events if e.get("type") == "content")
+        calls = next((e.get("tool_calls") for e in events if e.get("type") == "end"), None)
+        return ChatResult(generations=[ChatGeneration(
+            message=AIMessage(content=content, tool_calls=[_lc_tool_call(tc) for tc in (calls or [])]))])
+
+
+def _StubTool(name):
+    """占位工具条目（与 ToolRegistry.get 返回的 Tool 同形）：fn 是同名 langchain tool，
+    仅供 create_agent 装配 schema —— 执行被 middleware 短路，不会真跑。"""
+
+    @tool(name)
+    def _stub() -> str:
+        """占位工具。"""
+        return ""
+
+    return SimpleNamespace(fn=_stub)
 
 
 class FakeStreamingLLM:
@@ -23,6 +77,7 @@ class FakeStreamingLLM:
 
     async def complete(self, messages):
         return ""
+
 
 
 def test_service_assembles_and_tools_non_empty():
@@ -47,6 +102,7 @@ async def test_chat_stream_flow(user_id):
     """chat_stream 用 fake LLM 跑通：产出 conversation_id/token/done 事件，并落库结构化 assistant 消息。"""
     svc = AgentService()
     svc.llm = FakeStreamingLLM()
+    svc.chat_model = EventScriptChatModel(llm=svc.llm)  # 主循环图化后由 langchain 模型驱动
 
     async def noop(user_id, conv_id):
         pass
@@ -92,6 +148,7 @@ async def test_registry_built_once_and_reused_across_requests(user_id, monkeypat
     cached = svc.registry
 
     svc.llm = FakeStreamingLLM()
+    svc.chat_model = EventScriptChatModel(llm=svc.llm)  # 主循环图化后由 langchain 模型驱动
 
     async def noop(user_id, conv_id):
         pass
@@ -143,6 +200,9 @@ class SlowFastRegistry:
     def to_openai_schemas(self, names):
         return []
 
+    def get(self, name):
+        return _StubTool(name)
+
     def label(self, name):
         return name
 
@@ -160,6 +220,7 @@ async def test_tool_result_pairs_by_call_id_same_name_parallel(user_id):
     """同名工具并行且乱序完成时，tool_result 按 tool_call_id 精确配对 summary，不串。"""
     svc = AgentService()
     svc.llm = SameNameStreamLLM()
+    svc.chat_model = EventScriptChatModel(llm=svc.llm)  # 主循环图化后由 langchain 模型驱动
     svc.registry = SlowFastRegistry()
 
     async def noop(user_id, conv_id):
@@ -275,6 +336,7 @@ async def test_disconnect_still_persists_answer(user_id):
     """
     svc = AgentService()
     svc.llm = SlowStreamingLLM()
+    svc.chat_model = EventScriptChatModel(llm=svc.llm)  # 主循环图化后由 langchain 模型驱动
 
     async def noop(user_id, conv_id):
         pass

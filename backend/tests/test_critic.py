@@ -3,11 +3,13 @@
 # 以及 service 层的触发条件（仅硬数据工具触发）与修正答案流程。
 import json
 import logging
+from typing import Any
 
 import pytest
 from langchain.agents.structured_output import ToolStrategy
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage
+from langchain_core.messages.utils import convert_to_openai_messages
 from langchain_core.outputs import ChatGeneration, ChatResult
 
 from app.config import settings
@@ -61,6 +63,52 @@ def _verdict_call(ok, issues=None, call_id="v1"):
 def _verdict_model(ok=True, issues=None):
     """只下一个结论就结束的假模型（单次 critic 测试用）。"""
     return ScriptedChatModel(responses=[AIMessage(content="", tool_calls=[_verdict_call(ok, issues)])])
+
+
+def _verdict_turn(ok, issues=None):
+    """critic 下结论轮的事件脚本（结构化输出工具名就是 CriticVerdict 模型名）。"""
+    return [{"type": "end", "tool_calls": [
+        {"id": "v1", "function": {"name": "CriticVerdict",
+                                  "arguments": json.dumps({"ok": ok, "issues": issues or []})}}]}]
+
+
+def _lc_tool_call(tc):
+    """OpenAI 形状的 tool_call → langchain 形状（arguments JSON 串解析成 args dict）。"""
+    return {"id": tc["id"], "name": tc["function"]["name"],
+            "args": json.loads(tc["function"]["arguments"] or "{}")}
+
+
+class EventScriptChatModel(BaseChatModel):
+    """把事件式假 LLM 的 stream_chat 脚本适配成 langchain 模型（图化后主循环由 create_agent 驱动）。
+
+    content 事件拼成答案文本、end 事件的 tool_calls 转 langchain 形状；主循环与 critic 现在共用这
+    一个模型实例，故这里顺带数「下了几次结论」（CriticVerdict 工具调用）——旧断言的 idx 是调用序数，
+    共用一个实例后不再等于「critic 调了几次」，换成结论次数与旧断言语义严格等价。
+    """
+
+    llm: Any = None
+    verdict_calls: int = 0  # 返回 CriticVerdict 结论的次数
+
+    @property
+    def _llm_type(self):
+        return "event-script"
+
+    def bind_tools(self, tools, **kwargs):
+        # 覆盖为原样返回自身：create_agent 在调用期才 bind_tools，裸 BaseChatModel 会抛 NotImplementedError
+        return self
+
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+        # 事件脚本是 async generator（stream_chat），只能走异步路径
+        raise NotImplementedError("EventScriptChatModel 只支持异步调用")
+
+    async def _agenerate(self, messages, stop=None, run_manager=None, **kwargs):
+        events = [e async for e in self.llm.stream_chat(convert_to_openai_messages(messages))]
+        content = "".join(e.get("text", "") for e in events if e.get("type") == "content")
+        calls = next((e.get("tool_calls") for e in events if e.get("type") == "end"), None)
+        msg = AIMessage(content=content, tool_calls=[_lc_tool_call(tc) for tc in (calls or [])])
+        if any(tc["name"] == "CriticVerdict" for tc in msg.tool_calls):
+            self.verdict_calls += 1
+        return ChatResult(generations=[ChatGeneration(message=msg)])
 
 
 class _FakeStore:
@@ -239,11 +287,12 @@ async def test_critic_triggers_on_hard_data(user_id, tmp_path, monkeypatch):
         [{"type": "end",
           "tool_calls": [{"id": "1", "function": {"name": "weather_query", "arguments": '{"city":"成都"}'}}]}],
         [{"type": "content", "text": "成都明天晴"}, {"type": "end", "tool_calls": None}],
+        _verdict_turn(ok=True),
     ])
-    chat_model = _verdict_model(ok=True)
+    chat_model = EventScriptChatModel(llm=llm)
     svc = _make_svc(tmp_path, monkeypatch, llm, chat_model)
     [e async for e in svc.chat_stream(user_id, None, "成都天气")]
-    assert chat_model.idx == 1  # weather_query 是硬数据工具，critic 被触发
+    assert chat_model.verdict_calls == 1  # weather_query 是硬数据工具，critic 被触发
 
 
 @pytest.mark.asyncio
@@ -253,11 +302,12 @@ async def test_critic_skips_without_hard_data(user_id, tmp_path, monkeypatch):
         [{"type": "end", "tool_calls": [
             {"id": "1", "function": {"name": "poi_search", "arguments": '{"keywords":"景点","city":"成都"}'}}]}],
         [{"type": "content", "text": "宽窄巷子"}, {"type": "end", "tool_calls": None}],
+        _verdict_turn(ok=True),  # 只在 critic 被误触发时才会被消费，届时下结论次数会变成 1
     ])
-    chat_model = _verdict_model(ok=True)
+    chat_model = EventScriptChatModel(llm=llm)
     svc = _make_svc(tmp_path, monkeypatch, llm, chat_model)
     [e async for e in svc.chat_stream(user_id, None, "成都景点")]
-    assert chat_model.idx == 0  # poi_search 非硬数据，不触发 critic
+    assert chat_model.verdict_calls == 0  # poi_search 非硬数据，不触发 critic
 
 
 @pytest.mark.asyncio
@@ -268,16 +318,16 @@ async def test_critic_corrects_answer_when_rejected(user_id, tmp_path, monkeypat
         [{"type": "end",
           "tool_calls": [{"id": "1", "function": {"name": "weather_query", "arguments": '{"city":"成都"}'}}]}],
         [{"type": "content", "text": "成都明天晴，机票100元"}, {"type": "end", "tool_calls": None}],
+        _verdict_turn(ok=False, issues=[{"claim": "机票100元", "problem": "编造票价", "correction": "删除票价"}]),
     ], complete_response="成都明天晴")
-    chat_model = _verdict_model(
-        ok=False, issues=[{"claim": "机票100元", "problem": "编造票价", "correction": "删除票价"}])
+    chat_model = EventScriptChatModel(llm=llm)
     svc = _make_svc(tmp_path, monkeypatch, llm, chat_model)
     events = [e async for e in svc.chat_stream(user_id, None, "成都天气")]
     conv_id = next(e["conversation_id"] for e in events if e["type"] == "conversation_id")
     history = await svc.conversation_store.get_history(user_id, conv_id)
     saved = json.loads(history[-1]["content"])
     assert saved["content"] == "成都明天晴"  # 修正后的回答被落库
-    assert chat_model.idx == 1  # critic 调一次
+    assert chat_model.verdict_calls == 1  # critic 调一次
     assert len(llm.complete_calls) == 1  # 修正轮用 complete（不再重新 stream_chat 调工具）
     # 修正轮的 complete 收到工具结果 + 修正要点
     correction_user = [m for m in llm.complete_calls[0] if m["role"] == "user"][-1]
