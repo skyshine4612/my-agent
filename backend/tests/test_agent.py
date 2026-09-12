@@ -4,6 +4,7 @@
 # 主循环由 create_agent 驱动，模型入口是 langchain 模型（EventScriptChatModel 把逐轮事件脚本适配进来）。
 import asyncio
 import json
+import logging
 from types import SimpleNamespace
 from typing import Any
 
@@ -14,6 +15,7 @@ from langchain_core.messages.utils import convert_to_openai_messages
 from langchain_core.outputs import ChatGeneration, ChatResult
 from langchain_core.tools import tool
 
+from app.config import settings
 from app.core.agent import Agent, CriticConfig
 
 
@@ -96,12 +98,15 @@ class StreamingLLM:
 class FakeRegistry:
     """工具注册表的假实现：call_raw 记录调用并返回预设结果，to_openai_schemas 返回空 schema。"""
 
-    def __init__(self, r):
+    def __init__(self, r, raises=None):
         self.r = r
+        self.raises = raises or {}  # name → 要抛的异常，驱动工具失败的异常出口
         self.called = []
 
     async def call_raw(self, name, args):
         self.called.append((name, args))
+        if name in self.raises:
+            raise self.raises[name]
         return self.r[name]
 
     def get(self, name):
@@ -220,6 +225,36 @@ async def test_run_stream_parallel_tools_keep_order():
     tool_msgs = [m for m in second_messages if m["role"] == "tool"]
     assert [m["tool_call_id"] for m in tool_msgs] == ["1", "2"]
     assert [m["content"] for m in tool_msgs] == ["a_result", "b_result"]
+
+
+@pytest.mark.asyncio
+async def test_tool_failure_redacts_secrets(monkeypatch, caplog):
+    """工具抛出的异常里带已配置的密钥时，日志与回填文本都只剩 ***。
+
+    异常串会走「日志 / 回填模型 / SSE 下发 / 落库」四条路径，故两处出口都要验。
+    """
+    secret = "amap-key-should-not-leak"
+    monkeypatch.setattr(settings, "amap_api_key", secret)
+    llm = StreamingLLM([
+        [{"type": "end", "tool_calls": [{"id": "1", "function": {"name": "w", "arguments": "{}"}}]}],
+        [{"type": "content", "text": "done"}, {"type": "end", "tool_calls": None}],
+    ])
+    reg = FakeRegistry({}, raises={"w": RuntimeError(
+        "Client error '400 Bad Request' for url "
+        f"'https://restapi.amap.com/v3/geocode/geo?key={secret}&address=%E6%88%90%E9%83%BD'")})
+    a = Agent(name="t", system_prompt="s", tools=["w"], model=EventScriptChatModel(llm=llm))
+    events = []
+
+    async def on_event(e):
+        events.append(e)
+
+    with caplog.at_level(logging.WARNING, logger="app.core.agent"):
+        out, _ = await a.run_stream("go", [], reg, on_event=on_event)
+
+    assert secret not in caplog.text  # 出口 1：stdout 日志
+    assert secret not in str(events)  # 出口 2：tool_result SSE（同一份文本也随答案落库）
+    assert "***" in caplog.text
+    assert out == "done"  # 脱敏不改变「失败回填给模型、本轮照常收口」的行为
 
 
 @pytest.mark.asyncio

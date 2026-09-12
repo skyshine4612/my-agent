@@ -37,6 +37,21 @@ HARD_DATA_TOOLS = {"train_ticket_query", "flight_query", "weather_query", "holid
 # 防死循环的粗上界，不是精确契约。
 RECURSION_LIMIT = 60
 
+# 配置里按值携带凭据的字段：工具异常常带完整请求 URL（高德把 key 放 query）、连接串异常带密码。
+# 两个 MCP 服务地址不含凭据（token 走 header），故不在列。
+_SECRET_FIELDS = ("llm_api_key", "embedding_api_key", "vision_api_key", "variflight_api_key",
+                  "uapis_api_key", "tavily_api_key", "amap_api_key", "modelscope_token",
+                  "supabase_jwt_secret", "supabase_database_url", "supabase_test_database_url")
+
+
+def _redact_secrets(text):
+    """按值抹掉文本里已配置的凭据（未配置的字段与空值跳过）。"""
+    for name in _SECRET_FIELDS:
+        value = getattr(settings, name, "")
+        if value:
+            text = text.replace(value, "***")
+    return text
+
 
 def _struct_truncate_to_str(raw, list_limit=15, dict_limit=20, str_limit=4000):
     """结构化截断：list 取前 list_limit 条 / dict 取前 dict_limit 键 / str 截断 str_limit。
@@ -273,8 +288,10 @@ class _ToolExecMiddleware(AgentMiddleware):
         try:
             raw = await self.registry.call_raw(name, args)
         except Exception as e:
-            logger.warning("[Agent:%s] 工具 %s 执行失败：%s", self.agent_name, name, e)
-            raw = f"工具执行失败：{e}"
+            # 出口共用于所有数据源：同一个异常串会进日志、回填模型、下发前端并落库，四处一起脱敏
+            err = _redact_secrets(str(e))
+            logger.warning("[Agent:%s] 工具 %s 执行失败：%s", self.agent_name, name, err)
+            raw = f"工具执行失败：{err}"
         # 后处理与上报的异常会被框架的工具错误兜底吞成 error ToolMessage（降级不炸轮），
         # 不补日志就完全无痕：这里记完再原样抛出，保持框架既有的降级行为与错误串
         try:
