@@ -8,28 +8,31 @@ import logging
 import time
 
 from langchain.agents import create_agent
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from app.core.prompts import load_prompt, today_hint
 
 logger = logging.getLogger(__name__)
 
 
+# 注意：下面两个模型既是内部数据结构，也是模型可见的调用契约——它们的 docstring 与字段描述
+# 会被 ToolStrategy 取作「结构化输出工具」的 description 与参数说明（无 docstring 时工具描述为空串），
+# 所以描述必须写清「这个工具是干什么的、参数填什么」，而不是只给内部读者看。
 class CriticIssue(BaseModel):
-    """一条事实问题：原句 + 问题 + 具体怎么改。"""
+    """一条经核对确认的事实问题。回答里的事实被工具结果支撑时不要构造本对象。"""
 
-    claim: str
-    problem: str
+    claim: str = Field(description="回答里那句有问题的话的原句")
+    problem: str = Field(description="问题是什么：该事实在工具结果里不存在（编造），或与工具结果矛盾")
     # correction 必须有默认值：判 ok=true 时模型没有 correction 可填，
     # 设成必填会逼模型编一条出来，而空 correction 的 issue 会被当作误报过滤掉。
-    correction: str = ""
+    correction: str = Field(default="", description="具体怎么改（必须指向与 claim 同一个事实）；说不清怎么改就不要列这条 issue")
 
 
 class CriticVerdict(BaseModel):
-    """critic 判定结果：ok=false 时 issues 列出必须修正的事实问题。"""
+    """提交事实校验结论的工具。逐条核对完「工具结果 vs 待校验回答」后，必须调用本工具给出最终判定。"""
 
-    ok: bool
-    issues: list[CriticIssue] = []
+    ok: bool = Field(description="回答里的事实是否都能被工具结果支撑：能则 true，有编造或矛盾则 false")
+    issues: list[CriticIssue] = Field(default=[], description="ok=false 时必须逐条列出有问题的声明；ok=true 时留空数组")
 
 
 def build_critic_agent(model, tools):
