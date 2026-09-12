@@ -66,17 +66,11 @@ def _StubTool(name):
 
 
 class FakeStreamingLLM:
-    """流式 LLM 假实现：stream_chat 固定吐一段文本后收尾（不调工具），chat/complete 兜底。"""
+    """流式 LLM 假实现：stream_chat 固定吐一段文本后收尾（不调工具）。"""
 
     async def stream_chat(self, messages, tools=None):
         yield {"type": "content", "text": "你好，成都"}
         yield {"type": "end", "tool_calls": None}
-
-    async def chat(self, messages, tools=None, response_format=None):
-        return {"content": '{"ok":true,"issues":[]}', "tool_calls": None}
-
-    async def complete(self, messages):
-        return ""
 
 
 
@@ -177,12 +171,6 @@ class SameNameStreamLLM:
         self.i += 1
         for e in turn:
             yield e
-
-    async def chat(self, messages, tools=None, response_format=None):
-        return {"content": '{"ok":true,"issues":[]}', "tool_calls": None}
-
-    async def complete(self, messages):
-        return ""
 
 
 class SlowFastRegistry:
@@ -314,12 +302,6 @@ class SlowStreamingLLM:
         await asyncio.sleep(0.05)
         yield {"type": "content", "text": "你好，成都"}
         yield {"type": "end", "tool_calls": None}
-
-    async def chat(self, messages, tools=None, response_format=None):
-        return {"content": '{"ok":true,"issues":[]}', "tool_calls": None}
-
-    async def complete(self, messages):
-        return ""
 
 
 @pytest.mark.asyncio

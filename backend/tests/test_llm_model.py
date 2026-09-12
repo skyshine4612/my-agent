@@ -1,5 +1,6 @@
 # tests/test_llm_model.py
 # langchain 模型适配层测试：验证 get_chat_model() 的两个分支，不依赖真实 LLM / 网络
+import httpx
 import pytest
 from langchain.agents import create_agent
 from langchain_core.language_models import BaseChatModel
@@ -72,3 +73,30 @@ def test_get_chat_model_is_singleton(monkeypatch):
     _reset(monkeypatch)
 
     assert llm.get_chat_model() is llm.get_chat_model()
+
+
+def test_timeout_passed_explicitly(monkeypatch):
+    """timeout 显式对齐 120s：不写会落到 openai SDK 默认的 600s，改变蒸馏超时降级的触发时机"""
+    monkeypatch.setattr(settings, "llm_api_key", "sk-test")
+    _reset(monkeypatch)
+
+    assert llm.get_chat_model().request_timeout == httpx.Timeout(120.0, connect=10.0)
+
+
+@pytest.mark.asyncio
+async def test_close_chat_model_closes_client_and_noop_without_key(monkeypatch):
+    """close_chat_model 关闭有 key 分支的连接池；无 key 的假模型没有底层客户端，是安全 no-op。"""
+    # 有 key：base_url 不可达也能构建（构建阶段不发请求），关闭后底层客户端确实已关
+    monkeypatch.setattr(settings, "llm_api_key", "sk-test")
+    monkeypatch.setattr(settings, "llm_base_url", "http://127.0.0.1:1/v1")
+    _reset(monkeypatch)
+    client = llm.get_chat_model().root_async_client
+
+    await llm.close_chat_model()
+    assert client.is_closed()
+
+    # 无 key：假模型无底层客户端，直接返回
+    monkeypatch.setattr(settings, "llm_api_key", "")
+    _reset(monkeypatch)
+    llm.get_chat_model()
+    await llm.close_chat_model()

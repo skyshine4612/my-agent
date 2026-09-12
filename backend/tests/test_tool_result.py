@@ -103,12 +103,6 @@ class StreamingLLM:
         for e in turn:
             yield e
 
-    async def chat(self, messages, tools=None, response_format=None):
-        return {"content": "", "tool_calls": None}
-
-    async def complete(self, messages):
-        return ""
-
 
 @pytest.mark.asyncio
 async def test_store_write_and_read(tmp_path):

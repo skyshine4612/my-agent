@@ -67,12 +67,6 @@ class StreamingLLM:
         for event in turn:
             yield event
 
-    async def chat(self, messages, tools=None, response_format=None):
-        return {"content": "", "tool_calls": None}
-
-    async def complete(self, messages):
-        return "摘要"
-
 
 class FakeRegistry:
     """工具注册表的假实现：call_raw 记录调用并返回预设结果，to_openai_schemas 返回空 schema。"""

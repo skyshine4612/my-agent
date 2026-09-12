@@ -39,7 +39,7 @@ def get_chat_model() -> BaseChatModel:
     if _chat_model is None:
         if settings.llm_api_key:
             # enable_thinking 是 Qwen 专有字段，需经 extra_body 合并到请求体顶层（model_kwargs 会被 SDK 拒收）；
-            # timeout 显式给出：不写会落到 SDK 默认的 600s，比原先的 120s 长得多
+            # timeout 显式给出：不写会落到 SDK 默认的 600s
             _chat_model = ChatOpenAI(
                 model=settings.llm_model,
                 api_key=settings.llm_api_key,
