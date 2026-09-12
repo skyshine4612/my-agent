@@ -236,7 +236,12 @@ async def test_critic_filters_empty_correction():
 
 
 class ScriptedStreamLLM:
-    """按脚本产出 stream_chat 事件（每轮生成吐一个 turn）；脚本耗尽后的那次调用即 critic 修正轮。"""
+    """按脚本产出 stream_chat 事件（每轮生成吐一个 turn）。
+
+    修正轮按 prompt 内容识别（其 user 消息含修正 prompt 独有的「原始问题：」），不占脚本位置：
+    带环后调用序是「生成 → 结论 → 改写 → 复判」，改写轮后面还会再来一次结论轮，
+    「脚本耗尽点即改写轮」的旧判据会把复判也误认成改写。
+    """
 
     def __init__(self, stream_turns, complete_response=""):
         self.stream_turns = list(stream_turns)
@@ -247,8 +252,9 @@ class ScriptedStreamLLM:
 
     async def stream_chat(self, messages, tools=None):
         self.stream_messages.append(messages)
-        # 脚本已按序吐完，这次调用只可能是 critic 的修正重写：产出修正答案并记账
-        if self.i >= len(self.stream_turns):
+        prompt = "\n".join(m["content"] for m in messages if m.get("role") == "user")
+        if "原始问题：" in prompt:
+            # 修正轮：复用本轮工具结果直接重写答案，不消耗脚本
             self.correction_calls.append(messages)
             yield {"type": "content", "text": self.complete_response}
             yield {"type": "end", "tool_calls": None}
@@ -318,7 +324,10 @@ async def test_critic_corrects_answer_when_rejected(user_id, tmp_path, monkeypat
         [{"type": "end",
           "tool_calls": [{"id": "1", "function": {"name": "weather_query", "arguments": '{"city":"成都"}'}}]}],
         [{"type": "content", "text": "成都明天晴，机票100元"}, {"type": "end", "tool_calls": None}],
+        # 首判不通过
         _verdict_turn(ok=False, issues=[{"claim": "机票100元", "problem": "编造票价", "correction": "删除票价"}]),
+        # 改写轮由 prompt 内容识别，不占脚本位置；环回头再校验，故这里还要一结论轮
+        _verdict_turn(ok=True),
     ], complete_response="成都明天晴")
     chat_model = EventScriptChatModel(llm=llm)
     svc = _make_svc(tmp_path, monkeypatch, chat_model)
@@ -327,10 +336,10 @@ async def test_critic_corrects_answer_when_rejected(user_id, tmp_path, monkeypat
     history = await svc.conversation_store.get_history(user_id, conv_id)
     saved = json.loads(history[-1]["content"])
     assert saved["content"] == "成都明天晴"  # 修正后的回答被落库
-    assert chat_model.verdict_calls == 1  # critic 调一次
+    assert chat_model.verdict_calls == 2  # 首判 + 改写后的复判
     # 修正轮不再重新调工具，而是把「工具结果 + 修正要点」直接喂回模型重写
     assert len(llm.correction_calls) == 1
-    assert llm.i == len(llm.stream_turns)  # 脚本被完整消费，多出来的那次调用确实是修正轮
+    assert llm.i == len(llm.stream_turns)  # 脚本被完整消费，没有多调模型
     correction_user = [m for m in llm.correction_calls[0] if m["role"] == "user"][-1]
     assert "原始问题：成都天气" in correction_user["content"]
     assert "修正要点" in correction_user["content"]

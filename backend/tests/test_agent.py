@@ -14,13 +14,35 @@ from langchain_core.messages.utils import convert_to_openai_messages
 from langchain_core.outputs import ChatGeneration, ChatResult
 from langchain_core.tools import tool
 
-from app.core.agent import Agent
+from app.core.agent import Agent, CriticConfig
 
 
 def _lc_tool_call(tc):
     """OpenAI 形状的 tool_call → langchain 形状（arguments JSON 串解析成 args dict）。"""
     return {"id": tc["id"], "name": tc["function"]["name"],
             "args": json.loads(tc["function"]["arguments"] or "{}")}
+
+
+def _verdict_turn(ok, issues=None):
+    """critic 下结论轮的事件脚本（结构化输出工具名就是 CriticVerdict 模型名）。"""
+    return [{"type": "end", "tool_calls": [
+        {"id": "v1", "function": {"name": "CriticVerdict",
+                                  "arguments": json.dumps({"ok": ok, "issues": issues or []})}}]}]
+
+
+def _install_critic(monkeypatch, verdicts):
+    """用预设判定替换 app.core.agent.run_critic，并记录每次收到的入参（tool_results / answer）。
+
+    脚本用完后一直返回最后一条：够 test_critic_loop_stops_at_max_rewrite 这类「连续判不通过」的用例用。
+    """
+    calls = []
+
+    async def fake_run_critic(model, tool_results, answer, read_file_tool=None, grep_tool=None, max_iter=3):
+        calls.append({"tool_results": tool_results, "answer": answer})
+        return verdicts[min(len(calls) - 1, len(verdicts) - 1)]
+
+    monkeypatch.setattr("app.core.agent.run_critic", fake_run_critic)
+    return calls
 
 
 class EventScriptChatModel(BaseChatModel):
@@ -31,6 +53,7 @@ class EventScriptChatModel(BaseChatModel):
     """
 
     llm: Any = None
+    verdict_calls: int = 0  # 返回 CriticVerdict 结论的次数（主循环与 critic 共用这一个模型实例）
 
     @property
     def _llm_type(self):
@@ -48,8 +71,10 @@ class EventScriptChatModel(BaseChatModel):
         events = [e async for e in self.llm.stream_chat(convert_to_openai_messages(messages))]
         content = "".join(e.get("text", "") for e in events if e.get("type") == "content")
         calls = next((e.get("tool_calls") for e in events if e.get("type") == "end"), None)
-        return ChatResult(generations=[ChatGeneration(
-            message=AIMessage(content=content, tool_calls=[_lc_tool_call(tc) for tc in (calls or [])]))])
+        msg = AIMessage(content=content, tool_calls=[_lc_tool_call(tc) for tc in (calls or [])])
+        if any(tc["name"] == "CriticVerdict" for tc in msg.tool_calls):
+            self.verdict_calls += 1
+        return ChatResult(generations=[ChatGeneration(message=msg)])
 
 
 class StreamingLLM:
@@ -359,3 +384,156 @@ async def test_model_sees_distilled_summary_before_kept_window():
     assert [m["role"] for m in last] == ["system", "system", "assistant", "tool", "user"]
     assert last[1]["content"] == "[早期交互摘要] 早期摘要"  # 摘要在保留窗口之前
     assert last[-1]["content"] == "go"  # 用户指令在最后
+
+
+# ---------------------------------------------------------------------------
+# critic 回路：挂在 ReAct 收口钩子（after_agent）上，环跑在钩子内部，对图不可见。
+# 触发条件是本轮调用了硬数据工具（weather_query），故用例都以它为工具。
+# ---------------------------------------------------------------------------
+
+_HARD_TOOL = "weather_query"
+_FALLBACK = "抱歉，本轮查询了较多信息但未能整合成完整回答，请换个方式或精简需求后再试。"
+
+
+def _tool_round(call_id):
+    """一轮「只回 tool_calls」的 ReAct 事件脚本。"""
+    return [{"type": "end", "tool_calls": [
+        {"id": call_id, "function": {"name": _HARD_TOOL, "arguments": "{}"}}]}]
+
+
+def _answer_round(text):
+    """一轮给出最终答案的事件脚本。"""
+    return [{"type": "content", "text": text}, {"type": "end", "tool_calls": None}]
+
+
+@pytest.mark.asyncio
+async def test_critic_receives_react_answer(monkeypatch):
+    """critic 收到的待校验答案是 React 轮的产出原文 —— 事实校验回路真的在工作的唯一凭据。
+
+    取错来源（图 state 里那个只有改写才会写的 answer 键）会让首判恒对着空串校验，
+    真机上通常直接判通过，整个回路静默失效。
+    """
+    llm = StreamingLLM([_tool_round("c1"), _answer_round("成都明天晴")])
+    calls = _install_critic(monkeypatch, [{"ok": True, "issues": []}])
+    reg = FakeRegistry({_HARD_TOOL: "晴"})
+    a = Agent(name="t", system_prompt="s", tools=[_HARD_TOOL],
+              model=EventScriptChatModel(llm=llm), max_iters=3)
+    out, _ = await a.run_stream("成都天气", [], reg, critic=CriticConfig())
+    assert out == "成都明天晴"
+    assert len(calls) == 1
+    assert calls[0]["answer"] == "成都明天晴"  # 校验的是 React 轮答案原文，不是空串
+    assert calls[0]["tool_results"] == json.dumps(["晴"], ensure_ascii=False)  # 校验依据是本轮硬数据语料
+
+
+@pytest.mark.asyncio
+async def test_critic_loop_converges(monkeypatch):
+    """首判不通过、复判通过：critic 调 2 次、correcting 只发 1 次、下发与下发之外的都是改写版。"""
+    llm = StreamingLLM([_tool_round("c1"), _answer_round("成都明天晴，机票100元"),
+                        _answer_round("成都明天晴")])
+    calls = _install_critic(monkeypatch, [
+        {"ok": False, "issues": [{"claim": "机票100元", "problem": "编造票价", "correction": "删除票价"}]},
+        {"ok": True, "issues": []},
+    ])
+    reg = FakeRegistry({_HARD_TOOL: "晴"})
+    a = Agent(name="t", system_prompt="s", tools=[_HARD_TOOL],
+              model=EventScriptChatModel(llm=llm), max_iters=3)
+    events = []
+
+    async def on_event(e):
+        events.append(e)
+
+    out, _ = await a.run_stream("成都天气", [], reg, on_event=on_event, critic=CriticConfig())
+    assert len(calls) == 2  # 首判 + 改写后的复判
+    assert calls[0]["answer"] == "成都明天晴，机票100元"
+    assert calls[1]["answer"] == "成都明天晴"  # 复判校验的是改写后的答案
+    assert [e for e in events if e.get("status") == "correcting"] == [{"type": "status", "status": "correcting"}]
+    assert reg.called == [(_HARD_TOOL, {})]  # 改写不重新调工具
+    assert out == "成都明天晴"  # 下发的是改写版
+    assert "".join(e["content"] for e in events if e["type"] == "token") == "成都明天晴"
+
+
+@pytest.mark.asyncio
+async def test_critic_loop_stops_at_max_rewrite(monkeypatch):
+    """连续判不通过：critic 调 max_rewrite + 1 次后退出、correcting 发 max_rewrite 次、不挂死。"""
+    llm = StreamingLLM([_tool_round("c1"), _answer_round("初版，机票100元"),
+                        _answer_round("改写一"), _answer_round("改写二")])
+    calls = _install_critic(monkeypatch, [
+        {"ok": False, "issues": [{"claim": "票价", "problem": "编造", "correction": "删除"}]}])
+    reg = FakeRegistry({_HARD_TOOL: "晴"})
+    a = Agent(name="t", system_prompt="s", tools=[_HARD_TOOL],
+              model=EventScriptChatModel(llm=llm), max_iters=3)
+    events = []
+
+    async def on_event(e):
+        events.append(e)
+
+    out, _ = await a.run_stream("成都天气", [], reg, on_event=on_event, critic=CriticConfig())
+    assert len(calls) == 3  # 首次判定 + max_rewrite 次复判（默认 max_rewrite=2）
+    assert len([e for e in events if e.get("status") == "correcting"]) == 2
+    assert out == "改写二"  # 上限内最后一次改写的结果照常下发，不挂死也不空手而归
+    assert llm.i == 4  # 1 轮工具 + 答案轮 + 2 次改写，改写没有多调一次
+
+
+@pytest.mark.asyncio
+async def test_critic_does_not_leak_rounds(monkeypatch):
+    """critic 环内的模型调用不产生 ReAct 轮次：rounds 只数真正调工具的轮，checking 只发一次。"""
+    llm = StreamingLLM([_tool_round("c1"), _answer_round("成都明天晴，机票100元"),
+                        _answer_round("成都明天晴")])
+    calls = _install_critic(monkeypatch, [
+        {"ok": False, "issues": [{"claim": "机票100元", "problem": "编造票价", "correction": "删除票价"}]},
+        {"ok": True, "issues": []},
+    ])
+    reg = FakeRegistry({_HARD_TOOL: "晴"})
+    a = Agent(name="t", system_prompt="s", tools=[_HARD_TOOL],
+              model=EventScriptChatModel(llm=llm), max_iters=3)
+    events = []
+
+    async def on_event(e):
+        events.append(e)
+
+    _, rounds = await a.run_stream("成都天气", [], reg, on_event=on_event, critic=CriticConfig())
+    assert len(calls) == 2  # 校验与复判确实发生了
+    assert rounds == [[{"id": "c1", "type": "function", "function": {"name": _HARD_TOOL, "arguments": "{}"}}]]
+    assert len([e for e in events if e.get("status") == "checking"]) == 1
+    assert llm.i == 3  # 3 次模型调用里只有 1 次是调工具的轮次
+
+
+@pytest.mark.asyncio
+async def test_critic_turn_still_hits_max_iters_limit(monkeypatch):
+    """永不收敛 + 带 critic：额度抬高 2 步后仍恰跑满 max_iters 轮，返回兜底文案、零 token。
+
+    抬高 2 步的代价在这里可见：第 4 轮模型决策被放行（脚本要备 4 个 turn），但它的工具节点触顶，
+    故 reg 只被调 3 次、rounds 只有 3 条 —— 多出来的只是「次收口前的最后一次决策」。
+    """
+    llm = StreamingLLM([_tool_round(f"c{i}") for i in range(4)])
+    _install_critic(monkeypatch, [{"ok": True, "issues": []}])
+    reg = FakeRegistry({_HARD_TOOL: "晴"})
+    a = Agent(name="t", system_prompt="s", tools=[_HARD_TOOL],
+              model=EventScriptChatModel(llm=llm), max_iters=3)
+    events = []
+
+    async def on_event(e):
+        events.append(e)
+
+    out, rounds = await a.run_stream("go", [], reg, on_event=on_event, critic=CriticConfig())
+    assert out == _FALLBACK
+    assert len(rounds) == 3  # 额度每 +3 多放行一轮，+2 不会多放行第 4 轮
+    assert reg.called == [(_HARD_TOOL, {})] * 3
+    assert [e for e in events if e["type"] == "token"] == []
+
+
+@pytest.mark.asyncio
+async def test_critic_runs_on_converging_turn_with_critic():
+    """收敛 + 带 critic：收口钩子在额度内跑到，critic 确实被触发。
+
+    N 轮工具后收口实测需 3N + 3 步额度（N=1 时下限为 6），正好卡在额度边界上：
+    max_iters=2 的额度是 3 * 2 + 2 = 8，而收口这轮只用到 6 步。
+    """
+    llm = StreamingLLM([_tool_round("c1"), _answer_round("成都明天晴"), _verdict_turn(ok=True)])
+    chat_model = EventScriptChatModel(llm=llm)
+    reg = FakeRegistry({_HARD_TOOL: "晴"})
+    a = Agent(name="t", system_prompt="s", tools=[_HARD_TOOL], model=chat_model, max_iters=2)
+    out, rounds = await a.run_stream("成都天气", [], reg, critic=CriticConfig())
+    assert out == "成都明天晴"
+    assert chat_model.verdict_calls >= 1  # 收口钩子确实跑到并触发了 critic
+    assert len(rounds) == 1
