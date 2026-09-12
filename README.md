@@ -10,7 +10,7 @@
 - **标准 skill 两段式**：业务规则（`SKILL.md`）的清单常驻 system prompt，正文按需加载，新增业务无需改装配代码。
 - **子 Agent 委派**：复杂子任务可委派给独立上下文的子 Agent 处理、只返回摘要，避免主上下文被大量工具结果淹没。
 - **三层记忆**：工作记忆（本轮工具结果，易失）+ 短期记忆（summary 摘要 + 最近几轮结构化对话含工具调用，独立表持久化，是喂 LLM 的权威源）+ 长期记忆（跨会话偏好），记忆与会话历史分离：长期/短期记忆各从各表读，messages/conversations 仅前端展示；短期记忆超预算压成摘要（物理删除早期回合），工作记忆超长 spill（摘要 + 文件地址索引），子 Agent 按子会话隔离工具结果地址索引。
-- **本地知识库（RAG）**：自己收录的攻略语料（粘贴文本 / 上传文件 / 抓取网址三种入库方式）切块后用 `text-embedding-v4` 向量化存进 pgvector，检索按余弦相似度取 top-k。攻略页插图先转成文字描述再入库——知识库是文本语义检索，图片不转成文字就搜不到。知识库优先于通用查询工具：它记的是 POI 接口给不出的细节（具体店名、营业时间、避坑经验）。
+- **本地知识库（RAG）**：自己收录的攻略语料（粘贴文本 / 上传文件 / 抓取网址三种入库方式）切块后用 `text-embedding-v4` 向量化存进 pgvector，检索按余弦相似度取 top-k。攻略页插图先转成文字描述再入库（知识库是文本语义检索，图片不转成文字就搜不到），**原图同时存进 Supabase Storage**，检索命中时随工具结果一起下发，对话里直接渲染成缩略图、点击可放大。知识库优先于通用查询工具：它记的是 POI 接口给不出的细节（具体店名、营业时间、避坑经验）。
 - **长结果地址索引 + 历史会话压缩**：工具结果超阈值时完整结果写临时文件，模型用 `read_file`/`grep` 按需读回；历史会话按 running summary 压缩——一个会话的短期记忆 = 累积摘要 + 最近几轮原文 + 完整历史文件，上下文到阈值才触发，早期答案压成摘要、最近几轮保留原文，跨轮引用靠 `read_file` 读回，既避免截断丢信息，也避免模型凭标题编造细节。
 - **记忆查看**：输入框旁「记忆」入口，弹窗内 tab 切换长期偏好与当前会话的短期记忆（摘要 + 最近几轮对话）。
 - **SSE 流式对话**：逐字输出答案，实时展示工具调用进度；完整回复在流式输出前已落库，刷新后自动恢复会话与历史。
@@ -22,7 +22,7 @@
 |---|-----------------------------------------------------------------------------------------|
 | 后端 | Python 3.11+ · FastAPI · LangGraph · langchain · pydantic-settings · openai SDK · mcp · sse-starlette · asyncpg · PyJWT · tiktoken |
 | 前端 | Vue 3 · Vite · TypeScript · Element Plus · Pinia · supabase-js · marked + DOMPurify      |
-| 存储 / 身份 | 自托管 Supabase（Postgres + pgvector + GoTrue），5 张业务表全开 RLS                    |
+| 存储 / 身份 | 自托管 Supabase（Postgres + pgvector + Storage + GoTrue），6 张业务表全开 RLS          |
 | 抓取 | Playwright（跑完 JS 再取 DOM）+ trafilatura（提取正文）                                    |
 | LLM | 阿里云百炼 DashScope（`qwen3.7-plus`，OpenAI 兼容协议）                                 |
 | 部署 | Docker + docker-compose · nginx                                                         |
@@ -36,6 +36,7 @@ my-agent/
 │   │   ├── api/routes/        # 路由：SSE 对话 + 会话 + 记忆 + 知识库
 │   │   ├── core/              # 核心：agent(ReAct 图)/llm/critic/registry/db(连接池+RLS)/auth(JWT)/prompts/skills
 │   │   │                      #   memory(三层记忆)/knowledge(RAG)/ingest(抓取)/vision(插图转文字)/embedding/logging
+│   │   │                      #   storage(对象存储)/files(会话文件)/sandbox(沙箱)/skill_scripts(脚本)
 │   │   ├── datasource/        # 数据源：MCP（12306/机票）+ HTTP（高德/UAPIS/Tavily）
 │   │   ├── models/            # Pydantic 请求模型
 │   │   ├── prompts/           # 提示词 .md（system/grounding/critic）
@@ -73,12 +74,19 @@ sh ./utils/generate-keys.sh     # 生成 JWT_SECRET / ANON_KEY / SERVICE_ROLE_KE
 docker compose up -d            # 起完整栈，Kong 网关默认 8000 端口
 ```
 
-拿到 `docker/.env` 里的 `JWT_SECRET` 与 `ANON_KEY`，并在 Studio（Kong 的 `/`）里建两个库：
+拿到 `docker/.env` 里的 `JWT_SECRET` 与 `ANON_KEY`，然后在 Studio（Kong 的 `/`）里建库：
 
-- 主库 `postgres` 的 `public` schema：先 `create extension vector`（pgvector，`documents` 与 `long_term_memory` 的向量列都依赖它），再建 5 张业务表（`conversations` / `messages` / `short_term_memory` / `long_term_memory` / `documents`）+ 各自的 RLS 策略 + 两个向量检索函数（`match_documents` / `match_long_term`）。
-- 测试库 `agent_test`：建最小 `auth` 桩（`auth.users(id uuid primary key)` + `auth.uid()`）后套同样的 DDL，用于跑 pytest。
+- **主库 `postgres`**：跑 `deploy/schema.sql`——建 `extensions` schema 与 `vector` 扩展（`documents` 与 `long_term_memory` 的向量列依赖它，这里是幂等兜底），再建 6 张业务表（`conversations` / `messages` / `short_term_memory` / `long_term_memory` / `documents` / `files`）+ 各自的 RLS 策略 + 两个向量检索函数（`match_documents` / `match_long_term`）。表用 `if not exists`、策略先 drop 再建、函数 `create or replace`，可反复执行：
 
-> 这套 DDL 与策略就是 `backend/tests/conftest.py` 里的 `AUTH_STUB_SQL` / `BUSINESS_SQL`（测试库由它自动建）。主库按同一份语句在 Studio 里执行即可。
+  ```sh
+  psql "$SUPABASE_DATABASE_URL" -f deploy/schema.sql
+  ```
+
+  > 重跑**不会给老库加列**（`create table if not exists` 对已存在的表不生效），加了列的版本要删表重建。
+
+- **测试库 `agent_test`**：不用手工建，`backend/tests/conftest.py` 跑 pytest 时自动建（`AUTH_STUB_SQL` 造 `auth.users` 与 `auth.uid()` 桩，`BUSINESS_SQL` 是主库那份结构）。
+
+再建两个**私有**桶 `files` 与 `knowledge`，然后跑 `deploy/storage.sql` 建 `storage.objects` 上的策略。**这一步必须等 Supabase 起过一次之后再做**——`storage` schema 与 `storage.foldername()` 由 storage-api 首次启动时自建，在那之前这个文件跑不了。
 
 ### 本地开发
 

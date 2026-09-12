@@ -1,6 +1,6 @@
 # 数据库结构
 
-后端持久化 = 自托管 Supabase 的 Postgres（5 张业务表，**全开 RLS**）+ 向量检索（pgvector，`extensions` schema 的 `vector` 扩展）+ 文件存储（`result_dir`，地址索引）。
+后端持久化 = 自托管 Supabase 的 Postgres（6 张业务表，**全开 RLS**）+ 向量检索（pgvector，`extensions` schema 的 `vector` 扩展）+ 文件存储（工具结果的 spill 落本地 `result_dir`；会话文件与知识库图片的**字节**在 Supabase Storage，元数据仍在这套表里）。
 
 身份（`auth.users`）由 Supabase Auth / GoTrue 管理；业务表用外键指向它，`on delete cascade` 随用户删除级联清理。
 
@@ -24,7 +24,7 @@ select set_config('role', 'authenticated', true);
 
 > **改动表结构直接重建，不写迁移**（开发阶段约定）：`tests/conftest.py` 里 `long_term_memory` 用 `drop table if exists` 而非 `if not exists`，就是为了让测试库结构与 DDL 永远一致。主库同样按最新 DDL 重建即可。
 
-## 表结构（5 张业务表）
+## 表结构（6 张业务表）
 
 ### conversations（会话元信息）
 
@@ -67,8 +67,20 @@ select set_config('role', 'authenticated', true);
   "label": "搜菜谱做法",             // 中文动作短语
   "status": true,                   // 是否执行完成
   "result": "截断版结果",             // 工具结果截断版（前端气泡展开）
-  "tool_call_id": "call_xxx"        // 工具调用 id（前端还原工具气泡配对）
+  "tool_call_id": "call_xxx",       // 工具调用 id（前端还原工具气泡配对）
+  "artifacts": [StoredFile, ...],   // 脚本产物清单（可选）
+  "images": [KnowledgeImage, ...]   // 知识库图片清单（可选）
 }
+```
+
+后两个字段与「工具产物」相关，都属于**不落库就会静默失效**的那类：刷新一次，气泡下方的下载卡片或缩略图就没了。两者的结构：
+
+```json
+// StoredFile：脚本产物 / 上传件，可下载（字节在 Storage）
+{"file_id": "uuid", "name": "结果.xlsx", "size": 20480}
+
+// KnowledgeImage：知识库图片，只渲染缩略图（key 为 null 表示上传失败，前端显示占位）
+{"key": "a1b2c3d4e5f60718/9f8e.../0.jpg", "desc": "西湖断桥"}
 ```
 
 ### long_term_memory（长期记忆，跨会话偏好）
@@ -114,17 +126,40 @@ select set_config('role', 'authenticated', true);
 | `chunk_index` | int | 块在原文中的序号 |
 | `embedding` | vector(1024) **NOT NULL** | 检索向量，写入时必填 |
 | `source_url` | text | **文档唯一标识**，同一来源的所有块用它聚合/整篇删除 |
+| `images` | jsonb | 该块的图片清单 `[{"key": …, "desc": …}]`；`key` 是 `knowledge` 桶里的对象 key，上传失败写 `null` |
 | `created_at` | timestamptz DEFAULT now() | 入库时间 |
 
 索引：`documents_embedding_idx`（hnsw，`vector_cosine_ops`）。
+
+- `images` 挂在 **chunk 级**而非文档级：图片由正文里的占位符按起始偏移归属到某一块，同一块被检索命中时图就跟着出来，不必再回表找文档。
+- **新行一律写数组，`NULL` 专属旧行**——区分「历史上没这一列」与「这篇确实没图」。无 `source_url` 的入库（粘贴文本 / 上传文件）一条 `images` 都不写。
 
 - 知识库与长期记忆分成两张表，而非一张表加 `source_type` 列：两者隔离策略根本不同（`documents` 是 `using(true)` 全局共享，长期记忆是 `user_id = auth.uid()`），共用会让策略退化成按类型分支。
 - `embedding` 与长期记忆**相反**是 NOT NULL：知识库没向量就检索不到，embed 失败直接抛给调用方；长期记忆失败只是少一条排序依据，故降级为 NULL。
 - 无 `update` 策略与授权：文档不可改，要改就删了重传（重新上传即新增一批块）。
 
+### files（会话文件元数据，字节在 Storage）
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `id` | text PRIMARY KEY | `file_id`（uuid4），目录键 + 前端下载凭证 |
+| `user_id` | uuid NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE | 所属用户 |
+| `conversation_id` | text NOT NULL REFERENCES conversations(id) ON DELETE CASCADE | 所属会话 |
+| `name` | text NOT NULL | 原始文件名（净化后），`Content-Disposition` 用它 |
+| `size` | bigint NOT NULL | 字节数 |
+| `source` | text NOT NULL DEFAULT 'upload' | `upload` 或 `script:<skill>/<script>` |
+| `storage_path` | text NOT NULL | `files` 桶里的对象 key，布局同 `<user_id>/<conversation_id>/<file_id>/original.<ext>` |
+| `created_at` | timestamptz DEFAULT now() | 上传时间 |
+
+索引：`files_conv_idx(conversation_id, created_at desc)`。
+
+- 本表只管元数据，字节在 Storage 的 `files` 桶。**`storage_path` 与对象 key 同值**，不另设映射——两个名字对不上时排错要先猜哪个是真。
+- 上传件与脚本产物共用本表（靠 `source` 区分），走同一套下载链路。
+- 写序是**先 put 后 insert，行是提交点**：insert 失败就补偿删掉刚写的对象，避免留下无人引用的字节。
+
 ## RLS 策略
 
-五张表全部 `enable row level security`。前四张各一条 `for all to authenticated` 策略（`using` 管读/改/删，`with check` 管写）；`documents` 是共享语料，按操作拆成读/写/删三条：
+六张表全部 `enable row level security`。除 `documents` 外的**五张**各一条 `for all to authenticated` 策略（`using` 管读/改/删，`with check` 管写）；`documents` 是共享语料，按操作拆成读/写/删三条：
 
 | 表 | 策略名 | 判定条件 |
 |---|---|---|
@@ -132,11 +167,13 @@ select set_config('role', 'authenticated', true);
 | `long_term_memory` | `ltm_own` | `user_id = auth.uid()` |
 | `messages` | `msg_own` | `exists (… conversations c where c.id = messages.conv_id and c.user_id = auth.uid())` |
 | `short_term_memory` | `stm_own` | `exists (… conversations c where c.id = short_term_memory.conversation_id and c.user_id = auth.uid())` |
+| `files` | `files_own` | `user_id = auth.uid()` |
 | `documents` | `doc_read` / `doc_write` / `doc_delete` | `true`（`for select` / `for insert` / `for delete`，**全局共享，不按 user 隔离**） |
 
 要点：
 
 - `documents` 是唯一全局共享的表——知识库定位就是共享语料，读都 `using(true)` 了，删再按人拦住没意义。没有 `for update` 策略：文档不可改。不按 user 隔离不等于不设防，读写照样走 `rls_conn`（不切角色策略压根不执行）。
+- `files` 自带 `user_id`，与 `conv_own` 同构，不必经 `conversations` 绕一道。
 - 后两张表没有 `user_id` 列，归属经 `conversations` 间接判定；子查询里的 `conversations` 会再套用 `conv_own`，范围自动收窄到本人会话。
 - 条件里的列名必须限定成 `messages.conv_id` / `short_term_memory.conversation_id`，否则与外层同名时会歧义。
 - `auth.uid()` 从 `request.jwt.claims ->> 'sub'` 读当前用户（Supabase 原生实现，测试库用同构的桩替代）。
@@ -150,6 +187,7 @@ grant usage on schema extensions to authenticated;
 grant select, insert, update, delete on
     conversations, messages, short_term_memory, long_term_memory to authenticated;
 grant select, insert, delete on documents to authenticated;
+grant select, insert, delete on files to authenticated;
 grant usage, select on sequence
     messages_id_seq, short_term_memory_id_seq, long_term_memory_id_seq, documents_id_seq
     to authenticated;
@@ -164,7 +202,7 @@ grant usage, select on sequence
 | `match_documents` | `query_embedding vector(1024)`, `match_count int default 3` | 知识库检索，按余弦距离取 top-k，返回 `id/title/content/source_url/similarity` |
 | `match_long_term` | `query_embedding vector(1024)`, `match_user_id uuid`, `match_count int default 20` | 长期记忆检索，比前者多一道 `user_id` 过滤（显式过滤 + invoker 下的 RLS 是双保险），并排除 `embedding is null` 的历史条目 |
 
-> **删会话即级联**：`delete from conversations where id = …` 一条语句就带走 `messages` 与 `short_term_memory`（外键 `on delete cascade`），无需分开清理。`documents` 不挂外键，它不属于任何会话，删会话不影响知识库。
+> **删会话即级联**：`delete from conversations where id = …` 一条语句就带走 `messages`、`short_term_memory` 与 `files`（外键 `on delete cascade`），无需分开清理。但 `files` **只是元数据行**——它对应的 Storage 对象不在级联范围内（不在同一个库、也没有外键可挂），所以删会话那条路径上必须先 `delete_prefix` 删对象、再删行。`documents` 不挂外键，它不属于任何会话，删会话不影响知识库。
 
 ## 非表存储（文件）
 
@@ -180,6 +218,10 @@ grant usage, select on sequence
 ### 对象存储（Supabase Storage）
 
 知识库图片与会话文件的**字节**存这里，元数据仍在 Postgres。桶与 `storage.objects` 的策略写在 `deploy/storage.sql`，**必须等 storage-api 首次健康启动之后执行**——它自己建 storage schema 与 `storage.foldername()`。
+
+> **两个 URL 不是一回事**：后端用 `SUPABASE_URL` 走**内网网关**（后端进程与 Supabase 同网）；浏览器侧另有一个 `SUPABASE_PUBLIC_URL`（在 Supabase 自己的 `docker/.env` 里），前端拿它配 `VITE_SUPABASE_URL` 直连 GoTrue 登录。后端若误填公网地址，storage 链路会跟着出口网络一起抖。
+
+> **用户注销后 `files` 行随 `on delete cascade` 消失，`storage.objects` 里会留孤儿对象**：storage 与 public 是两个 schema、两套表，外键跨不过去。清理孤儿需要一个持 `service_role` 的定时任务（后端自签的 JWT 只能删 `auth.uid()` 名下的对象，而用户已经不在了）。当前没有这样的任务，孤儿随用户注销产生。
 
 | 桶 | 用途 | key 约定 | 隔离 |
 |---|---|---|---|
