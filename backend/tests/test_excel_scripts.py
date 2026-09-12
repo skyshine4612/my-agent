@@ -1,6 +1,7 @@
 # Excel skill 脚本单测：只测纯函数，不碰 openpyxl
 # （脚本把 openpyxl 延迟到 main() 里 import，宿主不装它也能跑这些用例）。
 import importlib.util
+import os
 from pathlib import Path
 
 import pytest
@@ -86,6 +87,13 @@ def test_unknown_rule_error():
 def test_empty_ops_rejected():
     with pytest.raises(ValueError, match="ops 不能为空"):
         load("desensitize").apply_rules(HEADER, ROWS, [])
+
+
+def test_resolve_does_not_truncate_long_file_id():
+    # file_id 加扩展名有 37 字符，越过 SAMPLE_CHARS=32：拿样本值那套截断去处理路径就找不着文件
+    fid = "c095ac351c9b4205875e488782e521c1.xlsx"
+    # 用 os.path.join 拼期望值：沙箱是 Linux，但这条断言跑在 Windows（分隔符不同）
+    assert load("inspect")._resolve({"file_id": fid}, "/tmp/w") == os.path.join("/tmp/w", fid)
 
 
 def test_summarize_sheet_reads_columns_and_samples():

@@ -22,6 +22,9 @@ dist/
 # 工具结果地址索引的临时文件（本轮用完即删）
 results/
 
+# 会话文件目录（上传件与脚本产物，跟随会话生命周期）
+files/
+
 # 测试与缓存
 .pytest_cache/
 .mypy_cache/

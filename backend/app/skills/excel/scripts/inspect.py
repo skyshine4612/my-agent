@@ -22,9 +22,18 @@ def _text(value):
     return f"{s[:SAMPLE_CHARS]}…" if len(s) > SAMPLE_CHARS else s
 
 
+def _raw(value):
+    """参数用字符串：只去空白。
+
+    **不能走 _text**：那个带 SAMPLE_CHARS 显示截断，而 file_id 加扩展名有 37 字符，
+    截一刀就变成另一个不存在的文件名。
+    """
+    return "" if value is None else str(value).strip()
+
+
 def _resolve(args, work_dir):
-    """定位输入文件：后端已把 file_id 换成沙箱内绝对路径，这里兼容直接给裸文件名的情况。"""
-    ref = _text(args.get("file_id"))
+    """定位输入文件：后端给的是沙箱内本次执行的 work_dir 下的文件名，这里兼容绝对路径。"""
+    ref = _raw(args.get("file_id"))
     if not ref:
         raise SystemExit("缺少 file_id：把会话文件清单里的 file_id 原样填进来")
     return ref if os.path.isabs(ref) else os.path.join(work_dir, os.path.basename(ref))

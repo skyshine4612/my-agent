@@ -62,9 +62,10 @@ async def test_substitutes_file_id_and_sends_bytes(env):
     r = await tool.ainvoke({"skill": "excel", "script": "desensitize",
                             "params": {"file_id": saved["file_id"], "ops": [{"column": "联系电话"}]}})
     call = sandbox.calls[0]
-    assert call["args"]["file_id"] == f"/tmp/work/{saved['file_id']}"
+    # 参数里只给文件名（带原扩展名）：真正的落点是沙箱本次执行的 work_dir，由脚本按 work_dir 定位
+    assert call["args"]["file_id"] == f"{saved['file_id']}.xlsx"
     assert call["args"]["ops"] == [{"column": "联系电话"}]     # 嵌套结构里非 file_id 的值原样保留
-    assert call["files"][0]["name"] == saved["file_id"]
+    assert call["files"][0]["name"] == f"{saved['file_id']}.xlsx"
     assert base64.b64decode(call["files"][0]["data"]) == b"PK\x03\x04"
     assert call["script"] == "print('hi')"                    # 源码来自白名单文件，不是模型
     assert r["ok"] is True and r["output"] == "done"
