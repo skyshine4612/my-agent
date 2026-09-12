@@ -24,11 +24,13 @@ from app.core.memory.working import WorkingMemory
 
 logger = logging.getLogger(__name__)
 
-# 非查询结果工具：返回「读回片段/规则正文/委派摘要/脚本结论与产物清单」而非「查询结果」。
+# 非查询结果工具：返回「读回片段/规则正文/委派摘要/脚本结论与产物清单/文件清单」而非「查询结果」。
 # 它们的返回原样回填窗口（不结构化截断），也不触发地址索引（不写文件）——
 # 否则 read_file 读回的片段又被截断/写文件，会形成 read→截断/spill→read 的循环；
-# run_skill_script 则会把产物清单截掉、把「可下载」变成「读一段文本」。
-NON_QUERY_TOOLS = {"read_file", "grep", "get_skill", "call_sub_agent", "run_skill_script"}
+# run_skill_script 则会把产物清单截掉、把「可下载」变成「读一段文本」；
+# list_uploaded_files 被截断就等于只报了前几个文件，后面的一律「查不到」。
+NON_QUERY_TOOLS = {"read_file", "grep", "get_skill", "call_sub_agent", "run_skill_script",
+                   "list_uploaded_files"}
 
 # 硬数据工具集合：这些工具返回的是「事实性」数据（车次/航班/天气/节假日），最容易被 LLM 编造或扭曲，
 # 只有本轮调用了它们才触发 critic 回路（省成本，仅在硬数据场景做事实校验）。

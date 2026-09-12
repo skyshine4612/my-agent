@@ -89,11 +89,27 @@ def test_empty_ops_rejected():
         load("desensitize").apply_rules(HEADER, ROWS, [])
 
 
-def test_resolve_does_not_truncate_long_file_id():
-    # file_id 加扩展名有 37 字符，越过 SAMPLE_CHARS=32：拿样本值那套截断去处理路径就找不着文件
-    fid = "c095ac351c9b4205875e488782e521c1.xlsx"
+def test_resolve_does_not_truncate_long_name():
+    # 长中文名越过 SAMPLE_CHARS=32：拿样本值那套截断去处理路径就会找一个不存在的文件
+    name = "2026年第三季度华东区销售明细汇总表（含税、已审核版）.xlsx"
+    assert len(name) > 32
     # 用 os.path.join 拼期望值：沙箱是 Linux，但这条断言跑在 Windows（分隔符不同）
-    assert load("inspect")._resolve({"file_id": fid}, "/tmp/w") == os.path.join("/tmp/w", fid)
+    assert load("inspect")._resolve({"file": name}, "/tmp/w") == os.path.join("/tmp/w", name)
+
+
+def test_resolve_keeps_lookups_inside_work_dir():
+    """绝对路径与 ../ 都被 basename 压回 work_dir：名字只用于查表，不参与路径拼接。"""
+    for script in ("inspect", "desensitize"):
+        assert load(script)._resolve({"file": "/etc/passwd"}, "/tmp/w") == os.path.join("/tmp/w", "passwd")
+        assert load(script)._resolve({"file": "../../x.xlsx"}, "/tmp/w") == os.path.join("/tmp/w", "x.xlsx")
+
+
+def test_resolve_lists_available_files_when_missing(tmp_path):
+    """名字对不上时把 work_dir 里实际有什么回给模型，让它一轮自纠，而不是反复填同一个错名字。"""
+    (tmp_path / "测试数据.xlsx").write_bytes(b"x")
+    for script in ("inspect", "desensitize"):
+        with pytest.raises(SystemExit, match="本次可用：测试数据.xlsx"):
+            load(script)._resolve({}, str(tmp_path))
 
 
 def test_summarize_sheet_reads_columns_and_samples():

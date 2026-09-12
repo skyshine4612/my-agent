@@ -151,7 +151,7 @@ async def test_chat_stream_records_attachments_on_user_message(user_id):
 async def test_chat_stream_writes_attachments_into_short_term_memory(user_id):
     """附件折进短期记忆的 user 行：下一轮追问「我上次传的那个」时模型才有事实可依。
 
-    system prompt 的「本轮上传件」块随轮次重建，下一轮就读不到了；附件元数据留在短期记忆里，
+    这一行与当轮喂给模型的 user 正文是同一份文本（同一个 render_user_message），
     跨轮指代才不用去会话清单里猜。
     """
     svc = AgentService()
@@ -168,12 +168,11 @@ async def test_chat_stream_writes_attachments_into_short_term_memory(user_id):
 
     records = await svc.short_term_memory.get_records(user_id, conv_id)
     assert records[0]["role"] == "user"
-    assert records[0]["content"].startswith("帮我把excel文件做下脱敏\n[本条消息携带的文件]\n")
-    assert "file_id: f1" in records[0]["content"]
-    assert "大文件.xlsx" in records[0]["content"]
+    assert records[0]["content"] == ("帮我把excel文件做下脱敏\n[本条消息携带的文件]\n"
+                                     "- 大文件.xlsx  5.5MB")
     # 关键：下一轮组装出的历史里必须还带着它——这才是「跨轮指代有事实可依」的实测口径
     history, _ = await svc.memory.assemble_history(user_id, conv_id)
-    assert "file_id: f1" in history[0]["content"]
+    assert "大文件.xlsx" in history[0]["content"]
 
 
 @pytest.mark.asyncio
@@ -194,6 +193,46 @@ async def test_chat_stream_without_files_keeps_user_message_plain(user_id):
     # 短期记忆同样原样，别把「无附件」也渲染成一块空壳
     records = await svc.short_term_memory.get_records(user_id, conv_id)
     assert records[0]["content"] == "成都三日游"
+
+
+class CapturingStreamLLM:
+    """记录每次调用看到的 messages，供断言「模型实际收到的是什么」。"""
+
+    def __init__(self):
+        self.calls = []
+
+    async def stream_chat(self, messages, tools=None):
+        self.calls.append(messages)
+        yield {"type": "content", "text": "好的"}
+        yield {"type": "end", "tool_calls": None}
+
+
+@pytest.mark.asyncio
+async def test_attachment_block_is_identical_in_model_input_and_memory(user_id):
+    """本轮喂给模型的 user 正文与写进短期记忆的 user 行是同一份文本。
+
+    两处各渲一次就可能漂移：模型这一轮看到的名字与它下一轮在记忆里看到的对不上，
+    追问「刚才那个文件」时就会去找一个不存在的名字。
+    """
+    svc = AgentService()
+    llm = CapturingStreamLLM()
+    svc.chat_model = EventScriptChatModel(llm=llm)
+
+    async def noop(user_id, conv_id):
+        pass
+
+    svc.memory.extract_facts = noop
+
+    expected = "帮我把excel文件做下脱敏\n[本条消息携带的文件]\n- 大文件.xlsx  5.5MB"
+    files = [{"file_id": "f1", "name": "大文件.xlsx", "size": 5748559}]
+    events = [e async for e in svc.chat_stream(user_id, None, "帮我把excel文件做下脱敏", files=files)]
+    conv_id = next(e["conversation_id"] for e in events if e["type"] == "conversation_id")
+
+    seen_user = [m for m in llm.calls[0] if m.get("role") == "user"]
+    assert seen_user[-1]["content"] == expected
+
+    records = await svc.short_term_memory.get_records(user_id, conv_id)
+    assert records[0]["content"] == expected
 
 
 @pytest.mark.asyncio

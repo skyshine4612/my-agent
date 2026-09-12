@@ -1,5 +1,5 @@
 # run_skill_script 工具测试：假沙箱客户端（记录调用参数）+ 真 FileStore(tmp_path) + 临时脚本目录。
-# 重点验证三件静默出错的事：白名单组合校验、file_id 替换只认已知值、产物写回带对的 source。
+# 重点验证三件静默出错的事：白名单组合校验、文件引用只认本会话文件名、产物写回带对的 source。
 import base64
 
 import pytest
@@ -54,54 +54,83 @@ async def test_enum_blocks_names_outside_whitelist(env):
         await tool.ainvoke({"skill": "excel", "script": "rm_rf", "params": {}})
 
 
-async def test_substitutes_file_id_and_sends_bytes(env):
+async def test_resolves_name_and_sends_bytes(env):
     store, scripts = env
-    saved = await store.save("u1", "c1", "a.xlsx", b"PK\x03\x04")
+    await store.save("u1", "c1", "a.xlsx", b"PK\x03\x04")
     sandbox = _FakeSandbox()
     tool = make_run_skill_script(sandbox, store, scripts)
     r = await tool.ainvoke({"skill": "excel", "script": "desensitize",
-                            "params": {"file_id": saved["file_id"], "ops": [{"column": "联系电话"}]}})
+                            "params": {"file": "a.xlsx", "ops": [{"column": "联系电话"}]}})
     call = sandbox.calls[0]
-    # 参数里只给文件名（带原扩展名）：真正的落点是沙箱本次执行的 work_dir，由脚本按 work_dir 定位
-    assert call["args"]["file_id"] == f"{saved['file_id']}.xlsx"
-    assert call["args"]["ops"] == [{"column": "联系电话"}]     # 嵌套结构里非 file_id 的值原样保留
-    assert call["files"][0]["name"] == f"{saved['file_id']}.xlsx"
+    # 参数原样透传（清单里的名字就是沙箱 work_dir 里的名字），字节另走 files 通道
+    assert call["args"]["file"] == "a.xlsx"
+    assert call["args"]["ops"] == [{"column": "联系电话"}]     # 嵌套结构里非文件名的值原样保留
+    assert call["files"][0]["name"] == "a.xlsx"
     assert base64.b64decode(call["files"][0]["data"]) == b"PK\x03\x04"
     assert call["script"] == "print('hi')"                    # 源码来自白名单文件，不是模型
     assert r["ok"] is True and r["output"] == "done"
 
 
-async def test_unknown_file_id_passes_through_untouched(env):
+async def test_unknown_name_passes_through_untouched(env):
     store, scripts = env
     sandbox = _FakeSandbox()
     tool = make_run_skill_script(sandbox, store, scripts)
+    # 不在本会话清单里的值原样透传：路径穿越串也走这条路，由脚本 basename 后 open 失败兜住
     await tool.ainvoke({"skill": "excel", "script": "desensitize",
-                        "params": {"file_id": "../../etc/passwd"}})
-    assert sandbox.calls[0]["args"]["file_id"] == "../../etc/passwd"
+                        "params": {"file": "../../etc/passwd"}})
+    assert sandbox.calls[0]["args"]["file"] == "../../etc/passwd"
     assert sandbox.calls[0]["files"] == []
 
 
-async def test_other_users_file_id_is_not_readable(env):
+async def test_file_id_shape_is_not_resolved(env):
+    """别名已去掉：照抄工具结果里的 uuid 不会被解析成文件，而是原样传下去撞壁、再靠脚本自纠。"""
+    store, scripts = env
+    saved = await store.save("u1", "c1", "a.xlsx", b"x")
+    sandbox = _FakeSandbox()
+    tool = make_run_skill_script(sandbox, store, scripts)
+    await tool.ainvoke({"skill": "excel", "script": "desensitize", "params": {"file": saved["file_id"]}})
+    assert sandbox.calls[0]["files"] == []
+    assert sandbox.calls[0]["args"]["file"] == saved["file_id"]
+
+
+async def test_name_equal_to_an_artifact_is_not_rewritten(env):
+    """值恰好等于某个产物名时不再被改装。
+
+    旧设计「命中就把 file_id 拼上扩展名」会把 out_name="已脱敏.xlsx" 改成 "已脱敏.xlsx.xlsx"。
+    """
+    store, scripts = env
+    await store.save("u1", "c1", "已脱敏.xlsx", b"x", source="script:excel/desensitize")
+    sandbox = _FakeSandbox()
+    tool = make_run_skill_script(sandbox, store, scripts)
+    r = await tool.ainvoke({"skill": "excel", "script": "desensitize",
+                            "params": {"file": "已脱敏.xlsx", "out_name": "已脱敏.xlsx"}})
+    assert sandbox.calls[0]["args"]["out_name"] == "已脱敏.xlsx"
+    assert sandbox.calls[0]["args"]["file"] == "已脱敏.xlsx"
+    assert [f["name"] for f in sandbox.calls[0]["files"]] == ["已脱敏.xlsx"]   # 同名只收一次
+    assert r["ok"] is True
+
+
+async def test_other_users_file_is_not_readable(env):
     store, scripts = env
     sandbox = _FakeSandbox()
     tool = make_run_skill_script(sandbox, store, scripts)
-    # 换一个用户执行：拿到别人的 file_id 也读不出字节——它不在本用户的清单里，于是按「非已知值」原样透传
-    saved = await store.save("u1", "c1", "a.xlsx", b"x")
+    # 换一个用户执行：同名文件不在本用户的清单里，于是原样透传、不给字节
+    await store.save("u1", "c1", "a.xlsx", b"x")
     current_user_id.set("u2")
-    await tool.ainvoke({"skill": "excel", "script": "desensitize", "params": {"file_id": saved["file_id"]}})
+    await tool.ainvoke({"skill": "excel", "script": "desensitize", "params": {"file": "a.xlsx"}})
     assert sandbox.calls[0]["files"] == []
-    assert sandbox.calls[0]["args"]["file_id"] == saved["file_id"]
+    assert sandbox.calls[0]["args"]["file"] == "a.xlsx"
 
 
 async def test_artifacts_are_saved_back(env):
     store, scripts = env
-    src = await store.save("u1", "c1", "a.xlsx", b"x")
+    await store.save("u1", "c1", "a.xlsx", b"x")
     sandbox = _FakeSandbox({"exit_code": 0, "stdout": "ok", "stderr": "",
                             "artifacts": [{"name": "已脱敏.xlsx",
                                            "data": base64.b64encode(b"out").decode()}],
                             "duration_ms": 1})
     tool = make_run_skill_script(sandbox, store, scripts)
-    r = await tool.ainvoke({"skill": "excel", "script": "desensitize", "params": {"file_id": src["file_id"]}})
+    r = await tool.ainvoke({"skill": "excel", "script": "desensitize", "params": {"file": "a.xlsx"}})
     art = r["artifacts"][0]
     assert art["name"] == "已脱敏.xlsx"
     got = await store.read("u1", "c1", art["file_id"])

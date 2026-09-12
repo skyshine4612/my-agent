@@ -107,12 +107,27 @@ def apply_rules(header, rows, ops, salt=""):
     return [header[i] for i in keep], new_rows, keep
 
 
+def _work_files(work_dir):
+    """本次执行 work_dir 里实际有哪些文件——模型填的名字对不上时用它自纠。
+
+    这里只有后端为本轮塞进来的输入件，不含跨用户信息，可以放心回给模型。
+    """
+    try:
+        return "、".join(sorted(os.listdir(work_dir))) or "空"
+    except OSError:
+        return "读不到"
+
+
 def _resolve(args, work_dir):
-    """定位输入文件：后端已把 file_id 换成沙箱内绝对路径，这里兼容直接给裸文件名的情况。"""
-    ref = _text(args.get("file_id"))
+    """定位输入文件：后端给的是本次执行 work_dir 下的裸文件名。
+
+    **不做绝对路径分支**：那正是路径穿越的入口（模型填 `/etc/passwd` 就会被原样打开）。
+    统一 basename 后拼进 work_dir，落点必然在本次执行目录内。
+    """
+    ref = _text(args.get("file"))
     if not ref:
-        raise SystemExit("缺少 file_id：把会话文件清单里的 file_id 原样填进来")
-    return ref if os.path.isabs(ref) else os.path.join(work_dir, os.path.basename(ref))
+        raise SystemExit(f"缺少 file：把会话文件清单里的文件名原样填进来（本次可用：{_work_files(work_dir)}）")
+    return os.path.join(work_dir, os.path.basename(ref))
 
 
 def _safe_name(name):
@@ -129,7 +144,8 @@ def main():
 
     path = _resolve(args, work_dir)
     if not os.path.exists(path):
-        raise SystemExit(f"读不到文件：{path}")
+        # 列出实际有哪些：模型按清单填了名字却对不上时（比如把 file_id 当名字填进来），一轮就能自纠
+        raise SystemExit(f"读不到文件：{os.path.basename(path)}（本次可用：{_work_files(work_dir)}）")
 
     # 不用 read_only：写回时要保留原有样式、列宽与合并单元格
     wb = load_workbook(path)

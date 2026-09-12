@@ -52,33 +52,30 @@ def _format_size(size: int) -> str:
     return f"{size / 1048576:.1f}MB" if size >= 1048576 else f"{size / 1024:.1f}KB"
 
 
-def render_file_directory(files: list[dict]) -> str:
-    """把会话文件清单渲染成「本会话可用文件」块：file_id + 名称 + 大小 + 来源标注。
+def render_file_directory(entries: dict[str, dict]) -> str:
+    """把会话文件清单渲染成「名称 + 大小 + 来源标注」的列表文本，供 list_uploaded_files 返回。
 
-    来源标注是必要的——模型得知道哪个是用户给的、哪个是自己刚生成的；只列近 10 个由调用方限制。
-    同名只留最新的一条：同名即同一个文件的重复投递，堆在清单里会把真文件挤出模型能看到的窗口。
+    入参是「文件名 → 条目」的映射（`FileStore.list_by_name`），不是文件列表：同名只留最新这条
+    规则在那一个地方收口，这里不再自己判重 —— 清单里出现的名字，必须就是模型报回来时能解析到
+    的那个文件，两处各去一次重就可能对不上。
+
+    来源标注是必要的——模型得知道哪个是用户给的、哪个是自己刚生成的。
     """
     lines = []
-    seen: set[str] = set()
-    for f in files:
-        name = f["name"]
-        if name in seen:
-            continue
-        seen.add(name)
+    for name, f in entries.items():
         source = f.get("source", "upload")
         note = "" if source == "upload" else f"（由 {source.removeprefix('script:')} 生成）"
-        lines.append(f"- file_id: {f['file_id']}  名称: {name}  {_format_size(f['size'])}{note}")
+        lines.append(f"- {name}  {_format_size(f['size'])}{note}")
     return "\n".join(lines)
 
 
 def render_turn_files(files: list[dict]) -> str:
-    """把本轮用户随消息上传的文件渲染成「本轮用户上传的文件」块。
+    """把本条消息携带的文件渲染成「本条消息携带的文件」块。
 
     单独成块而非混进会话清单：本轮要处理谁必须是**事实**，不能让模型从整会话清单里猜。
     清单是历史（含脚本产物），只在用户点名「上一个 / 之前那个」时才用。
     """
-    return "\n".join(f"- file_id: {f['file_id']}  名称: {f['name']}  {_format_size(f.get('size', 0))}"
-                     for f in files)
+    return "\n".join(f"- {f['name']}  {_format_size(f.get('size', 0))}" for f in files)
 
 
 def render_user_message(message: str, files: list[dict]) -> str:
@@ -93,17 +90,17 @@ def render_user_message(message: str, files: list[dict]) -> str:
 
 
 def render_system_prompt(skill_directory: str, tool_grounding: str,
-                         today: str = "", long_term_hint: str = "",
-                         file_directory: str = "", turn_files: str = "") -> str:
-    """把可用业务清单、事实规范、日期、用户偏好、本轮上传件与会话文件清单填进 system.md 的插槽。
+                         today: str = "", long_term_hint: str = "") -> str:
+    """把可用业务清单、事实规范、日期与用户偏好填进 system.md 的插槽。
 
     参数：
         skill_directory: 可用业务清单文本（每业务一行 name + description），来自各 skill 的 frontmatter
         tool_grounding:  事实规范（严禁编造事实数据），来自 load_prompt("grounding")
         today:           日期提示（today_hint()），必填
         long_term_hint:  用户历史偏好（render_long_term_hint()），可空（空则显示「无」）
-        file_directory:  本会话可用文件清单（render_file_directory()），可空（空则显示「无」）
-        turn_files:      本轮用户上传的文件（render_turn_files()），可空（空则显示「无」）
+
+    文件不进这里：本轮携带的附件折进 user 正文（render_user_message），会话里还有哪些文件由
+    list_uploaded_files 工具按需查。放 system 等于每轮重发一份随时在变的清单，且只对本轮有效。
     """
     template = load_prompt("system")
     # 用 str.replace 而非 str.format 替换插槽：提示词正文里若有 JSON 花括号（如 critic 的 {"ok":...}），
@@ -112,6 +109,4 @@ def render_system_prompt(skill_directory: str, tool_grounding: str,
             .replace("{skill_directory}", skill_directory)
             .replace("{tool_grounding}", tool_grounding)
             .replace("{today}", today or "无")
-            .replace("{long_term_hint}", long_term_hint or "无")
-            .replace("{turn_files}", turn_files or "无")
-            .replace("{file_directory}", file_directory or "无"))
+            .replace("{long_term_hint}", long_term_hint or "无"))

@@ -15,8 +15,7 @@ from app.core.llm import close_chat_model, get_chat_model
 from app.core.memory import ConversationStore, LongTermMemory, ShortTermMemory, ToolResultStore
 from app.core.memory.manager import MemoryManager
 from app.core.memory.metrics import log_snapshot
-from app.core.prompts import (load_prompt, render_file_directory, render_history_summary,
-                              render_turn_files, render_user_message,
+from app.core.prompts import (load_prompt, render_history_summary, render_user_message,
                               render_long_term_hint, render_system_prompt, today_hint)
 from app.core.registry import ToolRegistry
 from app.core.sandbox import SandboxClient
@@ -25,7 +24,8 @@ from app.core.skills import load_skills
 from app.core.token_utils import estimate_tokens
 from app.datasource.amap_web import AmapWebDataSource
 from app.tools import register_all_tools
-from app.tools.file import make_grep, make_read_file, register_file_tools
+from app.tools.file import (make_grep, make_read_file, register_file_tools,
+                            register_uploaded_files_tool)
 from app.tools.knowledge import register_knowledge_tools
 from app.tools.script import register_script_tools
 from app.tools.sub_agent import make_call_sub_agent
@@ -94,6 +94,8 @@ class AgentService:
         self._datasources.extend(register_all_tools(registry, amap_web_ds, [s["name"] for s in self.skills]))
         # read_file/grep 工具：地址索引的按需读出口（需要 tool_result_store，故在 service 层注册）
         register_file_tools(registry, self.tool_result_store)
+        # list_uploaded_files：会话文件清单的按需读出口（以前是每轮写进 system prompt 的一段）
+        register_uploaded_files_tool(registry, self.file_store)
         # search_knowledge：知识库语义检索（需要 knowledge store，同理由 service 层注册）
         register_knowledge_tools(registry, self.knowledge)
         # run_skill_script：在沙箱里跑仓库里已评审的脚本（需要沙箱客户端 + 文件存储 + 脚本索引）
@@ -132,7 +134,7 @@ class AgentService:
         """SSE 流式对话主流程，依次产出事件：conversation_id → token/tool_call/tool_result → done。
 
         返回 AsyncIterator[dict]，每个 dict 的 "type" 字段标识事件类型。
-        files 是随本条消息发出的附件（[{file_id,name,size}]），只用于落库与前端展示。
+        files 是随本条消息发出的附件（[{file_id,name,size}]）：落库供前端展示，并折进 user 正文喂模型。
         """
         # 设置请求级 user_id contextvar，供工具层（read_file/grep 按用户隔离读、
         # _ToolExecMiddleware 写文件）使用
@@ -149,7 +151,7 @@ class AgentService:
                   if files else message)
         await self.conversation_store.add_message(user_id, conv_id, "user", stored)
 
-        history, summary_hint, agent = await self._prepare_context(user_id, conv_id, message, files)
+        history, summary_hint, agent = await self._prepare_context(user_id, conv_id, message)
 
         # 事件队列：worker 在独立 task 里跑完整轮（生成→critic→落库→记忆→token 输出），
         # 主协程只负责从 queue 取事件转发 SSE。客户端刷新断开只会取消主协程（转发），
@@ -163,10 +165,12 @@ class AgentService:
             客户端断开取消的路径：断开后 worker 继续执行到 add_message，答案照常入库。
             """
             state = _TurnState()
+            # 附件折进 user 正文：本轮喂模型与写短期记忆共用这一份文本，两处渲染不会漂移
+            user_message = render_user_message(message, files or [])
             try:
                 # 工具调用阶段：run_stream 产出的事件转发进 queue（token 不立即下发，等 critic 后统一输出）。
                 # critic 校验与修正改写挂在 ReAct 收口钩子上，其 checking / correcting 状态随事件流按序到达
-                async for sse in self._stream_agent_reply(agent, history, conv_id, message, state, summary_hint):
+                async for sse in self._stream_agent_reply(agent, history, conv_id, user_message, state, summary_hint):
                     await queue.put(sse)
                 # 工具调用结束，进入「整理答案」阶段：硬数据轮次的 checking 已由收口钩子发出，这里只补非校验轮次的标记
                 if not state.hard_results:
@@ -178,10 +182,8 @@ class AgentService:
                     user_id, conv_id, "assistant",
                     json.dumps({"content": answer, "tools": state.tools}, ensure_ascii=False))
                 # 补写本轮到短期记忆（按 ReAct 轮次），让「记忆」页立即显示最新一轮；
-                # 附件折进 user 正文（而非只靠 system 的本轮块），下一轮追问「上次那个文件」才有事实可依
-                await self.memory.append_turn(user_id, conv_id,
-                                              render_user_message(message, files or []),
-                                              answer, state.rounds)
+                # 与喂模型的是同一份 user_message，下一轮追问「上次那个文件」才有事实可依
+                await self.memory.append_turn(user_id, conv_id, user_message, answer, state.rounds)
                 # 流式输出最终答案：拆小块逐块上发（此时已过 critic 校验，保证只输出一段干净答案）
                 for j in range(0, len(answer), 40):
                     await queue.put({"type": "token", "content": answer[j:j + 40]})
@@ -210,7 +212,7 @@ class AgentService:
             await self.conversation_store.update_title(user_id, conv_id, message[:20])
         return conv_id
 
-    async def _prepare_context(self, user_id, conv_id, message, files=None):
+    async def _prepare_context(self, user_id, conv_id, message):
         """准备阶段：召回长期记忆 + 组装短期历史 + 渲染 system prompt，返回 (history, summary_hint, agent)。"""
         # 长期记忆召回：按本轮问题语义检索最相关的 20 条（向量链路不可用时回退 importance 排序），
         # 再按 token 预算截断（占 long_term_hint_ratio），避免历史偏好无限挤占留给对话的预算；
@@ -230,17 +232,10 @@ class AgentService:
         # 可用业务清单（name + description）注入 system prompt；正文由 get_skill 工具按需加载
         skill_directory = "\n".join(f"- {s['name']}：{s['description']}" for s in self.skills)
         summary_hint = render_history_summary(summary, conv_id)
-        # 本轮上传件单列一块：这次要处理谁必须是事实，不能让模型从整会话清单里猜
-        turn_files = render_turn_files(files or [])
-        # 本会话可用文件（上传件 + 脚本产物）：模型任何时候都看得见有哪些文件、file_id 是什么
-        file_directory = render_file_directory(
-            await self.file_store.list_files(user_id, conv_id, limit=10))
         system = render_system_prompt(
             skill_directory, load_prompt("grounding"),
             today=today_hint(),
             long_term_hint=render_long_term_hint(hint_parts),
-            file_directory=file_directory,
-            turn_files=turn_files,
         )
         agent = Agent(name="assistant", system_prompt=system, tools=self.registry.list_names(),
                       model=self.chat_model)

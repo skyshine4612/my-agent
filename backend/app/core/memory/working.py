@@ -101,7 +101,8 @@ class WorkingMemory:
                 {"role": "system",
                  "content": "把下面这段已查过的工具调用与结果蒸馏成一段摘要，保留关键工具、参数与结果要点。"
                             "车次号/航班号/票价/时间/日期/地点名等硬数据必须保留精确原值，"
-                            "不要概括成「有航班」「价格中等」这类模糊描述。"}
+                            "不要概括成「有航班」「价格中等」这类模糊描述。"
+                            "文件名也必须原样保留，不要概括成「某个 Excel 文件」。"}
             ] + serialized)
             summary = resp.content if isinstance(resp.content, str) else ""
             if summary:

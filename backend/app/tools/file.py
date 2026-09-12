@@ -9,7 +9,12 @@ from typing import Annotated
 from langchain_core.tools import tool
 from pydantic import Field
 
-from app.core.context import current_user_id
+from app.core.context import current_conversation_id, current_user_id
+from app.core.prompts import render_file_directory
+
+# 清单列多少个文件：够覆盖一个会话的常态用量，又不至于把上下文塞满。
+# 必须 ≤ FileStore 反查用的 FILE_REF_LIMIT，否则会出现「清单里看得见、引用时解析不到」的死角。
+LIST_LIMIT = 20
 
 
 def make_read_file(store):
@@ -48,7 +53,30 @@ def make_grep(store):
     return grep
 
 
+def make_list_uploaded_files(file_store):
+    """构造 list_uploaded_files 工具：闭包 FileStore，列本会话的文件（上传件 + 脚本产物）。
+
+    这个清单以前是每轮塞进 system prompt 的，改成按需查：清单只对「用户指的是哪个文件」
+    有用，而用户点名的那一轮，文件名就在消息正文里（render_user_message 折的）。
+    """
+
+    @tool
+    async def list_uploaded_files() -> str:
+        """列出本会话里可用的文件（用户上传的 + 之前生成的产物，含文件名与大小）。当不确定会话里有哪些文件，或用户提到的是之前轮次提到的文件时使用。"""
+        entries = await file_store.list_by_name(current_user_id.get(),
+                                                current_conversation_id.get(),
+                                                limit=LIST_LIMIT)
+        return render_file_directory(entries) or "本会话还没有任何文件。"
+
+    return list_uploaded_files
+
+
 def register_file_tools(registry, tool_result_store):
     """把 read_file / grep 工具注入 ToolRegistry（需要 tool_result_store，故在 service 层装配时注册）。"""
     registry.register_tool(make_read_file(tool_result_store), "读取结果文件")
     registry.register_tool(make_grep(tool_result_store), "搜索结果文件")
+
+
+def register_uploaded_files_tool(registry, file_store):
+    """把 list_uploaded_files 注入 ToolRegistry（需要 FileStore，与上面两个读的 store 不是同一个）。"""
+    registry.register_tool(make_list_uploaded_files(file_store), "列出会话文件")

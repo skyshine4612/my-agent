@@ -10,7 +10,7 @@ description: 处理 Excel（.xlsx）文件：先看表结构，再按列做字�
 ## 步骤
 
 1. **先看表结构**
-   `run_skill_script(skill="excel", script="inspect", params={"file_id": "<会话文件清单里的 file_id>"})`
+   `run_skill_script(skill="excel", script="inspect", params={"file": "<会话文件清单里的文件名>"})`
    返回每个 sheet 的列名、样本值与行数。
 
 2. **照样本值认列，不要照用户的原话认**
@@ -21,7 +21,7 @@ description: 处理 Excel（.xlsx）文件：先看表结构，再按列做字�
 
    ```json
    {
-     "file_id": "<会话文件清单里的 file_id>",
+     "file": "<会话文件清单里的文件名>",
      "sheet": "Sheet1",
      "header_row": 1,
      "ops": [

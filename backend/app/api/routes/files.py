@@ -8,6 +8,7 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from fastapi.responses import Response
 
 from app.core.auth import get_current_user
+from app.core.files import safe_filename
 from app.services.agent_service import service
 
 router = APIRouter()
@@ -22,7 +23,9 @@ ALLOWED_SUFFIXES = {".xlsx"}
 async def upload_file(file: UploadFile = File(...), conversation_id: str = Form(None),
                       user_id: str = Depends(get_current_user)):
     """上传一个会话文件；没带 conversation_id 或带的不是自己的会话时，自动建一个空会话并返回其 id。"""
-    name = file.filename or ""
+    # 先净化再判后缀：判的必须是最终落盘的那个名字。用原名判，`a.xlsx\n` 这类尾随控制字符的名字
+    # suffix 会成 `.xlsx\n`，合法文件反而被拒
+    name = safe_filename(file.filename or "")
     if Path(name).suffix.lower() not in ALLOWED_SUFFIXES:
         raise HTTPException(status_code=400, detail="本期只支持 .xlsx 文件")
     data = await file.read()

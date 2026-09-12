@@ -2,8 +2,10 @@
 # 短期记忆（summary + 最近几轮对话）契约测试：replace_records / get_records / append_records
 # 短期记忆表有 conversation_id 外键，且 RLS 按会话归属判定，因此每个用例都要先建会话。
 import pytest
+from langchain_core.messages import AIMessage
 
 from app.core.memory import ConversationStore, ShortTermMemory
+from app.core.memory.manager import MemoryManager
 
 
 @pytest.mark.asyncio
@@ -86,3 +88,29 @@ async def test_append_records_with_tool(user_id, new_conversation):
     assert [r["role"] for r in got] == ["user", "assistant", "tool", "assistant"]
     assert got[2]["tool_call_id"] == "c1"
     assert got[2]["content"] == "结果"
+
+
+class _CapturingLLM:
+    """记录提示词的假模型：护栏测试要看的是提示词本身，不是摘要产物。"""
+
+    def __init__(self):
+        self.messages = []
+
+    async def ainvoke(self, messages):
+        self.messages = messages
+        return AIMessage(content="新摘要")
+
+
+@pytest.mark.asyncio
+async def test_summary_prompt_demands_file_names_verbatim():
+    """短期摘要的提示词必须点名「文件名原样保留」。
+
+    摘要跨轮持久，是压缩后模型能看见的全部上下文；文件名一旦被概括成「某个 Excel 文件」，
+    用户下一轮说「把刚才那个文件的姓名也打码」就没有可指向的对象了。store 传 None 是因为
+    这个用例只走 _update_summary 的纯 LLM 分支，不碰任何存储。
+    """
+    llm = _CapturingLLM()
+    m = MemoryManager(None, None, None, None, llm)
+    await m._update_summary("旧摘要", "【用户】把测试数据.xlsx 脱敏")
+    prompt = llm.messages[0]["content"]
+    assert "文件名" in prompt and "原样保留" in prompt

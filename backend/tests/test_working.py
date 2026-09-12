@@ -13,9 +13,11 @@ class FakeLLM:
     def __init__(self, summary="摘要"):
         self.summary = summary
         self.calls = 0
+        self.messages = []
 
     async def ainvoke(self, messages):
         self.calls += 1
+        self.messages = messages
         return AIMessage(content=self.summary)
 
 
@@ -127,3 +129,22 @@ async def test_fit_distills_single_oversized_unit():
     assert len(out) == 1
     assert out[0]["role"] == "system"
     assert "[早期交互摘要]" in out[0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_distill_prompt_demands_file_names_verbatim():
+    """蒸馏提示词必须点名「文件名原样保留」。
+
+    文件名是重跑脚本恢复产物的唯一指针，而「测试数据.xlsx」这类长资源名正是最容易被
+    概括成「某个 Excel 文件」的东西——丢了模型就不知道拿哪个文件重跑。这条护栏防的是
+    这句要求被当作冗余措辞删掉。
+    """
+    llm = FakeLLM("摘要")
+    wm = WorkingMemory(llm, budget_tokens=50)
+    await wm.fit([
+        {"role": "assistant", "content": "脱敏",
+         "tool_calls": [{"id": "1", "function": {"name": "run_skill_script", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "1", "content": "x" * 500},
+    ])
+    prompt = llm.messages[0]["content"]
+    assert "文件名" in prompt and "原样保留" in prompt

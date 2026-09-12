@@ -1,12 +1,11 @@
 # app/tools/script.py
 # run_skill_script：在沙箱里执行一个仓库中已评审的数据处理脚本。
 # 安全边界集中在三处：① (skill, script) 由白名单 + enum 钉死；② 脚本源码由后端读盘，不经模型的手；
-# ③ params 里只有「等于已知 file_id」的字符串会被换成同名文件，其余原样传递、由脚本自己校验。
+# ③ params 里只有「等于本会话某个文件名」的字符串会被认出来，其余原样传递、由脚本自己校验。
 # 参数名不能叫 args：langchain 把同名字段当作可变参数的合成字段直接剔除，值永远送不进函数体。
 import asyncio
 import base64
 import logging
-from pathlib import Path
 from typing import Annotated, Literal
 
 from langchain_core.tools import tool
@@ -17,33 +16,29 @@ from app.core.context import current_conversation_id, current_user_id
 logger = logging.getLogger(__name__)
 
 
-def _sandbox_name(file_id, meta):
-    """文件在沙箱里的名字：file_id 加原扩展名。
+def _collect_file_refs(node, known, referenced) -> None:
+    """递归找出 params 里引用了会话文件的字符串，把名字记进 referenced。
 
-    扩展名不能省：openpyxl 这类库靠后缀判格式，叫 <uuid> 的文件它直接拒绝打开。
-    """
-    return f"{file_id}{Path(meta.get('name') or '').suffix.lower()}"
-
-
-def _substitute_file_ids(node, known, referenced):
-    """递归替换 params 里的 file_id：命中已知值的换成它在沙箱里的文件名并记进 referenced，其余原样返回。
+    **不改写值**：模型在清单里看到的名字就是沙箱 work_dir 里的名字，命中与否字符串都一样。
+    这消掉了旧设计「命中就把 file_id 拼成 <uuid>.xlsx」的误伤面——`out_name: "已脱敏.xlsx"`
+    恰好等于上一轮产物的名字，旧逻辑会把它拼成 `已脱敏.xlsx.xlsx`。
 
     文件由沙箱写进本次执行自己的 work_dir（每次执行一个 uuid 目录），路径经 stdin 交给脚本，
     所以这里只给裸文件名，由脚本 join(work_dir, name) 定位——工具侧不该猜沙箱的目录布局。
 
-    「只替换等于已知 file_id 的字符串」本身就是参数注入的防线：模型填 `../../etc/passwd`
+    「只认等于本会话文件名的字符串」本身就是参数注入的防线：模型填 `../../etc/passwd`
     只会原样传给脚本，脚本按 basename 拼进 work_dir 后 open() 直接失败，不需要额外校验代码。
+    **名字只用于查表，绝不参与路径拼接**：进路径的永远是 store 自己发的 file_id。
     """
     if isinstance(node, str):
         if node in known:
             referenced.add(node)
-            return _sandbox_name(node, known[node])
-        return node
-    if isinstance(node, list):
-        return [_substitute_file_ids(v, known, referenced) for v in node]
-    if isinstance(node, dict):
-        return {k: _substitute_file_ids(v, known, referenced) for k, v in node.items()}
-    return node
+    elif isinstance(node, list):
+        for v in node:
+            _collect_file_refs(v, known, referenced)
+    elif isinstance(node, dict):
+        for v in node.values():
+            _collect_file_refs(v, known, referenced)
 
 
 def make_run_skill_script(sandbox, file_store, scripts):
@@ -72,21 +67,21 @@ def make_run_skill_script(sandbox, file_store, scripts):
         conversation_id = current_conversation_id.get()
         source = f"script:{skill}/{script}"
 
-        # 解析 params 里的文件引用：换成沙箱内的文件名，同时把被引用的文件字节收齐
-        known = {f["file_id"]: f for f in await file_store.list_files(user_id, conversation_id, limit=50)}
+        # 认出 params 里引用了哪些会话文件，把它们的字节收齐；值本身不用改
+        known = await file_store.list_by_name(user_id, conversation_id)
         referenced = set()
-        resolved = _substitute_file_ids(params, known, referenced)
+        _collect_file_refs(params, known, referenced)
         files = []
-        for fid in sorted(referenced):
-            got = await file_store.read(user_id, conversation_id, fid)
+        for name in sorted(referenced):
+            # 用条目自己的 file_id 去读。名字是模型可见的键，不是路径键，直接拿去 read 会被拒
+            got = await file_store.read(user_id, conversation_id, known[name]["file_id"])
             if got is None:
-                return {"ok": False, "error": f"文件不存在或无权访问：{fid}"}
-            files.append({"name": _sandbox_name(fid, known[fid]),
-                          "data": base64.b64encode(got[1]).decode()})
+                return {"ok": False, "error": f"文件不存在或无权访问：{name}"}
+            files.append({"name": name, "data": base64.b64encode(got[1]).decode()})
 
         # 脚本源码从白名单路径读盘：模型递进来的只有 skill/script 两个名字
         script_source = await asyncio.to_thread(path.read_text, encoding="utf-8")
-        result = await sandbox.run(script_source, resolved, files)
+        result = await sandbox.run(script_source, params, files)
 
         # 产物写回会话文件目录，生成新 file_id 供前端下载
         artifacts = [await file_store.save(user_id, conversation_id, a["name"],
