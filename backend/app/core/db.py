@@ -16,8 +16,19 @@ _pool: asyncpg.Pool | None = None
 async def init_pool(dsn: str) -> None:
     """初始化连接池（应用启动时调用一次）。"""
     global _pool
-    _pool = await asyncpg.create_pool(dsn, min_size=1, max_size=10)
+    _pool = await asyncpg.create_pool(dsn, min_size=1, max_size=10, init=_init_conn)
     logger.info("[db] 连接池已初始化")
+
+
+async def _init_conn(conn) -> None:
+    """每根连接建好时注册 jsonb/json 编解码。
+
+    默认编解码把 jsonb 当**文本**给 Python，`row["images"]` 会是 str 而不是 list，
+    下游（图片归属、下发前端）全部静默落空。只注册这两个类型：
+    timestamptz 等其余类型的现有行为（返回 datetime）有代码依赖，不动。
+    """
+    await conn.set_type_codec("jsonb", encoder=json.dumps, decoder=json.loads, schema="pg_catalog")
+    await conn.set_type_codec("json", encoder=json.dumps, decoder=json.loads, schema="pg_catalog")
 
 
 async def close_pool() -> None:
