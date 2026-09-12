@@ -1,0 +1,6 @@
+# 只影响构建上下文，不影响镜像内容：挡掉本地跑 uv 时生成的缓存，别把几百 MB 整个发给 daemon。
+# pyproject.toml / uv.lock 不在此列 —— Dockerfile 要 COPY 它们。
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/

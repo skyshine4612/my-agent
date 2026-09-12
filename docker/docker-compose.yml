@@ -1,22 +1,4 @@
-# 自托管 Supabase（11 个服务）+ 它依赖的 volumes 配置树，取自官方 supabase/supabase 仓库的 docker/ 目录。
-#
-# 自包含：volumes/ 里的 envoy 配置、db 初始化 SQL、pooler.exs、edge-function 入口随包携带，
-# 新机器上把这个目录传过去、cd 进去 docker compose up -d 就能起，不需要再去别处找文件。
-# 只有 17 个配置文件在版本库里，PGDATA（volumes/db/data，171MB 起）与 storage 对象被 .gitignore 挡住。
-#
-# 与官方编排的唯一差异：./volumes/xxx 改成 ${SUPABASE_VOLUMES:-./volumes}/xxx。
-# 默认值就是包自带的那棵树；在已有数据的机器上换编排时，把 SUPABASE_VOLUMES 指向旧树
-# （如 /opt/supabase/docker/volumes），宿主上的 PG 集群、storage 文件、命名卷原地复用，回退即换回旧编排。
-#
-# 升级要同时换编排与 volumes 配置树 —— 两者版本错配时报错点很难认（envoy 挂到空目录最典型），
-# 只覆盖 docker-compose.yml 是不够的。
-# 顶层 name 与各 container_name 一律不动 —— 它们是连接串、运维习惯与既有命名卷的锚点。
-#
-# Usage
-#   Start:  docker compose up -d
-#   Stop:   docker compose down        # 绝不要加 -v：db-config 卷里是 pgsodium 根密钥，删了 Vault 数据就解不开
-#   Logs:   docker compose logs -f supabase-db
-name: supabase
+name: my-agent
 
 services:
   studio:
@@ -589,6 +571,45 @@ services:
         "/app/bin/migrate && /app/bin/supavisor eval \"$$(cat /etc/pooler/pooler.exs)\" && /app/bin/server"
       ]
 
+  # 代码执行沙箱：常驻、无状态
+  sandbox:
+    container_name: my-agent-sandbox
+    build:
+      context: ./sandbox
+      args:
+        # 构建期要拉 PyPI，150 直连 pypi.org 不通（报 from versions: none），走国内镜像。
+        # 换机器/换源只改这一行，Dockerfile 本身保持中立。
+        PIP_INDEX_URL: https://pypi.tuna.tsinghua.edu.cn/simple
+    restart: unless-stopped
+    read_only: true                       # 根文件系统只读：挡持久化后门与写坏镜像
+    tmpfs:
+      # 唯一可写处，占内存、算在下面的 mem_limit 里。noexec 挡「往 /tmp 丢个二进制再跑」；
+      # 脚本只是 python 的参数（读文件），所以拦不到正常执行
+      - /tmp:rw,noexec,nosuid,size=512m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 2g
+    cpus: 1.0
+    pids_limit: 64                        # 内存与 CPU 拦不住 fork 炸弹，只有它拦得住
+    ulimits:
+      nofile: 256                         # 防 fd 耗尽
+      fsize: 52428800                     # 单文件 50MB，防脚本把 512m 的 tmpfs 写穿
+    ports:
+      - "8001:8001"
+    networks:
+      - sandbox_net
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8001/health', timeout=3).status == 200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
 volumes:
+  # 卷名跟着顶层 name 走（my-agent_db-config / my-agent_deno-cache）
   db-config:
   deno-cache:
+
+networks:
+  sandbox_net:

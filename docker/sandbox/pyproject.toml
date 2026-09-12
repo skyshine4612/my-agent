@@ -1,0 +1,7 @@
+[project]
+name = "sandbox"
+version = "0.1.0"
+requires-python = ">=3.11"
+# 这份清单就是沙箱里脚本的可用能力边界：脚本只能 import 标准库和这里装了的包。
+# 加一个包等于放宽沙箱能力，是安全决策，不是顺手事 —— Dockerfile 从 uv.lock 装，改这里要重新 uv lock。
+dependencies = ["fastapi>=0.115", "uvicorn>=0.30", "openpyxl>=3.1"]
