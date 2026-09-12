@@ -47,17 +47,30 @@ def render_history_summary(summary: str, conv_id: str) -> str:
     return f"【历史对话摘要】\n{summary}\n[完整历史存到 {conv_id}/_history.txt，可用 read_file 读]"
 
 
+def render_file_directory(files: list[dict]) -> str:
+    """把会话文件清单渲染成「本会话可用文件」块：file_id + 名称 + 大小 + 来源标注。
+
+    来源标注是必要的——模型得知道哪个是用户给的、哪个是自己刚生成的；只列近 10 个由调用方限制。
+    """
+    lines = []
+    for f in files:
+        source = f.get("source", "upload")
+        note = "" if source == "upload" else f"（由 {source.removeprefix('script:')} 生成）"
+        lines.append(f"- file_id: {f['file_id']}  名称: {f['name']}  {f['size'] / 1048576:.1f}MB{note}")
+    return "\n".join(lines)
+
+
 def render_system_prompt(skill_directory: str, tool_grounding: str,
-                         today: str = "", long_term_hint: str = "") -> str:
-    """把可用业务清单、工具事实规范、日期与用户偏好填进 system.md 的插槽，生成顶层 system prompt。
+                         today: str = "", long_term_hint: str = "",
+                         file_directory: str = "") -> str:
+    """把可用业务清单、事实规范、日期、用户偏好与本会话文件清单填进 system.md 的插槽。
 
     参数：
         skill_directory: 可用业务清单文本（每业务一行 name + description），来自各 skill 的 frontmatter
         tool_grounding:  事实规范（严禁编造事实数据），来自 load_prompt("grounding")
         today:           日期提示（today_hint()），必填
         long_term_hint:  用户历史偏好（render_long_term_hint()），可空（空则显示「无」）
-    返回：
-        替换掉全部插槽后的完整 system prompt（历史摘要由 render_history_summary 独立成 system 消息，不进此模板）。
+        file_directory:  本会话可用文件清单（render_file_directory()），可空（空则显示「无」）
     """
     template = load_prompt("system")
     # 用 str.replace 而非 str.format 替换插槽：system.md 除插槽外暂无花括号，
@@ -66,4 +79,5 @@ def render_system_prompt(skill_directory: str, tool_grounding: str,
             .replace("{skill_directory}", skill_directory)
             .replace("{tool_grounding}", tool_grounding)
             .replace("{today}", today or "无")
-            .replace("{long_term_hint}", long_term_hint or "无"))
+            .replace("{long_term_hint}", long_term_hint or "无")
+            .replace("{file_directory}", file_directory or "无"))

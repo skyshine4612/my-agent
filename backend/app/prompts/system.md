@@ -3,6 +3,9 @@
 【可用业务】
 {skill_directory}
 
+【本会话可用文件】
+{file_directory}
+
 【硬性规则】
 {tool_grounding}
 

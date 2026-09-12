@@ -15,8 +15,8 @@ from app.core.llm import close_chat_model, get_chat_model
 from app.core.memory import ConversationStore, LongTermMemory, ShortTermMemory, ToolResultStore
 from app.core.memory.manager import MemoryManager
 from app.core.memory.metrics import log_snapshot
-from app.core.prompts import (load_prompt, render_history_summary, render_long_term_hint,
-                              render_system_prompt, today_hint)
+from app.core.prompts import (load_prompt, render_file_directory, render_history_summary,
+                              render_long_term_hint, render_system_prompt, today_hint)
 from app.core.registry import ToolRegistry
 from app.core.sandbox import SandboxClient
 from app.core.skill_scripts import scan_scripts
@@ -216,10 +216,14 @@ class AgentService:
         # 可用业务清单（name + description）注入 system prompt；正文由 get_skill 工具按需加载
         skill_directory = "\n".join(f"- {s['name']}：{s['description']}" for s in self.skills)
         summary_hint = render_history_summary(summary, conv_id)
+        # 本会话可用文件（上传件 + 脚本产物）：模型任何时候都看得见有哪些文件、file_id 是什么
+        file_directory = render_file_directory(
+            await self.file_store.list_files(user_id, conv_id, limit=10))
         system = render_system_prompt(
             skill_directory, load_prompt("grounding"),
             today=today_hint(),
             long_term_hint=render_long_term_hint(hint_parts),
+            file_directory=file_directory,
         )
         agent = Agent(name="assistant", system_prompt=system, tools=self.registry.list_names(),
                       model=self.chat_model)
