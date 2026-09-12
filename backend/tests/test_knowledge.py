@@ -216,6 +216,38 @@ async def test_has_source_key_recognises_an_ingested_url(kb, user_id):
     assert await store.has_source_key(user_id, "0" * 16) is False
 
 
+async def test_search_knowledge_tool_returns_hits_and_images(kb, user_id):
+    """工具层把图片从 hits 里提出来单列一份：模型不负责拼图片 URL，
+    它由 agent 侧的侧信道原样带给前端（照 artifacts 的路子）。"""
+    from app.core.context import current_user_id
+    from app.tools.knowledge import make_search_knowledge
+
+    store, _ = kb()
+    await store.ingest(user_id, _text("西湖很美，适合散步。"), title="杭州",
+                       source_url="http://a/1", images=[_img()])
+    # 直接 set：ContextVar 的属性是只读的，monkeypatch.setattr 装不上
+    current_user_id.set(user_id)
+    got = await make_search_knowledge(store).ainvoke({"query": "西湖"})
+    assert isinstance(got, dict)
+    assert got["hits"] and "content" in got["hits"][0]
+    assert len(got["images"]) == 1
+    assert got["images"][0]["desc"] == "西湖断桥"
+    assert got["images"][0]["key"]                    # 真的带上了一个对象 key
+    # 只有 key 与 desc：图片字节留在 upload 那一步，不进 hit、更不进模型语料
+    assert set(got["images"][0]) == {"key", "desc"}
+
+
+async def test_search_knowledge_tool_keeps_empty_branch(kb, user_id):
+    """空分支保留中文短句：改成 dict 后模型会看到 {"hits": [], "images": []}，显式提示就没了。"""
+    from app.core.context import current_user_id
+    from app.tools.knowledge import make_search_knowledge
+
+    store, _ = kb()
+    current_user_id.set(user_id)
+    got = await make_search_knowledge(store).ainvoke({"query": "西湖"})
+    assert got == "知识库暂无相关内容"
+
+
 async def test_search_attaches_a_list_of_images(kb, user_id):
     """jsonb codec 不在的话这里是 str，下游全落空 —— 断言形态不只会断言内容。"""
     store, _ = kb()
