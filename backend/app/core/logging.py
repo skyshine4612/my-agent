@@ -46,3 +46,12 @@ def setup_logging():
     # HTTP 客户端每发一个请求就打一条 INFO（一次入库几十条 embedding），只保留失败
     for noisy in ("httpx", "httpx2", "httpcore", "httpcore2"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
+
+    # uvicorn 默认把日志写到自己接的 stderr，不往 root 传 —— 未捕获的异常栈因此
+    # 进不了 logs/app.log。这里把它改成走 root，异常才会落进文件。
+    # 时序没问题：import app.main（触发本函数）发生在 uvicorn 配置完自己的日志之后。
+    # access 请求日志不接，只进终端，免得把日志文件刷成请求流水。
+    for name in ("uvicorn", "uvicorn.error"):
+        uvicorn_logger = logging.getLogger(name)
+        uvicorn_logger.handlers = []
+        uvicorn_logger.propagate = True

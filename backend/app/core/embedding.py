@@ -3,12 +3,15 @@
 # 与 get_chat_model() 的单例工厂同构（均为进程级单例），但**不做降级兜底**：
 # 知识库没有向量就检索不到，属于必须失败的情形；长期记忆允许降级，由 store 自己接异常。
 import asyncio
+import logging
 from abc import ABC, abstractmethod
 
 import httpx
 from openai import AsyncOpenAI
 
 from app.config import settings
+
+logger = logging.getLogger(__name__)
 
 
 class EmbeddingClient(ABC):
@@ -57,18 +60,36 @@ def get_embedding() -> EmbeddingClient:
 _EMBED_BATCH = 10
 # 批次并发数：总耗时约为批数的 _EMBED_CONCURRENCY 分之一，同时不给接口打满并发
 _EMBED_CONCURRENCY = 8
+# 进度日志的批次间隔，只在批次超过这个数的长文档上打点
+_PROGRESS_EVERY = 20
 
 
 async def embed_batched(embedder: EmbeddingClient, texts: list[str]) -> list[list[float]]:
-    """分批并发调用 embed()，返回顺序与 texts 一一对应。"""
+    """分批并发调用 embed()，返回顺序与 texts 一一对应。
+
+    批次够多时按 _PROGRESS_EVERY 打进度：长文档向量化要跑几十秒到几分钟，
+    中途一行不打看起来就像卡死。
+    """
     if not texts:
         return []
     batches = [texts[i:i + _EMBED_BATCH] for i in range(0, len(texts), _EMBED_BATCH)]
     sem = asyncio.Semaphore(_EMBED_CONCURRENCY)
+    total = len(texts)
+    report = len(batches) > _PROGRESS_EVERY
+    done = 0
+    items = 0
 
     async def run(batch: list[str]) -> list[list[float]]:
+        nonlocal done, items
         async with sem:
-            return await embedder.embed(batch)
+            out = await embedder.embed(batch)
+        # 两行计数之间没有 await，单线程事件循环下不会交错
+        done += 1
+        items += len(batch)
+        if report and (done % _PROGRESS_EVERY == 0 or done == len(batches)):
+            logger.info("[embedding] 向量化进度 %d/%d 批（%d/%d 条）",
+                        done, len(batches), items, total)
+        return out
 
     # gather 按入参顺序返回，逐批展开即与 texts 对齐
     return [v for batch in await asyncio.gather(*(run(b) for b in batches)) for v in batch]

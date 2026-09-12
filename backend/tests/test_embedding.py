@@ -2,11 +2,12 @@
 # Embedding 客户端契约测试：用假的 openai client / 假 embedder 顶替网络调用，
 # 只验请求参数、返回解析与分批并发行为。
 import asyncio
+import logging
 
 import pytest
 
-from app.core.embedding import (_EMBED_BATCH, _EMBED_CONCURRENCY, OpenAICompatEmbedding,
-                                embed_batched)
+from app.core.embedding import (_EMBED_BATCH, _EMBED_CONCURRENCY, _PROGRESS_EVERY,
+                                OpenAICompatEmbedding, embed_batched)
 
 
 class _FakeItem:
@@ -97,3 +98,26 @@ async def test_embed_batched_empty_input_makes_no_call():
     emb = _RecordingEmbedder()
     assert await embed_batched(emb, []) == []
     assert emb.batches == []
+
+
+@pytest.mark.asyncio
+async def test_embed_batched_logs_progress_on_long_input(caplog):
+    """批次够多时按间隔打进度，长文档不会全程黑屏。"""
+    emb = _RecordingEmbedder()
+    texts = [str(i) for i in range(_EMBED_BATCH * (_PROGRESS_EVERY + 10))]
+    with caplog.at_level(logging.INFO, logger="app.core.embedding"):
+        await embed_batched(emb, texts)
+
+    progress = [r for r in caplog.records if "向量化进度" in r.getMessage()]
+    assert progress, "长文档应打进度日志"
+    assert str(len(texts)) in progress[-1].getMessage(), "末条进度应报出总条数"
+
+
+@pytest.mark.asyncio
+async def test_embed_batched_stays_quiet_on_short_input(caplog):
+    """短输入（长期记忆提炼那种量级）不刷进度日志。"""
+    emb = _RecordingEmbedder()
+    with caplog.at_level(logging.INFO, logger="app.core.embedding"):
+        await embed_batched(emb, [str(i) for i in range(5)])
+
+    assert caplog.records == []
