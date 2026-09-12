@@ -19,15 +19,15 @@ class Settings(BaseSettings):
     enable_thinking: bool = False
     # LLM 采样温度
     llm_temperature: float = 0.5
-    # Embedding 服务 API Key：留空则复用 llm_api_key（同一 DashScope 账号，通常不用单独配）
+    # Embedding 服务 API Key（同一 DashScope 账号，值通常与 llm_api_key 相同，但必须显式配在 .env）
     embedding_api_key: str = ""
-    # Embedding 模型名（DashScope text-embedding-v4，默认输出 1024 维）
+    # Embedding 模型名（DashScope text-embedding-v4，输出 1024 维）
     embedding_model: str = "text-embedding-v4"
     # Embedding 向量维度：必须与建表时的 vector(N) 一致，换模型时两处要一起改
     embedding_dimensions: int = 1024
-    # 多模态模型名（把攻略页插图转成文字描述用）：留空则复用 llm_model
+    # 多模态模型名（把攻略页插图转成文字描述用，如 qwen3.7-plus）
     vision_model: str = ""
-    # 多模态 API Key：留空则复用 llm_api_key（同一 DashScope 账号，通常不用单独配）
+    # 多模态 API Key（同上，值通常与 llm_api_key 相同，但必须显式配在 .env）
     vision_api_key: str = ""
     # ModelScope 访问令牌（用于调用 ModelScope 上的 MCP 服务）
     modelscope_token: str = ""

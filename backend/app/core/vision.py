@@ -64,14 +64,15 @@ _vision: VisionClient | None = None
 def get_vision() -> VisionClient:
     """返回全局多模态客户端单例（首次调用时构造）。
 
-    默认复用 llm_model，配了 VISION_MODEL 才切到独立的多模态模型。
+    VISION_MODEL / VISION_API_KEY 必须显式配在 .env 里：这里不做「留空则复用 llm_*」的兜底，
+    兜底会让「没配」和「配错了」长得一模一样，只能靠读代码才分得清。
     """
     global _vision
     if _vision is None:
         _vision = OpenAICompatVision(
             base_url=settings.llm_base_url,
-            api_key=settings.vision_api_key or settings.llm_api_key,
-            model=settings.vision_model or settings.llm_model)
+            api_key=settings.vision_api_key,
+            model=settings.vision_model)
     return _vision
 
 

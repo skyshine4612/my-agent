@@ -135,11 +135,11 @@ docker compose up --build
 | `LLM_MODEL` | 使用的模型 | `qwen3.7-plus`                                      |
 | `ENABLE_THINKING` | Qwen 思考模式开关（`false` 关闭更快，`true` 更强推理但更慢） | `false`                                            |
 | `LLM_TEMPERATURE` | LLM 采样温度 | `0.5`                                                |
-| `EMBEDDING_API_KEY` | 向量化 API Key（知识库与长期记忆共用），留空复用 `LLM_API_KEY` | 空 |
+| `EMBEDDING_API_KEY` | 向量化 API Key（知识库与长期记忆共用）。值通常与 `LLM_API_KEY` 相同，但必须显式配 | 空 |
 | `EMBEDDING_MODEL` | 向量化模型 | `text-embedding-v4`                                 |
 | `EMBEDDING_DIMENSIONS` | 向量维度，**必须与建表的 `vector(N)` 一致** | `1024`                                              |
-| `VISION_MODEL` | 多模态模型（攻略页插图转文字描述），留空复用 `LLM_MODEL` | 空 |
-| `VISION_API_KEY` | 多模态 API Key，留空复用 `LLM_API_KEY` | 空                                                  |
+| `VISION_MODEL` | 多模态模型（攻略页插图转文字描述，`qwen3.7-plus` 支持图片输入） | `qwen3.7-plus` |
+| `VISION_API_KEY` | 多模态 API Key。值通常与 `LLM_API_KEY` 相同，但必须显式配 | 空 |
 | `MODELSCOPE_TOKEN` | ModelScope 访问令牌（调用 MCP 服务） | 空                                                  |
 | `TRAIN_12306_URL` | 12306 火车票 MCP 服务地址 | 空                                                  |
 | `FLIGHT_VARIFLIGHT_URL` | variflight 官方 MCP 服务地址 | 空                                                  |

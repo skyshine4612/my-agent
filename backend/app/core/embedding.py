@@ -48,7 +48,7 @@ def get_embedding() -> EmbeddingClient:
     if _embedding is None:
         _embedding = OpenAICompatEmbedding(
             base_url=settings.llm_base_url,
-            api_key=settings.embedding_api_key or settings.llm_api_key,
+            api_key=settings.embedding_api_key,
             model=settings.embedding_model,
             dimensions=settings.embedding_dimensions,
         )
