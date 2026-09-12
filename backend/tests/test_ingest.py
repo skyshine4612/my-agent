@@ -77,6 +77,35 @@ def test_extract_with_images_returns_both():
     assert "\x00IMG0\x00" in text
 
 
+def test_short_article_keeps_headings_and_images():
+    """正文 200~800 字的页面（图集攻略的常见形态）不能被兜底纯文本顶掉格式。
+
+    钉住 trafilatura 的 rescue 分支：主提取短于 MIN_EXTRACTED_SIZE 时它拿 baseline() 的
+    扁平 <p> 整个替换结果，标题与图片一起消失，而文字量照样过建库路由的长度校验，
+    于是静默入库成一篇没图、没小标题的语料。上面两个端到端用例都用 40 段（>1000 字）
+    恰好绕开了这条路径，这个用例专门走进去（正文约 400 字：够入库，不够 800）。
+    """
+    paras = [
+        "第一天从断桥残雪开始沿白堤走到平湖秋月，再到孤山看西泠印社，傍晚在楼外楼吃一顿"
+        "西湖醋鱼和龙井虾仁，饭后沿湖散步看音乐喷泉，夜里住在龙翔桥附近。",
+        "第二天走南线，苏堤春晓适合清晨，花港观鱼看红鱼池，中午在知味观吃小笼，"
+        "下午去雷峰塔俯瞰全湖，夜里逛河坊街和南宋御街。",
+        "第三天走西线，灵隐寺与飞来峰石刻值得半天，永福寺人少清静，"
+        "出来后上天竺吃一碗素面，傍晚回市区。",
+        "避坑经验：周末苏堤和白堤人极多，建议早上七点前进景区；"
+        "龙井村的茶叶别在路边摊买；游船选国营码头，私营船漫天要价。",
+    ]
+    body = "".join(f"<p>{p}</p>" for p in paras)
+    html = ("<html><body><article><h1>西湖三日游攻略</h1>"
+            '<img src="https://cdn.example.com/1.jpg">' + body +
+            '<img src="https://cdn.example.com/2.jpg">' + body +
+            "</article></body></html>")
+    text, images = extract_with_images(html, "https://example.com/guide/hz")
+    assert images == ["https://cdn.example.com/1.jpg", "https://cdn.example.com/2.jpg"]
+    assert "# 西湖三日游攻略" in text
+    assert "\x00IMG0\x00" in text
+
+
 def test_scrub_marks_never_leaves_null_bytes():
     """要守的不变量只有一条：**输出里没有 \\x00**。
 

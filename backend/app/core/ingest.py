@@ -4,11 +4,9 @@ import asyncio
 import logging
 import re
 import time
-from copy import deepcopy
 from urllib.parse import urljoin
 
 import trafilatura
-from trafilatura.settings import DEFAULT_CONFIG
 
 from app.core.vision import describe_images
 
@@ -17,11 +15,12 @@ logger = logging.getLogger(__name__)
 # 图片占位符：正文里留住图的位置，描述生成后原地回填
 _IMAGE_MARK = r"\x00IMG\d+\x00"
 
-# 主提取产出低于此值才会去走 readability / jusText 兜底链。默认的 250 太低：主提取只拿到
-# 几百字导航的页面会直接返回导航、触发不了兜底，正文整块丢。代价是本来干净的结果可能混进
-# 「登录/无障碍」这类短碎片，对检索无害。
-_EXTRACTOR_CONFIG = deepcopy(DEFAULT_CONFIG)
-_EXTRACTOR_CONFIG["DEFAULT"]["MIN_EXTRACTED_SIZE"] = "800"
+# 提取用 trafilatura 的默认配置，**刻意不覆盖 MIN_EXTRACTED_SIZE**：主提取结果短于该值时，
+# 它会拿 baseline() 的扁平 <p> 纯文本整个替换掉结果 —— 正文捞得更多，标题与图片却一起没了。
+# 曾把它调到 800 想让「主提取只抓到几百字导航就当成功」的页面进兜底链，实测三组页面
+# （导航淹没正文、导航页、正文 400 字的图集页）里 800 档一次都没多捞到正文，只把带图的
+# markdown 换成了无格式纯文本；「抓得太少」trafilatura 2.2.0 自己会用 escalation 判断
+# （提取量不足页面文本 20% 时换 recall 模式重试），不需要这个旋钮。
 
 # trafilatura 的 markdown 图片与链接语法
 _MD_IMAGE = re.compile(r"!\[[^\]]*\]\(\s*([^)\s]+)[^)]*\)")
@@ -79,8 +78,8 @@ def _normalize(text: str) -> str:
 def extract_with_images(html: str, base_url: str = "") -> tuple[str, list[str]]:
     """HTML → (带图片占位的正文, 按出现顺序的图片 URL 列表)。
 
-    正文由 trafilatura 提取（配置见 _EXTRACTOR_CONFIG），本函数只把它输出的 markdown
-    转成建库管道要的形状。base_url 传页面地址：trafilatura 靠它启用站点特定规则。
+    正文由 trafilatura 按默认配置提取（为什么不改配置见文件头），本函数只把它输出的
+    markdown 转成建库管道要的形状。base_url 传页面地址：trafilatura 靠它启用站点特定规则。
     """
     md = trafilatura.extract(
         html,
@@ -91,7 +90,6 @@ def extract_with_images(html: str, base_url: str = "") -> tuple[str, list[str]]:
         include_links=True,
         # 攻略页的「用户问答」落在评论区容器里，对检索有价值，不按噪音丢弃
         include_comments=True,
-        config=_EXTRACTOR_CONFIG,
     ) or ""
     text, images = markdown_to_text(md, base_url)
     return _normalize(text), images
