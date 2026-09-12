@@ -118,8 +118,14 @@ class AgentService:
         await close_chat_model()
 
     async def delete_conversation(self, user_id, conv_id):
-        """删除会话及其消息，并清理该会话的短期记忆与工具结果地址索引；归属校验失败返回 False。"""
-        return await self.memory.delete_conversation(user_id, conv_id)
+        """删除会话及其消息，并清理该会话的短期记忆、工具结果地址索引与会话文件；归属校验失败返回 False。
+
+        result_dir 与 file_dir 是分开的两棵树（本轮清 vs 会话清），所以要分别清。
+        """
+        ok = await self.memory.delete_conversation(user_id, conv_id)
+        if ok:
+            await self.file_store.delete_conversation(user_id, conv_id)
+        return ok
 
     async def chat_stream(self, user_id, conv_id, message):
         """SSE 流式对话主流程，依次产出事件：conversation_id → token/tool_call/tool_result → done。
