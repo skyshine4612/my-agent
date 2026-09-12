@@ -8,3 +8,7 @@ from contextvars import ContextVar
 # 真实链路必然注入——身份由 get_current_user 本地验签得出，未登录在路由层就被 401 拦下。
 # 默认空串只是未注入时的确定性兜底，不再有 anonymous 这种「看起来像合法用户」的降级身份。
 current_user_id: ContextVar[str] = ContextVar("current_user_id", default="")
+
+# 当前请求的 conversation_id：工具层用它定位会话目录（读上传件、写产物）。
+# 同样由 service 层在 chat_stream 入口 set；worker task 经 create_task 复制上下文，工具执行时读得到。
+current_conversation_id: ContextVar[str] = ContextVar("current_conversation_id", default="")

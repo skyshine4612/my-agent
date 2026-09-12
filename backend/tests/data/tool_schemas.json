@@ -235,6 +235,33 @@
       "type": "object"
     }
   },
+  "run_skill_script": {
+    "description": "执行一个已评审的数据处理脚本（如 Excel 字段脱敏）。可用的脚本与参数含义见对应业务的规则正文。",
+    "name": "run_skill_script",
+    "parameters": {
+      "properties": {
+        "params": {
+          "additionalProperties": true,
+          "description": "脚本参数（字段含义见该业务的规则正文）",
+          "type": "object"
+        },
+        "script": {
+          "description": "脚本名",
+          "type": "string"
+        },
+        "skill": {
+          "description": "业务名",
+          "type": "string"
+        }
+      },
+      "required": [
+        "params",
+        "script",
+        "skill"
+      ],
+      "type": "object"
+    }
+  },
   "search_knowledge": {
     "description": "在本地知识库中按语义检索攻略/游记语料，返回最相关的片段。当需要目的地的深度玩法、避坑经验、行程细节等攻略类信息时使用。",
     "name": "search_knowledge",

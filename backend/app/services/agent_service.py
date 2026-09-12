@@ -8,7 +8,8 @@ from dataclasses import dataclass, field
 
 from app.config import settings
 from app.core.agent import HARD_DATA_TOOLS, Agent, CriticConfig
-from app.core.context import current_user_id
+from app.core.context import current_conversation_id, current_user_id
+from app.core.files import FileStore
 from app.core.knowledge import KnowledgeStore
 from app.core.llm import close_chat_model, get_chat_model
 from app.core.memory import ConversationStore, LongTermMemory, ShortTermMemory, ToolResultStore
@@ -17,12 +18,15 @@ from app.core.memory.metrics import log_snapshot
 from app.core.prompts import (load_prompt, render_history_summary, render_long_term_hint,
                               render_system_prompt, today_hint)
 from app.core.registry import ToolRegistry
+from app.core.sandbox import SandboxClient
+from app.core.skill_scripts import scan_scripts
 from app.core.skills import load_skills
 from app.core.token_utils import estimate_tokens
 from app.datasource.amap_web import AmapWebDataSource
 from app.tools import register_all_tools
 from app.tools.file import make_grep, make_read_file, register_file_tools
 from app.tools.knowledge import register_knowledge_tools
+from app.tools.script import register_script_tools
 from app.tools.sub_agent import make_call_sub_agent
 
 logger = logging.getLogger(__name__)
@@ -55,6 +59,12 @@ class AgentService:
         self.knowledge = KnowledgeStore()
         # 工具结果地址索引：超长结果写临时文件，read_file/grep 按需读；本轮结束即清，避免堆积
         self.tool_result_store = ToolResultStore(settings.result_dir)
+        # 会话文件：上传件与沙箱产物，与 result_dir（spill）分两棵树
+        self.file_store = FileStore(settings.file_dir)
+        # 沙箱客户端：长连接复用，随 registry 一起装配一次
+        self.sandbox = SandboxClient(settings.sandbox_url, settings.sandbox_timeout)
+        # 脚本白名单：启动时扫描一次，run_skill_script 的 enum 与校验都用这份索引
+        self.skill_scripts = scan_scripts()
         # langchain 模型：全项目唯一的 LLM 通路口（主循环 / critic / 记忆蒸馏 / 修正重写共用）
         self.chat_model = get_chat_model()
         # critic 子图的工具：与主循环共用同一套 read_file/grep 实现，启动时装配一次
@@ -85,6 +95,8 @@ class AgentService:
         register_file_tools(registry, self.tool_result_store)
         # search_knowledge：知识库语义检索（需要 knowledge store，同理由 service 层注册）
         register_knowledge_tools(registry, self.knowledge)
+        # run_skill_script：在沙箱里跑仓库里已评审的脚本（需要沙箱客户端 + 文件存储 + 脚本索引）
+        register_script_tools(registry, self.sandbox, self.file_store, self.skill_scripts)
         # 注册 call_sub_agent（子 Agent 委派，需要模型 + skill 清单 + 工具结果地址索引，只能在 service 层注册）
         sub_agent_tool = make_call_sub_agent(self.chat_model, registry, [s["name"] for s in self.skills],
                                              settings.llm_context_budget,
@@ -102,6 +114,7 @@ class AgentService:
             ds_close = getattr(ds, "close", None)
             if ds_close is not None:
                 await ds_close()
+        await self.sandbox.close()
         await close_chat_model()
 
     async def delete_conversation(self, user_id, conv_id):
@@ -119,6 +132,8 @@ class AgentService:
         logger.info("[service] 收到请求，user=%s，消息：%.60s", user_id, message)
 
         conv_id = await self._ensure_conversation(user_id, conv_id, message)
+        # 工具层要按会话定位文件目录，与 user_id 一起注入请求级上下文
+        current_conversation_id.set(conv_id)
         yield {"type": "conversation_id", "conversation_id": conv_id}
         # 落库本轮用户消息
         await self.conversation_store.add_message(user_id, conv_id, "user", message)
