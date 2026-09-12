@@ -117,11 +117,25 @@ create table if not exists documents(
 create index if not exists documents_embedding_idx
     on documents using hnsw (embedding vector_cosine_ops);
 
+-- 会话文件：字节在 Storage 的 files 桶，这里只存元数据。
+create table if not exists files(
+    id              text primary key,
+    user_id         uuid not null references auth.users(id) on delete cascade,
+    conversation_id text not null references conversations(id) on delete cascade,
+    name            text not null,
+    size            bigint not null,
+    source          text not null default 'upload',
+    storage_path    text not null,
+    created_at      timestamptz default now()
+);
+create index if not exists files_conv_idx on files(conversation_id, created_at desc);
+
 alter table conversations      enable row level security;
 alter table messages           enable row level security;
 alter table short_term_memory  enable row level security;
 alter table long_term_memory   enable row level security;
 alter table documents          enable row level security;
+alter table files              enable row level security;
 
 drop policy if exists conv_own on conversations;
 create policy conv_own on conversations
@@ -169,6 +183,13 @@ drop policy if exists doc_delete on documents;
 create policy doc_delete on documents
     for delete to authenticated using (true);
 
+-- 会话文件按用户隔离，与 conv_own 同构（这里自带 user_id，不必经 conversations 绕）
+drop policy if exists files_own on files;
+create policy files_own on files
+    for all to authenticated
+    using      (user_id = auth.uid())
+    with check (user_id = auth.uid());
+
 grant usage on schema public to authenticated;
 -- 无此授权时 PostgreSQL 会在 search_path 里静默跳过 extensions，
 -- 报错是「type vector does not exist」而非权限不足，容易误判成扩展没装。
@@ -177,6 +198,7 @@ grant select, insert, update, delete on
     conversations, messages, short_term_memory, long_term_memory
     to authenticated;
 grant select, insert, delete on documents to authenticated;
+grant select, insert, delete on files to authenticated;
 grant usage, select on sequence
     messages_id_seq, short_term_memory_id_seq, long_term_memory_id_seq, documents_id_seq
     to authenticated;
@@ -245,7 +267,8 @@ async def db():
     yield
     async with admin_conn() as conn:
         await conn.execute(
-            "truncate conversations, messages, short_term_memory, long_term_memory, documents cascade")
+            "truncate conversations, messages, short_term_memory, long_term_memory, documents, "
+            "files cascade")
     await close_pool()
 
 
