@@ -1,10 +1,10 @@
 FROM python:3.11-slim
 WORKDIR /app
-# 安装依赖（与 pyproject.toml 保持一致）
-RUN pip install --no-cache-dir \
-    "fastapi>=0.115.0" "uvicorn[standard]>=0.32.0" "pydantic>=2.0.0" \
-    "pydantic-settings>=2.0.0" "openai>=1.0.0" "mcp>=1.0.0" "httpx>=0.27.0" \
-    "sse-starlette>=2.0.0" "python-dotenv>=1.0.0"
+COPY pyproject.toml uv.lock ./
+RUN pip install --no-cache-dir uv \
+ && uv export --frozen --no-dev --no-emit-project -o /tmp/requirements.txt \
+ && pip install --no-cache-dir -r /tmp/requirements.txt \
+ && pip uninstall -y uv
 COPY app ./app
 EXPOSE 8000
 # 数据库与 JWT 密钥由挂载的 /app/.env 提供（SUPABASE_DATABASE_URL / SUPABASE_JWT_SECRET）
