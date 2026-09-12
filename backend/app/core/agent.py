@@ -129,6 +129,9 @@ def _tool_result_event(agent_name, name, label, tool_call_id, text, raw):
              "result": text, "id": tool_call_id, "label": label}
     if isinstance(raw, dict) and raw.get("artifacts"):
         event["artifacts"] = raw["artifacts"]
+    # 知识库图片：与 artifacts 并列的侧信道。模型不参与拼图片 URL，它只负责拿到描述。
+    if isinstance(raw, dict) and raw.get("images"):
+        event["images"] = raw["images"]
     return event
 
 

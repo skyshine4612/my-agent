@@ -309,6 +309,9 @@ class AgentService:
                         # 产物清单随消息落库：刷新后从历史还原工具气泡时，下载入口还在
                         if ev.get("artifacts"):
                             entry["artifacts"] = ev["artifacts"]
+                        # 知识库图片同理：不落库的话刷新一次缩略图就没了
+                        if ev.get("images"):
+                            entry["images"] = ev["images"]
                         # id 转成 tool_call_id 保留：供 assemble_history 跨轮还原 role=tool 消息时配对
                         entry["tool_call_id"] = entry.pop("id")
                         state.tools.append(entry)
@@ -319,6 +322,8 @@ class AgentService:
                            "result": ev.get("result", ""), "id": ev["id"], "label": ev.get("label", name)}
                     if ev.get("artifacts"):
                         sse["artifacts"] = ev["artifacts"]
+                    if ev.get("images"):
+                        sse["images"] = ev["images"]
                     yield sse
 
         gen_task = asyncio.create_task(generate())

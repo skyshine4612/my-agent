@@ -20,3 +20,15 @@ def test_script_artifacts_pass_through():
 def test_empty_artifacts_not_attached():
     ev = _tool_result_event("main", "run_skill_script", "执行数据处理脚本", "tc3", "", {"ok": True, "artifacts": []})
     assert "artifacts" not in ev
+
+
+def test_tool_result_event_carries_images():
+    """图片与 artifacts 并列走侧信道，不塞进 artifacts —— 后者的语义是「可下载的会话文件」。"""
+    ev = _tool_result_event("assistant", "search_knowledge", "检索知识库", "id1", "文本",
+                            {"hits": [], "images": [{"key": "a/b/0.jpg", "desc": "西湖"}]})
+    assert ev["images"] == [{"key": "a/b/0.jpg", "desc": "西湖"}]
+
+
+def test_tool_result_event_without_images_has_no_key():
+    ev = _tool_result_event("assistant", "read_file", "读取结果文件", "id1", "文本", "raw")
+    assert "images" not in ev

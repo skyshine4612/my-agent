@@ -315,6 +315,66 @@ async def test_tool_result_pairs_by_call_id_same_name_parallel(user_id):
     assert {e["id"] for e in tool_results} == {"call_a", "call_b"}
 
 
+class ImageToolLLM:
+    """第一轮调一次 search_knowledge，第二轮收口。"""
+
+    def __init__(self):
+        self.i = 0
+        self.turns = [
+            [{"type": "end", "tool_calls": [
+                {"id": "call_k", "function": {"name": "search_knowledge",
+                                              "arguments": '{"query":"西湖"}'}}]}],
+            [{"type": "content", "text": "西湖很好"}, {"type": "end", "tool_calls": None}],
+        ]
+
+    async def stream_chat(self, messages, tools=None):
+        turn = self.turns[self.i]
+        self.i += 1
+        for e in turn:
+            yield e
+
+
+class ImageRegistry:
+    """call_raw 返回 search_knowledge 那种带侧信道的结构化结果。"""
+
+    def list_names(self):
+        return ["search_knowledge"]
+
+    def get(self, name):
+        return _StubTool(name)
+
+    def label(self, name):
+        return "检索知识库"
+
+    async def call_raw(self, name, args):
+        return {"hits": [{"content": "西湖很美"}],
+                "images": [{"key": "a/b/0.jpg", "desc": "西湖"}]}
+
+
+@pytest.mark.asyncio
+async def test_images_reach_both_sse_and_history(user_id):
+    """图片在事件构造、落库、SSE 三处各有一份显式白名单，漏哪一处都不报错只静默失效：
+    只改事件构造的话前端收得到、落库丢了，刷新一次缩略图就没了。两处下游一起断言。"""
+    svc = AgentService()
+    svc.chat_model = EventScriptChatModel(llm=ImageToolLLM())
+    svc.registry = ImageRegistry()
+
+    async def noop(user_id, conv_id):
+        pass
+
+    svc.memory.extract_facts = noop
+
+    events = [e async for e in svc.chat_stream(user_id, None, "西湖怎么玩")]
+    imgs = [{"key": "a/b/0.jpg", "desc": "西湖"}]
+    results = [e for e in events if e["type"] == "tool_result"]
+    assert [e.get("images") for e in results] == [imgs]
+
+    conv_id = next(e["conversation_id"] for e in events if e["type"] == "conversation_id")
+    history = await svc.conversation_store.get_history(user_id, conv_id)
+    saved = json.loads(history[-1]["content"])
+    assert saved["tools"][0]["images"] == imgs
+
+
 class RecordingLLM:
     """记录蒸馏调用次数的假模型，验证增量压缩不重复调用摘要浓缩。"""
 
