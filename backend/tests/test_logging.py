@@ -2,6 +2,7 @@
 # 日志接线的回归测试：uvicorn 的异常栈必须能落进 logs/app.log。
 import logging
 
+import pytest
 from uvicorn.config import LOGGING_CONFIG
 
 from app.core.logging import setup_logging
@@ -20,19 +21,14 @@ def _replay_uvicorn_logger_setup():
         lg.propagate = cfg.get("propagate", True)
 
 
-def test_uvicorn_loggers_feed_root():
-    """uvicorn / uvicorn.error 必须上行到 root，否则未捕获异常栈只进 stderr。"""
-    _replay_uvicorn_logger_setup()
-    setup_logging()
+@pytest.mark.parametrize("name", ["uvicorn", "uvicorn.error"])
+def test_uvicorn_loggers_reach_root(name):
+    """行为断言：这两个 logger 上打的记录要真的走到 root 的 handler。
 
-    for name in ("uvicorn", "uvicorn.error"):
-        lg = logging.getLogger(name)
-        assert lg.handlers == [], f"{name} 自带 handler 会把日志截在半路"
-        assert lg.propagate is True, f"{name} 关掉了 propagate，异常栈到不了 root"
-
-
-def test_uvicorn_error_record_actually_reaches_root():
-    """行为断言：uvicorn.error 上打的记录要真的走到 root 的 handler。"""
+    setup_logging 清空它们自带的 handler 并打开 propagate，为的就是未捕获异常栈能落进
+    logs/app.log（uvicorn 默认只写自己的 stderr）。这里用探针记录验证「真的到了」，
+    而不是断言 handlers / propagate 这两个内部接线属性。
+    """
     _replay_uvicorn_logger_setup()
     setup_logging()
 
@@ -42,7 +38,7 @@ def test_uvicorn_error_record_actually_reaches_root():
     root = logging.getLogger()
     root.addHandler(probe)
     try:
-        logging.getLogger("uvicorn.error").error("探针异常")
+        logging.getLogger(name).error("探针异常")
     finally:
         root.removeHandler(probe)
 

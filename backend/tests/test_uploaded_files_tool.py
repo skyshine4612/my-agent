@@ -24,13 +24,6 @@ async def test_lists_upload_and_marks_artifacts(store):
     assert "由 excel/desensitize 生成" in out
 
 
-async def test_reports_plain_names_without_file_id(store):
-    """清单里不出现 file_id：模型按文件名引用，uuid 是它不该看见的内部键。"""
-    await store.save("u1", "c1", "a.xlsx", b"x" * 1024)
-    out = await make_list_uploaded_files(store).ainvoke({})
-    assert out == "- a.xlsx  1.0KB"
-
-
 async def test_empty_conversation_falls_back_to_text(store):
     """空清单必须给一句话：返回空串时模型会以为工具坏了，转而凭印象编文件名。"""
     out = await make_list_uploaded_files(store).ainvoke({})

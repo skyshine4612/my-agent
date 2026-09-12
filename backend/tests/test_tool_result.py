@@ -70,9 +70,6 @@ class FakeRegistry:
         # create_agent 需要真工具对象（middleware 才拿得到 request.tool）；执行由 middleware 短路，不会真跑
         return _StubTool(name)
 
-    def to_openai_schemas(self, names):
-        return []
-
     def label(self, name):
         return name
 

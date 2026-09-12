@@ -98,7 +98,7 @@ class StreamingLLM:
 
 
 class FakeRegistry:
-    """工具注册表的假实现：call_raw 记录调用并返回预设结果，to_openai_schemas 返回空 schema。"""
+    """工具注册表的假实现：call_raw 记录调用并返回预设结果。"""
 
     def __init__(self, r, raises=None):
         self.r = r
@@ -114,9 +114,6 @@ class FakeRegistry:
     def get(self, name):
         # create_agent 需要真工具对象（middleware 才拿得到 request.tool）；执行由 middleware 短路，不会真跑
         return _StubTool(name)
-
-    def to_openai_schemas(self, names):
-        return []
 
     def label(self, name):
         return name
@@ -137,16 +134,13 @@ class ConcurrentRegistry:
         # 进入时自增并发数，退出前 sleep 制造重叠窗口，若串行执行则 max_active 恒为 1
         self.active += 1
         self.max_active = max(self.max_active, self.active)
-        # 默认延迟保持一致，现有用例 test_run_stream_parallel_tools_keep_order 的行为不受影响
+        # 默认延迟保持一致：所有工具同时起步，重叠窗口才观测得到
         await asyncio.sleep(self.delays.get(name, 0.05))
         self.active -= 1
         return self.results[name]
 
     def get(self, name):
         return _StubTool(name)
-
-    def to_openai_schemas(self, names):
-        return []
 
     def label(self, name):
         return name
@@ -204,29 +198,6 @@ async def test_run_stream_tool_call_and_accumulated_text():
     assert reg.called == [("w", {"c": "成都"})]
     assert any(e["type"] == "tool_call" and e["tool"] == "w" and e["args"] == {"c": "成都"} for e in events)
     assert any(e["type"] == "tool_result" and e["tool"] == "w" and e["status"] is True and e["result"] == "晴" for e in events)
-
-
-@pytest.mark.asyncio
-async def test_run_stream_parallel_tools_keep_order():
-    """验证 run_stream 同一轮多工具并行执行，且结果按 tool_calls 原始顺序回填（tool_call_id 对齐）。"""
-    llm = StreamingLLM([
-        [{"type": "end", "tool_calls": [
-            {"id": "1", "function": {"name": "a", "arguments": "{}"}},
-            {"id": "2", "function": {"name": "b", "arguments": "{}"}},
-        ]}],
-        [{"type": "content", "text": "done"}, {"type": "end", "tool_calls": None}],
-    ])
-    reg = ConcurrentRegistry({"a": "a_result", "b": "b_result"})
-    a = Agent(name="t", system_prompt="s", tools=["a", "b"], model=EventScriptChatModel(llm=llm))
-    out, _ = await a.run_stream("go", [], reg, on_event=None)
-    assert out == "done"
-    # 并发度达到 2，证明两个工具是并行执行而非串行
-    assert reg.max_active == 2
-    # 第二轮回填的 tool 消息按 tool_call_id 原始顺序（1 在前、2 在后），内容与工具一一对应
-    second_messages = llm.calls[1]
-    tool_msgs = [m for m in second_messages if m["role"] == "tool"]
-    assert [m["tool_call_id"] for m in tool_msgs] == ["1", "2"]
-    assert [m["content"] for m in tool_msgs] == ["a_result", "b_result"]
 
 
 @pytest.mark.asyncio
@@ -308,6 +279,10 @@ async def test_parallel_tool_calls_keep_order_and_ids():
     # tool_result 按 id 配对，而非按完成顺序 —— b 更快完成，故到达顺序与 tool_call 相反
     assert [e["id"] for e in results] == ["call_b", "call_a"]
     assert {e["id"]: e["result"] for e in results} == {"call_a": "a_result", "call_b": "b_result"}
+    # 回填给模型的 tool 消息同样按 tool_call_id 原始顺序，内容与工具一一对应 —— 完成顺序相反也不乱
+    tool_msgs = [m for m in llm.calls[1] if m["role"] == "tool"]
+    assert [m["tool_call_id"] for m in tool_msgs] == ["call_a", "call_b"]
+    assert [m["content"] for m in tool_msgs] == ["a_result", "b_result"]
 
 
 @pytest.mark.asyncio

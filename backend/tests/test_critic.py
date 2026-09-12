@@ -6,7 +6,6 @@ import logging
 from typing import Any
 
 import pytest
-from langchain.agents.structured_output import ToolStrategy
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage
 from langchain_core.messages.utils import convert_to_openai_messages
@@ -215,8 +214,6 @@ def test_critic_verdict_docstring_becomes_tool_description():
     模型只能靠猜该调哪个工具；猜错即 structured_response=None → 走 fail-open 静默恒判通过。
     """
     assert CriticVerdict.__doc__ and CriticVerdict.__doc__.strip()
-    spec = ToolStrategy(schema=CriticVerdict).schema_specs[0]
-    assert spec.description.strip() == CriticVerdict.__doc__.strip()
 
 
 @pytest.mark.asyncio

@@ -140,19 +140,8 @@ async def test_update_importance_bumps_dedup_metric(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_long_term_prune(user_id, make_user, fake_embedder):
-    """验证长期记忆的 importance 淘汰与用户隔离"""
-    l = LongTermMemory(max_facts=2, embedder=fake_embedder)
-    await l.add_facts(user_id, [{"fact": "a", "importance": 0.9}, {"fact": "b", "importance": 0.3},
-                                {"fact": "c", "importance": 0.5}])
-    facts = await l.get_all(user_id)
-    assert len(facts) == 2 and "b" not in [f["fact"] for f in facts]
-    assert await l.get_all(await make_user()) == []  # 跨用户隔离
-
-
-@pytest.mark.asyncio
 async def test_long_term_prune_user_isolation(make_user, fake_embedder):
-    """验证容量淘汰按 user_id 隔离：A 超限淘汰时不影响 B 的高分 facts 数量与内容"""
+    """容量淘汰（留 importance 最高的 max_facts 条）按 user_id 隔离：A 超限不影响 B，新用户读到空。"""
     l = LongTermMemory(max_facts=2, embedder=fake_embedder)
     a, b = await make_user(), await make_user()
     # 用户 B 先存入高分事实，作为隔离基准
@@ -165,3 +154,5 @@ async def test_long_term_prune_user_isolation(make_user, fake_embedder):
     assert [f["fact"] for f in await l.get_all(a)] == ["A-low-3", "A-low-2"]
     # B 的 facts 数量与内容均不受 A 的淘汰影响
     assert [f["fact"] for f in await l.get_all(b)] == ["B-important"]
+    # 第三个用户什么都读不到
+    assert await l.get_all(await make_user()) == []

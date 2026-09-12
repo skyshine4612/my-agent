@@ -148,34 +148,6 @@ async def test_chat_stream_records_attachments_on_user_message(user_id):
 
 
 @pytest.mark.asyncio
-async def test_chat_stream_writes_attachments_into_short_term_memory(user_id):
-    """附件折进短期记忆的 user 行：下一轮追问「我上次传的那个」时模型才有事实可依。
-
-    这一行与当轮喂给模型的 user 正文是同一份文本（同一个 render_user_message），
-    跨轮指代才不用去会话清单里猜。
-    """
-    svc = AgentService()
-    svc.chat_model = EventScriptChatModel(llm=FakeStreamingLLM())
-
-    async def noop(user_id, conv_id):
-        pass
-
-    svc.memory.extract_facts = noop
-
-    files = [{"file_id": "f1", "name": "大文件.xlsx", "size": 5748559}]
-    events = [e async for e in svc.chat_stream(user_id, None, "帮我把excel文件做下脱敏", files=files)]
-    conv_id = next(e["conversation_id"] for e in events if e["type"] == "conversation_id")
-
-    records = await svc.short_term_memory.get_records(user_id, conv_id)
-    assert records[0]["role"] == "user"
-    assert records[0]["content"] == ("帮我把excel文件做下脱敏\n[本条消息携带的文件]\n"
-                                     "- 大文件.xlsx  5.5MB")
-    # 关键：下一轮组装出的历史里必须还带着它——这才是「跨轮指代有事实可依」的实测口径
-    history, _ = await svc.memory.assemble_history(user_id, conv_id)
-    assert "大文件.xlsx" in history[0]["content"]
-
-
-@pytest.mark.asyncio
 async def test_chat_stream_without_files_keeps_user_message_plain(user_id):
     """没带附件时用户消息仍是纯文本——历史里已存的旧消息是纯文本，两种格式前端都要吃得下。"""
     svc = AgentService()
@@ -208,11 +180,11 @@ class CapturingStreamLLM:
 
 
 @pytest.mark.asyncio
-async def test_attachment_block_is_identical_in_model_input_and_memory(user_id):
-    """本轮喂给模型的 user 正文与写进短期记忆的 user 行是同一份文本。
+async def test_attachment_block_reaches_model_and_survives_into_the_next_turn(user_id):
+    """附件折进 user 正文的完整口径：本轮模型收到它、短期记忆存下同一份、下一轮组装历史时还在。
 
-    两处各渲一次就可能漂移：模型这一轮看到的名字与它下一轮在记忆里看到的对不上，
-    追问「刚才那个文件」时就会去找一个不存在的名字。
+    三处任一漂移都断链——模型这轮看到的名字与它下一轮在记忆里看到的对不上，追问「刚才那个
+    文件」时就会去找一个不存在的名字。所以断言的是「同一份文本」，而不是「含某段文字」。
     """
     svc = AgentService()
     llm = CapturingStreamLLM()
@@ -230,9 +202,12 @@ async def test_attachment_block_is_identical_in_model_input_and_memory(user_id):
 
     seen_user = [m for m in llm.calls[0] if m.get("role") == "user"]
     assert seen_user[-1]["content"] == expected
-
     records = await svc.short_term_memory.get_records(user_id, conv_id)
+    assert records[0]["role"] == "user"
     assert records[0]["content"] == expected
+    # 下一轮组装出的历史里还带着它——「跨轮指代有事实可依」的实测口径
+    history, _ = await svc.memory.assemble_history(user_id, conv_id)
+    assert history[0]["content"] == expected
 
 
 @pytest.mark.asyncio
@@ -296,9 +271,6 @@ class SlowFastRegistry:
 
     def list_names(self):
         return ["poi_search"]
-
-    def to_openai_schemas(self, names):
-        return []
 
     def get(self, name):
         return _StubTool(name)

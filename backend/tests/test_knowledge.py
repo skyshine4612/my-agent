@@ -35,7 +35,7 @@ async def test_ingest_empty_text_writes_nothing(db, user_id, fake_embedder):
 
 
 async def test_search_ranks_by_similarity(db, user_id, fake_embedder):
-    """检索按余弦相似度降序：问西湖，西湖那块必须排第一。"""
+    """检索按余弦相似度降序（问西湖，西湖那块排第一），且 top_k 限制返回条数。"""
     store = KnowledgeStore(embedder=fake_embedder, **_PER_PARA)
     await store.ingest(user_id, "西湖值得去。\n\n火锅值得吃。\n\n长城值得爬。", title="攻略")
 
@@ -43,12 +43,7 @@ async def test_search_ranks_by_similarity(db, user_id, fake_embedder):
     assert len(hits) == 3
     assert "西湖" in hits[0]["content"]
     assert hits[0]["similarity"] > hits[1]["similarity"]
-
-
-async def test_search_respects_top_k(db, user_id, fake_embedder):
-    """top_k 限制返回条数。"""
-    store = KnowledgeStore(embedder=fake_embedder, **_PER_PARA)
-    await store.ingest(user_id, "西湖值得去。\n\n火锅值得吃。\n\n长城值得爬。", title="攻略")
+    # top_k 生效：库里有 3 条，要 1 条就只给 1 条
     assert len(await store.search(user_id, "西湖", top_k=1)) == 1
 
 

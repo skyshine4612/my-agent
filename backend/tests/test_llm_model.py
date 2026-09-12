@@ -3,7 +3,6 @@
 import httpx
 import pytest
 from langchain.agents import create_agent
-from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import HumanMessage
 from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI
@@ -54,7 +53,6 @@ def test_get_chat_model_with_key_returns_langchain_model(monkeypatch):
 
     model = llm.get_chat_model()
     assert isinstance(model, ChatOpenAI)
-    assert isinstance(model, BaseChatModel)
     assert model.model_name == settings.llm_model
 
 

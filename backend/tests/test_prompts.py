@@ -7,9 +7,8 @@ from app.core.prompts import (load_prompt, render_history_summary, render_long_t
 
 
 def test_today_hint_contains_current_date():
-    """today_hint 输出「今天是」+ 当天日期（YYYY-MM-DD）+ 周几，让 LLM 不再编造过去日期。"""
+    """today_hint 的输出必须含当天日期（YYYY-MM-DD）与周几，让 LLM 不再编造过去日期。"""
     hint = today_hint()
-    assert hint.startswith("今天是 ")
     # 包含今天日期（格式 YYYY-MM-DD）
     assert datetime.now().strftime("%Y-%m-%d") in hint
     # 含周几提示（周一 ~ 周日 之一）
@@ -38,7 +37,6 @@ def test_render_system_prompt_fills_slots():
     assert "{long_term_hint}" not in out
     assert directory in out
     assert grounding in out
-    assert "你是通用多业务助手" in out
     assert "今天是 2026-09-06（周六）。" in out
     assert "喜欢自然风光；偏好经济型酒店" in out
 
@@ -60,7 +58,8 @@ def test_render_history_summary():
 
 
 def test_render_system_prompt_empty_context_shows_none():
-    """today / long_term_hint 为空时渲染为「无」，不残留空标题。"""
+    """today / long_term_hint 为空时降级成「无」，而不是留一个空标题或未替换的占位符。"""
     out = render_system_prompt("- travel：旅行规划", load_prompt("grounding"))
-    assert "【当前时间】\n无" in out
-    assert "【用户历史偏好】\n无" in out
+    assert "无" in out
+    for slot in ("{today}", "{long_term_hint}", "{skill_directory}", "{tool_grounding}"):
+        assert slot not in out

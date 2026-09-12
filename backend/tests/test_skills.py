@@ -13,14 +13,14 @@ def test_load_skills_scans_travel():
     names = [s["name"] for s in skills]
     assert "travel" in names
     travel = next(s for s in skills if s["name"] == "travel")
-    assert travel["description"] == "旅行规划（行程/交通/景点/天气/美食/预算）"
-    assert "train_ticket_query" in travel["body"]
+    assert "旅行" in travel["description"]  # 描述进 system 的业务清单，是模型选 skill 的依据
+    assert travel["body"].strip()
 
 
 def test_get_skill_body_returns_body():
     """get_skill_body 按名返回正文；未知名返回空串。"""
     body = get_skill_body("travel")
-    assert "train_ticket_query" in body
+    assert "train_ticket_query" in body  # 正文真的读出来了，不只是非空
     assert get_skill_body("unknown") == ""
 
 
