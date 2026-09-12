@@ -3,6 +3,7 @@
 # 全局共享（不像长期记忆那样按 user 隔离），但读写仍走 rls_conn：
 # 1A 的规矩是放进这套栈的表全开 RLS，业务查询一律不裸池直连。
 import logging
+import time
 
 from app.core.chunking import chunk_text
 from app.core.db import rls_conn
@@ -30,9 +31,12 @@ class KnowledgeStore:
         embed 失败直接抛出，不静默降级：知识库没有向量就检索不到，
         属于必须让调用方知道的情形（与长期记忆允许 embedding=NULL 相反）。
         """
+        started = time.monotonic()
         chunks = chunk_text(text, self.chunk_size, self.overlap)
         if not chunks:
             return 0
+        name = title or source_url or "未命名"
+        logger.info("[知识库] 切块 %d 块，开始向量化：%s", len(chunks), name)
         vectors = await embed_batched(self.embedder, chunks)
         async with rls_conn(user_id) as conn:
             await conn.executemany(
@@ -40,7 +44,8 @@ class KnowledgeStore:
                 "values($1, $2, $3, $4::vector, $5)",
                 [(title, c, i, to_vector_literal(v), source_url)
                  for i, (c, v) in enumerate(zip(chunks, vectors))])
-        logger.info("[知识库] 入库：%s（%d 块）", title or source_url or "未命名", len(chunks))
+        logger.info("[知识库] 入库：%s（%d 块，耗时 %.1fs）", name, len(chunks),
+                    time.monotonic() - started)
         return len(chunks)
 
     async def search(self, user_id, query, top_k=3) -> list[dict]:

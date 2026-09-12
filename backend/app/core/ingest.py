@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import re
+import time
 from html.parser import HTMLParser
 from urllib.parse import urljoin
 
@@ -109,8 +110,12 @@ async def _fill_image_descriptions(text: str, urls: list[str], referer: str = ""
     if not urls:
         return text
     descs = await describe_images(urls, referer=referer)
+    filled = 0
     for i, desc in enumerate(descs):
+        if desc:
+            filled += 1
         text = text.replace(f"\x00IMG{i}\x00", f"【图片：{desc}】" if desc else "")
+    logger.info("[知识库] 图片描述 url=%s 候选 %d 张，拿到描述 %d 张", referer, len(descs), filled)
     return re.sub(_IMAGE_MARK, "", text)
 
 
@@ -134,7 +139,9 @@ def _fetch_html_sync(url: str) -> tuple[str, str]:
                 page.wait_for_load_state("networkidle", timeout=8000)
             except Exception:
                 logger.info("[知识库] networkidle 等待超时，按当前 DOM 提取 url=%s", url)
-            return (page.title() or url), page.content()
+            title, html = (page.title() or url), page.content()
+            logger.info("[知识库] 页面就绪 url=%s 标题=%s HTML=%d 字", url, title, len(html))
+            return title, html
         finally:
             browser.close()
 
@@ -145,6 +152,11 @@ async def fetch_url_text(url: str) -> tuple[str, str]:
     攻略站多为前端渲染，直接抓 HTML 拿不到正文，所以走真实浏览器。
     建库是低频操作，每次起一个浏览器实例即可，不做常驻连接池。
     """
+    logger.info("[知识库] 开始抓取 url=%s", url)
+    started = time.monotonic()
     title, html = await asyncio.to_thread(_fetch_html_sync, url)
     text, images = extract_with_images(html, url)
-    return title, await _fill_image_descriptions(text, images, referer=url)
+    text = await _fill_image_descriptions(text, images, referer=url)
+    logger.info("[知识库] 抓取完成 url=%s 正文 %d 字，图片候选 %d 张，耗时 %.1fs",
+                url, len(text), len(images), time.monotonic() - started)
+    return title, text

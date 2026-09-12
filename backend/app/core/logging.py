@@ -43,3 +43,6 @@ def setup_logging():
     if not root.handlers:
         root.addHandler(console)
         root.addHandler(file_handler)
+    # HTTP 客户端每发一个请求就打一条 INFO（一次入库几十条 embedding），只保留失败
+    for noisy in ("httpx", "httpx2", "httpcore", "httpcore2"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
