@@ -21,6 +21,7 @@ from app.core.registry import ToolRegistry
 from app.core.sandbox import SandboxClient
 from app.core.skill_scripts import scan_scripts
 from app.core.skills import load_skills
+from app.core.storage import StorageClient
 from app.core.token_utils import estimate_tokens
 from app.datasource.amap_web import AmapWebDataSource
 from app.tools import register_all_tools
@@ -60,8 +61,10 @@ class AgentService:
         self.knowledge = KnowledgeStore()
         # 工具结果地址索引：超长结果写临时文件，read_file/grep 按需读；本轮结束即清，避免堆积
         self.tool_result_store = ToolResultStore(settings.result_dir)
+        # 对象存储：会话文件与知识库图片共用，启动时 new 一次（httpx 构造不开连接，仍是零 IO）
+        self.storage = StorageClient(settings.supabase_url, settings.supabase_jwt_secret)
         # 会话文件：上传件与沙箱产物，与 result_dir（spill）分两棵树
-        self.file_store = FileStore(settings.file_dir)
+        self.file_store = FileStore(self.storage)
         # 沙箱客户端：长连接复用，随 registry 一起装配一次
         self.sandbox = SandboxClient(settings.sandbox_url, settings.sandbox_timeout)
         # 脚本白名单：启动时扫描一次，run_skill_script 的 enum 与校验都用这份索引
@@ -118,17 +121,20 @@ class AgentService:
             if ds_close is not None:
                 await ds_close()
         await self.sandbox.close()
+        # 漏了这行等于把「启动时装配一次」想避免的连接泄漏原样复制一份
+        await self.storage.close()
         await close_chat_model()
 
     async def delete_conversation(self, user_id, conv_id):
-        """删除会话及其消息，并清理该会话的短期记忆、工具结果地址索引与会话文件；归属校验失败返回 False。
+        """删除会话及其消息，并清理该会话的 Storage 对象、短期记忆与工具结果地址索引；
+        归属校验失败返回 False。
 
-        result_dir 与 file_dir 是分开的两棵树（本轮清 vs 会话清），所以要分别清。
+        **顺序写死：先删对象，再删会话行。** 反过来的话 conversations 级联先把 files 行
+        删光——今天前缀删不读表，看似无关，但任何一次「读表再删」的改动都会静默失效。
+        非本人的 conv_id 前缀里带的是请求者自己的 user_id，匹配不到任何对象，是空操作。
         """
-        ok = await self.memory.delete_conversation(user_id, conv_id)
-        if ok:
-            await self.file_store.delete_conversation(user_id, conv_id)
-        return ok
+        await self.file_store.delete_conversation(user_id, conv_id)
+        return await self.memory.delete_conversation(user_id, conv_id)
 
     async def chat_stream(self, user_id, conv_id, message, files=None):
         """SSE 流式对话主流程，依次产出事件：conversation_id → token/tool_call/tool_result → done。

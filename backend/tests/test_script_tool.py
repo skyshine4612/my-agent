@@ -1,14 +1,16 @@
-# run_skill_script 工具测试：假沙箱客户端（记录调用参数）+ 真 FileStore(tmp_path) + 临时脚本目录。
+# run_skill_script 工具测试：假沙箱客户端（记录调用参数）+ 真 FileStore（假 Storage、真库）+ 临时脚本目录。
 # 重点验证三件静默出错的事：白名单组合校验、文件引用只认本会话文件名、产物写回带对的 source。
 import base64
 
 import pytest
+import pytest_asyncio
 
 from app.core.agent import NON_QUERY_TOOLS
 from app.core.context import current_conversation_id, current_user_id
 from app.core.files import FileStore
 from app.core.skill_scripts import scan_scripts
 from app.tools.script import make_run_skill_script
+from tests.fake_storage import make_client
 
 
 class _FakeSandbox:
@@ -25,20 +27,32 @@ class _FakeSandbox:
 
 
 @pytest.fixture
-def env(tmp_path):
-    for skill, scripts in (("excel", ["desensitize.py"]), ("travel", ["plan.py"])):
+def scripts(tmp_path):
+    """白名单脚本目录：run_skill_script 读的是这里的源码，不是模型给的。"""
+    for skill, names in (("excel", ["desensitize.py"]), ("travel", ["plan.py"])):
         d = tmp_path / "skills" / skill / "scripts"
         d.mkdir(parents=True)
-        for s in scripts:
+        for s in names:
             (d / s).write_text("print('hi')", encoding="utf-8")
-    store = FileStore(tmp_path / "files")
-    current_user_id.set("u1")
-    current_conversation_id.set("c1")
-    return store, scan_scripts(tmp_path / "skills")
+    return scan_scripts(tmp_path / "skills")
+
+
+@pytest_asyncio.fixture
+async def env(db, user_id, new_conversation, scripts):
+    """(store, scripts, uid, cid)：真 FileStore——字节进假 Storage，元数据进真库。
+
+    uid / cid 必须是库里真实存在的行（files 表两个外键），
+    再像以前那样用 "u1" / "c1" 字面量灌 contextvar 会直接撞外键。
+    """
+    storage, _ = make_client()
+    cid = await new_conversation()
+    current_user_id.set(user_id)
+    current_conversation_id.set(cid)
+    return FileStore(storage), scripts, user_id, cid
 
 
 async def test_rejects_unknown_skill_script_pair(env):
-    store, scripts = env
+    store, scripts, uid, cid = env
     sandbox = _FakeSandbox()
     tool = make_run_skill_script(sandbox, store, scripts)
     # excel 与 plan 各自都在白名单里，但组合不存在
@@ -48,15 +62,15 @@ async def test_rejects_unknown_skill_script_pair(env):
 
 
 async def test_enum_blocks_names_outside_whitelist(env):
-    store, scripts = env
+    store, scripts, uid, cid = env
     tool = make_run_skill_script(_FakeSandbox(), store, scripts)
     with pytest.raises(Exception):
         await tool.ainvoke({"skill": "excel", "script": "rm_rf", "params": {}})
 
 
 async def test_resolves_name_and_sends_bytes(env):
-    store, scripts = env
-    await store.save("u1", "c1", "a.xlsx", b"PK\x03\x04")
+    store, scripts, uid, cid = env
+    await store.save(uid, cid, "a.xlsx", b"PK\x03\x04")
     sandbox = _FakeSandbox()
     tool = make_run_skill_script(sandbox, store, scripts)
     r = await tool.ainvoke({"skill": "excel", "script": "desensitize",
@@ -72,7 +86,7 @@ async def test_resolves_name_and_sends_bytes(env):
 
 
 async def test_unknown_name_passes_through_untouched(env):
-    store, scripts = env
+    store, scripts, uid, cid = env
     sandbox = _FakeSandbox()
     tool = make_run_skill_script(sandbox, store, scripts)
     # 不在本会话清单里的值原样透传：路径穿越串也走这条路，由脚本 basename 后 open 失败兜住
@@ -84,8 +98,8 @@ async def test_unknown_name_passes_through_untouched(env):
 
 async def test_file_id_shape_is_not_resolved(env):
     """别名已去掉：照抄工具结果里的 uuid 不会被解析成文件，而是原样传下去撞壁、再靠脚本自纠。"""
-    store, scripts = env
-    saved = await store.save("u1", "c1", "a.xlsx", b"x")
+    store, scripts, uid, cid = env
+    saved = await store.save(uid, cid, "a.xlsx", b"x")
     sandbox = _FakeSandbox()
     tool = make_run_skill_script(sandbox, store, scripts)
     await tool.ainvoke({"skill": "excel", "script": "desensitize", "params": {"file": saved["file_id"]}})
@@ -98,8 +112,8 @@ async def test_name_equal_to_an_artifact_is_not_rewritten(env):
 
     旧设计「命中就把 file_id 拼上扩展名」会把 out_name="已脱敏.xlsx" 改成 "已脱敏.xlsx.xlsx"。
     """
-    store, scripts = env
-    await store.save("u1", "c1", "已脱敏.xlsx", b"x", source="script:excel/desensitize")
+    store, scripts, uid, cid = env
+    await store.save(uid, cid, "已脱敏.xlsx", b"x", source="script:excel/desensitize")
     sandbox = _FakeSandbox()
     tool = make_run_skill_script(sandbox, store, scripts)
     r = await tool.ainvoke({"skill": "excel", "script": "desensitize",
@@ -110,21 +124,21 @@ async def test_name_equal_to_an_artifact_is_not_rewritten(env):
     assert r["ok"] is True
 
 
-async def test_other_users_file_is_not_readable(env):
-    store, scripts = env
+async def test_other_users_file_is_not_readable(env, make_user):
+    store, scripts, uid, cid = env
     sandbox = _FakeSandbox()
     tool = make_run_skill_script(sandbox, store, scripts)
     # 换一个用户执行：同名文件不在本用户的清单里，于是原样透传、不给字节
-    await store.save("u1", "c1", "a.xlsx", b"x")
-    current_user_id.set("u2")
+    await store.save(uid, cid, "a.xlsx", b"x")
+    current_user_id.set(await make_user())
     await tool.ainvoke({"skill": "excel", "script": "desensitize", "params": {"file": "a.xlsx"}})
     assert sandbox.calls[0]["files"] == []
     assert sandbox.calls[0]["args"]["file"] == "a.xlsx"
 
 
 async def test_artifacts_are_saved_back(env):
-    store, scripts = env
-    await store.save("u1", "c1", "a.xlsx", b"x")
+    store, scripts, uid, cid = env
+    await store.save(uid, cid, "a.xlsx", b"x")
     sandbox = _FakeSandbox({"exit_code": 0, "stdout": "ok", "stderr": "",
                             "artifacts": [{"name": "已脱敏.xlsx",
                                            "data": base64.b64encode(b"out").decode()}],
@@ -133,13 +147,13 @@ async def test_artifacts_are_saved_back(env):
     r = await tool.ainvoke({"skill": "excel", "script": "desensitize", "params": {"file": "a.xlsx"}})
     art = r["artifacts"][0]
     assert art["name"] == "已脱敏.xlsx"
-    got = await store.read("u1", "c1", art["file_id"])
+    got = await store.read(uid, cid, art["file_id"])
     assert got is not None and got[1] == b"out"
     assert got[0]["source"] == "script:excel/desensitize"
 
 
 async def test_nonzero_exit_reports_stderr(env):
-    store, scripts = env
+    store, scripts, uid, cid = env
     sandbox = _FakeSandbox({"exit_code": 1, "stdout": "", "stderr": "列名不存在：手机号",
                             "artifacts": [], "duration_ms": 1})
     tool = make_run_skill_script(sandbox, store, scripts)

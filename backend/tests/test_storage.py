@@ -5,7 +5,7 @@ import pytest
 from app.core.storage import (BUCKET_FILES, StorageAuthError, StorageClient,
                               StorageRejected, encode_key, safe_ext)
 
-from tests.fake_storage import make_client
+from tests.fake_storage import TEST_SECRET, make_client
 
 
 async def test_put_then_get_roundtrip():
@@ -32,8 +32,8 @@ async def test_put_rejects_mismatched_returned_key():
 
 async def test_auth_error_on_bad_secret():
     """secret 不一致 → 401 → StorageAuthError（不是泛化异常）。"""
-    client, _ = make_client("right-secret")
-    client._secret = "wrong-secret"
+    client, _ = make_client(TEST_SECRET + "-right")
+    client._secret = TEST_SECRET + "-wrong"
     try:
         await client.get("u1", BUCKET_FILES, "a/b.txt")
     except StorageAuthError:

@@ -11,10 +11,15 @@ import jwt
 from app.core.storage import StorageClient
 
 
+# 假签名密钥。刻意取够 32 字节：PyJWT 对更短的 HMAC 密钥每次签名/验签各发一条
+# InsecureKeyLengthWarning，而它会在几十个用例里被触发，把真警告淹掉。
+TEST_SECRET = "test-secret-that-is-long-enough-for-hs256"
+
+
 class FakeStorage:
     """按 storage-api v1.74.0 的 REST 形状实现上传/下载/删除/批量删/列表。"""
 
-    def __init__(self, secret: str = "test-secret"):
+    def __init__(self, secret: str = TEST_SECRET):
         self.secret = secret
         self.objects: dict[tuple[str, str], bytes] = {}
         self.calls: list[tuple[str, str]] = []
@@ -97,7 +102,7 @@ class FakeStorage:
         return httpx.Response(200, json=items[offset:offset + limit])
 
 
-def make_client(secret: str = "test-secret"):
+def make_client(secret: str = TEST_SECRET):
     """造一个接在内存假 storage 上的客户端，返回 (client, fake)。"""
     fake = FakeStorage(secret)
     http = httpx.AsyncClient(transport=fake.transport)

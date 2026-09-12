@@ -65,8 +65,6 @@ class Settings(BaseSettings):
     sandbox_url: str = "http://sandbox:8001"
     # 传给沙箱的执行超时秒数；后端 httpx 实际等的是这个值 + 5s（留给沙箱杀进程并回结构化响应）
     sandbox_timeout: int = 60
-    # 会话文件目录（上传件与沙箱产物，跟随会话生命周期），与 result_dir 是两棵树
-    file_dir: str = "files"
     # 历史答案原文占 llm_context_budget 的比例（历史会话压缩：超预算的早期答案落盘+摘要，剩余的留给工具交互）
     history_budget_ratio: float = 0.5
     # 长期记忆 hint 占 llm_context_budget 的比例（召回的用户偏好注入 system 的 token 预算上限）
