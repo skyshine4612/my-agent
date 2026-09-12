@@ -46,6 +46,7 @@
         "name": {
           "description": "业务名",
           "enum": [
+            "excel",
             "meal_planning",
             "travel"
           ],
@@ -247,9 +248,14 @@
         },
         "script": {
           "description": "脚本名",
+          "enum": [
+            "desensitize",
+            "inspect"
+          ],
           "type": "string"
         },
         "skill": {
+          "const": "excel",
           "description": "业务名",
           "type": "string"
         }
