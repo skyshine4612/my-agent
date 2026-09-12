@@ -77,3 +77,10 @@ export async function fetchFile(fileId: string, conversationId: string) {
         responseType: 'blob',
     })).data as Blob
 }
+
+// 取知识库原图：同样是 blob。<img src> 带不上 Authorization，必须走这条路。
+// key 形如 <source_key>/<ingest_id>/0.jpg，逐段编码后直接拼进路径。
+export async function fetchKnowledgeImage(key: string) {
+    const path = key.split('/').map(encodeURIComponent).join('/')
+    return (await api.get(`/knowledge/images/${path}`, {responseType: 'blob'})).data as Blob
+}

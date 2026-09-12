@@ -7,6 +7,12 @@ export interface StoredFile {
     size: number
 }
 
+// 知识库图片：key 是 Storage 对象 key（上传失败时为 null），desc 是多模态模型的描述
+export interface KnowledgeImage {
+    key: string | null
+    desc: string
+}
+
 // 工具事件：SSE 流中 tool_call / tool_result 的渲染单元
 // tool_call 产生 {tool, args, id}，tool_result 随后按 id 回填 status（是否完成）与 result（截断版结果）
 // id 用于同名工具并发时精确配对（历史落库消息不含 id，故设为可选）
@@ -19,6 +25,8 @@ export interface ToolEvent {
     id?: string
     // 脚本产物：沙箱里生成、后端写回会话文件目录的文件，渲染成下载卡片
     artifacts?: StoredFile[]
+    // 知识库图片：与 artifacts 并列的侧信道，渲染成缩略图（不可下载）
+    images?: KnowledgeImage[]
 }
 
 // 对话消息：前端聊天区的渲染单元
