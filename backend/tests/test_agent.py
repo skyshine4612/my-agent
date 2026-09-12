@@ -320,45 +320,28 @@ async def test_status_event_precedes_first_content_block():
 
 
 @pytest.mark.asyncio
-async def test_never_converging_model_hits_max_iters_limit():
-    """模型每轮只回 tool_calls、从不给答案：跑满 max_iters 后返回兜底文案，不发 token，rounds 记满。"""
+async def test_never_converging_model_hits_recursion_limit():
+    """模型每轮只回 tool_calls、从不给答案：跑满 60 步后返回兜底文案，不发 token、rounds 记满。
+
+    额度固定 60 步，一轮 ReAct 占 3 步（before_model 钩子 + 模型 + 工具），故恰好放行 20 轮；
+    第 21 次模型调用不会发生。
+    """
     llm = StreamingLLM([
-        [{"type": "end", "tool_calls": [{"id": "c1", "function": {"name": "w", "arguments": "{}"}}]}],
-        [{"type": "end", "tool_calls": [{"id": "c2", "function": {"name": "w", "arguments": "{}"}}]}],
-        [{"type": "end", "tool_calls": [{"id": "c3", "function": {"name": "w", "arguments": "{}"}}]}],
-    ])
+        [{"type": "end", "tool_calls": [{"id": f"c{i}", "function": {"name": "w", "arguments": "{}"}}]}]
+        for i in range(20)])
     reg = FakeRegistry({"w": "晴"})
-    a = Agent(name="t", system_prompt="s", tools=["w"],
-              model=EventScriptChatModel(llm=llm), max_iters=3)
+    a = Agent(name="t", system_prompt="s", tools=["w"], model=EventScriptChatModel(llm=llm))
     events = []
 
     async def on_event(e):
         events.append(e)
 
     out, rounds = await a.run_stream("go", [], reg, on_event=on_event)
-    assert out == "抱歉，本轮查询了较多信息但未能整合成完整回答，请换个方式或精简需求后再试。"
-    assert len(rounds) == 3  # 跑满 max_iters 轮，每轮都真实执行了工具
-    assert reg.called == [("w", {})] * 3
-    assert [e for e in events if e["type"] == "token"] == []
-
-
-@pytest.mark.asyncio
-async def test_default_max_iters_is_20_rounds():
-    """默认 max_iters = 20，且真能跑满 20 轮 —— 图侧 recursion_limit = 3 * max_iters = 60。
-
-    一轮 ReAct 在限额里占 3 个任务（abefore_model 钩子 + 模型 + 工具），故上限必须是 3 * max_iters：
-    少一档就凑不满 max_iters 轮，多一档会把多出来的模型调用放进去。
-    """
-    assert Agent(name="t", system_prompt="s").max_iters == 20
-    llm = StreamingLLM([
-        [{"type": "end", "tool_calls": [{"id": f"c{i}", "function": {"name": "w", "arguments": "{}"}}]}]
-        for i in range(20)])
-    reg = FakeRegistry({"w": "晴"})
-    a = Agent(name="t", system_prompt="s", tools=["w"], model=EventScriptChatModel(llm=llm))
-    out, rounds = await a.run_stream("go", [], reg)
-    assert len(rounds) == 20
+    assert out == _FALLBACK
+    assert len(rounds) == 20  # 跑满 20 轮，每轮都真实执行了工具
     assert reg.called == [("w", {})] * 20
-    assert out == "抱歉，本轮查询了较多信息但未能整合成完整回答，请换个方式或精简需求后再试。"
+    assert llm.i == 20
+    assert [e for e in events if e["type"] == "token"] == []
 
 
 @pytest.mark.asyncio
@@ -417,7 +400,7 @@ async def test_critic_receives_react_answer(monkeypatch):
     calls = _install_critic(monkeypatch, [{"ok": True, "issues": []}])
     reg = FakeRegistry({_HARD_TOOL: "晴"})
     a = Agent(name="t", system_prompt="s", tools=[_HARD_TOOL],
-              model=EventScriptChatModel(llm=llm), max_iters=3)
+              model=EventScriptChatModel(llm=llm))
     out, _ = await a.run_stream("成都天气", [], reg, critic=CriticConfig())
     assert out == "成都明天晴"
     assert len(calls) == 1
@@ -436,7 +419,7 @@ async def test_critic_loop_converges(monkeypatch):
     ])
     reg = FakeRegistry({_HARD_TOOL: "晴"})
     a = Agent(name="t", system_prompt="s", tools=[_HARD_TOOL],
-              model=EventScriptChatModel(llm=llm), max_iters=3)
+              model=EventScriptChatModel(llm=llm))
     events = []
 
     async def on_event(e):
@@ -461,7 +444,7 @@ async def test_critic_loop_stops_at_max_rewrite(monkeypatch):
         {"ok": False, "issues": [{"claim": "票价", "problem": "编造", "correction": "删除"}]}])
     reg = FakeRegistry({_HARD_TOOL: "晴"})
     a = Agent(name="t", system_prompt="s", tools=[_HARD_TOOL],
-              model=EventScriptChatModel(llm=llm), max_iters=3)
+              model=EventScriptChatModel(llm=llm))
     events = []
 
     async def on_event(e):
@@ -485,7 +468,7 @@ async def test_critic_does_not_leak_rounds(monkeypatch):
     ])
     reg = FakeRegistry({_HARD_TOOL: "晴"})
     a = Agent(name="t", system_prompt="s", tools=[_HARD_TOOL],
-              model=EventScriptChatModel(llm=llm), max_iters=3)
+              model=EventScriptChatModel(llm=llm))
     events = []
 
     async def on_event(e):
@@ -499,17 +482,17 @@ async def test_critic_does_not_leak_rounds(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_critic_turn_still_hits_max_iters_limit(monkeypatch):
-    """永不收敛 + 带 critic：额度抬高 2 步后仍恰跑满 max_iters 轮，返回兜底文案、零 token。
+async def test_critic_turn_still_hits_recursion_limit(monkeypatch):
+    """永不收敛 + 带 critic：额度与无 critic 时相同，仍恰跑满 20 轮，返回兜底文案、零 token。
 
-    抬高 2 步的代价在这里可见：第 4 轮模型决策被放行（脚本要备 4 个 turn），但它的工具节点触顶，
-    故 reg 只被调 3 次、rounds 只有 3 条 —— 多出来的只是「次收口前的最后一次决策」。
+    第 21 轮模型决策不会发生（额度在第 21 轮的 before_model 钩子处触顶），故 reg 只被调 20 次、
+    rounds 只有 20 条。
     """
-    llm = StreamingLLM([_tool_round(f"c{i}") for i in range(4)])
+    llm = StreamingLLM([_tool_round(f"c{i}") for i in range(20)])
     _install_critic(monkeypatch, [{"ok": True, "issues": []}])
     reg = FakeRegistry({_HARD_TOOL: "晴"})
     a = Agent(name="t", system_prompt="s", tools=[_HARD_TOOL],
-              model=EventScriptChatModel(llm=llm), max_iters=3)
+              model=EventScriptChatModel(llm=llm))
     events = []
 
     async def on_event(e):
@@ -517,23 +500,24 @@ async def test_critic_turn_still_hits_max_iters_limit(monkeypatch):
 
     out, rounds = await a.run_stream("go", [], reg, on_event=on_event, critic=CriticConfig())
     assert out == _FALLBACK
-    assert len(rounds) == 3  # 额度每 +3 多放行一轮，+2 不会多放行第 4 轮
-    assert reg.called == [(_HARD_TOOL, {})] * 3
+    assert len(rounds) == 20
+    assert reg.called == [(_HARD_TOOL, {})] * 20
     assert [e for e in events if e["type"] == "token"] == []
 
 
 @pytest.mark.asyncio
 async def test_critic_runs_on_converging_turn_with_critic():
-    """收敛 + 带 critic：收口钩子在额度内跑到，critic 确实被触发。
+    """收敛 + 带 critic：在额度用尽的最后一轮才收口，收口钩子仍跑得到、critic 确实被触发。
 
-    N 轮工具后收口实测需 3N + 3 步额度（N=1 时下限为 6），正好卡在额度边界上：
-    max_iters=2 的额度是 3 * 2 + 2 = 8，而收口这轮只用到 6 步。
+    19 轮工具占 57 步，收口轮（before_model + 模型 + 收口钩子）用掉第 58-60 步、刚好跑满；
+    末尾到 END 差一步超限抛异常，但答案已在钩子返回的 state 更新里下发。
     """
-    llm = StreamingLLM([_tool_round("c1"), _answer_round("成都明天晴"), _verdict_turn(ok=True)])
+    llm = StreamingLLM([_tool_round(f"c{i}") for i in range(19)]
+                       + [_answer_round("成都明天晴"), _verdict_turn(ok=True)])
     chat_model = EventScriptChatModel(llm=llm)
     reg = FakeRegistry({_HARD_TOOL: "晴"})
-    a = Agent(name="t", system_prompt="s", tools=[_HARD_TOOL], model=chat_model, max_iters=2)
+    a = Agent(name="t", system_prompt="s", tools=[_HARD_TOOL], model=chat_model)
     out, rounds = await a.run_stream("成都天气", [], reg, critic=CriticConfig())
     assert out == "成都明天晴"
     assert chat_model.verdict_calls >= 1  # 收口钩子确实跑到并触发了 critic
-    assert len(rounds) == 1
+    assert len(rounds) == 19

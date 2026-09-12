@@ -33,6 +33,10 @@ NON_QUERY_TOOLS = {"read_file", "grep", "get_skill", "call_sub_agent"}
 # 只有本轮调用了它们才触发 critic 回路（省成本，仅在硬数据场景做事实校验）。
 HARD_DATA_TOOLS = {"train_ticket_query", "flight_query", "weather_query", "holiday_calendar"}
 
+# 图侧步数额度：一轮 ReAct 占 3 步（before_model 钩子 + 模型 + 工具），60 步 = 20 轮。
+# 防死循环的粗上界，不是精确契约。
+RECURSION_LIMIT = 60
+
 
 def _struct_truncate_to_str(raw, list_limit=15, dict_limit=20, str_limit=4000):
     """结构化截断：list 取前 list_limit 条 / dict 取前 dict_limit 键 / str 截断 str_limit。
@@ -368,13 +372,11 @@ class Agent:
         system_prompt:   系统提示词，注入每轮对话的最前
         tools:           本 Agent 可调用的工具名列表
         model:           langchain 模型实例（create_agent 驱动主循环，工作记忆蒸馏也走它）
-        max_iters:       单次 run_stream 的 ReAct 最大迭代轮数，防止无限循环
     """
     name: str
     system_prompt: str
     tools: list[str] = field(default_factory=list)
     model: object = None
-    max_iters: int = 20
 
     async def run_stream(self, user_message, history, registry, on_event=None,
                          conversation_id=None, context_budget=None,
@@ -447,15 +449,9 @@ class Agent:
             #  从 state 里删掉，故轮次不能从 messages 反推）
             async for mode, payload in graph.astream(
                     {"messages": inputs, "hard_results": [], "tool_results": [], "rounds": []},
-                    # 限额按「任务」计，一轮 ReAct 占 3 个：before_model 钩子 + 模型 + 工具，
-                    # 故取 3 * max_iters —— 刚好允许跑满 max_iters 轮，之后下一次钩子即触顶抛
-                    # GraphRecursionError，落到兜底文案。
-                    # critic 在场时收口钩子也是真实图节点、要占一步，单一 step 计数器下只能靠抬额度补给它，
-                    # 故 +2 步（这正是「工具刚好用满 max_iters 轮、随后收口」那一轮校验能否跑到的差别）。
-                    # 抬到 +3 会让 floor((3n+3)/3) = n + 1 而多放行一轮，破坏「永不停歇仍恰 max_iters 轮」这条契约。
-                    # 有界代价：「把 max_iters 轮工具全部用完、下一次才收口」的那一轮会多放行一步模型决策，
-                    # 于是答案能产出、收口钩子却仍触顶 —— 该轮的事实校验被跳过（单一 step 计数器下无法两全）。
-                    config={"recursion_limit": 3 * self.max_iters + (2 if critic is not None else 0)},
+                    # 限额按「任务」计，一轮 ReAct 占 3 个：before_model 钩子 + 模型 + 工具。
+                    # 模型跑到额度用尽仍未收口时落到兜底文案。
+                    config={"recursion_limit": RECURSION_LIMIT},
                     stream_mode=["messages", "values"]):
                 if mode == "messages":
                     chunk, meta = payload
@@ -485,10 +481,11 @@ class Agent:
                     if payload.get("answer") is not None:
                         answer = payload["answer"]
         except GraphRecursionError:
-            # 达到 max_iters 仍未收敛（每轮都在调工具）：落到下面的兜底文案
-            logger.warning("[Agent:%s] 达到 %d 轮上限仍未收敛，返回兜底文案", self.name, self.max_iters)
+            # 触顶：answer 已有值说明收口钩子跑完了，答案照常下发，只是末尾到 END 超了额度
+            if answer is None:
+                logger.warning("[Agent:%s] 达到 %d 步上限仍未收敛，返回兜底文案", self.name, RECURSION_LIMIT)
         # 判空用 None 而非空串：不调工具轮次即使 content 为空也算收敛（返回空串），
-        # 只有「跑满 max_iters 仍每轮调工具」才落到下面的兜底文案
+        # 只有「跑满额度仍每轮调工具」才落到下面的兜底文案
         if answer is not None:
             # 最终答案按小块上发（前端逐块渲染，保持流式感）
             for j in range(0, len(answer), 40):

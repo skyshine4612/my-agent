@@ -55,7 +55,7 @@ api/routes/chat.py  →  services/agent_service.py  →  core/agent.py (ReAct �
 ```
 
 - **`app/services/agent_service.py`**：核心编排器，进程级单例 `service`（路由层直接 `import` 复用）。`chat_stream` 依次做：会话归属校验/新建 → 落库用户消息 → LTM 召回偏好 → 组装历史 → 注入 system prompt（含可用业务清单 + 事实规范 + 今天日期）→ 驱动 `Agent.run_stream` → critic 校验 → 落库结构化 assistant 消息 → 流式输出答案 → fire-and-forget 提炼长期记忆。记忆的组装/压缩/提炼委托给 `core/memory/manager.py` 的 `MemoryManager`。
-- **`app/core/agent.py`**：`Agent.run_stream` 实现 ReAct 循环（LLM 决策 → 工具调用 → 回填结果 → 再决策，最多 `max_iters=20` 轮）。同一轮多个 tool_calls 用 `asyncio.gather` 并行执行；工具结果用 `call_raw` 拿结构化原始结果后做结构化截断（list 前 20 / dict 前 20 键 / str `truncate_limit` 默认 4000），完整结果 spill 到文件供 `read_file`/`grep` 读回；工作记忆（本轮工具结果）的 token 预算淘汰委托给 `core/memory/working.py` 的 `WorkingMemory`。
+- **`app/core/agent.py`**：`Agent.run_stream` 实现 ReAct 循环（LLM 决策 → 工具调用 → 回填结果 → 再决策，图侧额度 `RECURSION_LIMIT` 固定 60 步 —— 一轮 ReAct 占 3 步，即最多 20 轮）。同一轮多个 tool_calls 用 `asyncio.gather` 并行执行；工具结果用 `call_raw` 拿结构化原始结果后做结构化截断（list 前 20 / dict 前 20 键 / str `truncate_limit` 默认 4000），完整结果 spill 到文件供 `read_file`/`grep` 读回；工作记忆（本轮工具结果）的 token 预算淘汰委托给 `core/memory/working.py` 的 `WorkingMemory`。
 - **`app/core/registry.py`**：`ToolRegistry` 统一管理工具元信息（name/description/parameters/fn/label），转成 OpenAI function-calling schema 供 LLM 决策，并执行同步/异步工具函数。
 - **`app/core/llm.py`**：LLM 接入层，全项目唯一的 LLM 通路 —— `get_chat_model()` 单例工厂返回 langchain 模型（DashScope 走 OpenAI 兼容协议，故用 `ChatOpenAI`）；无 key 时返回 `_EmptyFakeChatModel`（产出空内容），保证服务仍可启动。`close_chat_model()` 由 lifespan 调用，关闭模型持有的 httpx 连接池。
 - **`app/core/critic.py`**：`run_critic` 事实校验专家——多轮带工具（`read_file`/`grep` 定向读完整落库结果做 grounded 校验），比对「工具结果 vs 回答」，输出 `{ok, issues}`；注入当天日期避免年份误判，过滤「correction 为空」的误报 issue，限轮数 + fail-open（失败/超限按通过处理，不阻塞主流程）。

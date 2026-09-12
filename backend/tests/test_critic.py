@@ -239,8 +239,7 @@ class ScriptedStreamLLM:
     """按脚本产出 stream_chat 事件（每轮生成吐一个 turn）。
 
     修正轮按 prompt 内容识别（其 user 消息含修正 prompt 独有的「原始问题：」），不占脚本位置：
-    带环后调用序是「生成 → 结论 → 改写 → 复判」，改写轮后面还会再来一次结论轮，
-    「脚本耗尽点即改写轮」的旧判据会把复判也误认成改写。
+    调用序是「生成 → 结论 → 改写 → 复判」，改写轮后面还会再来一次结论轮。
     """
 
     def __init__(self, stream_turns, complete_response=""):
