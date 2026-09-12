@@ -252,3 +252,47 @@ async def test_parallel_tool_calls_keep_order_and_ids():
     # tool_result 按 id 配对，而非按完成顺序 —— b 更快完成，故到达顺序与 tool_call 相反
     assert [e["id"] for e in results] == ["call_b", "call_a"]
     assert {e["id"]: e["result"] for e in results} == {"call_a": "a_result", "call_b": "b_result"}
+
+
+@pytest.mark.asyncio
+async def test_model_sees_user_message_last():
+    """模型所见窗口的布局：本轮用户指令在最末尾。
+
+    旧循环每轮重建 `fixed + short_term + working + [user_msg]`，用户指令刻意压在最后；图化后 state 只追加，
+    故这条顺序由 _WorkingMemoryMiddleware.awrap_model_call 在「模型所见」这一层复位 —— 它直接决定模型
+    实际读到的 prompt，丢了等于静默改了提示词。
+    """
+    llm = StreamingLLM([
+        [{"type": "end", "tool_calls": [{"id": "c1", "function": {"name": "w", "arguments": "{}"}}]}],
+        [{"type": "content", "text": "done"}, {"type": "end", "tool_calls": None}],
+    ])
+    reg = FakeRegistry({"w": "晴"})
+    a = Agent(name="t", system_prompt="s", tools=["w"], llm=llm, model=EventScriptChatModel(llm=llm))
+    out, _ = await a.run_stream("go", [], reg)
+    assert out == "done"
+    # 第二轮模型调用所见：system → assistant(tool_calls) → tool → user，用户指令压在最后
+    assert [m["role"] for m in llm.calls[1]] == ["system", "assistant", "tool", "user"]
+    assert llm.calls[1][-1]["content"] == "go"
+
+
+@pytest.mark.asyncio
+async def test_model_sees_distilled_summary_before_kept_window():
+    """淘汰轮的布局：蒸馏摘要在保留窗口之前（旧实现 `working = [摘要] + 保留单元`），用户指令仍在最后。
+
+    摘要位置不是纯显示问题：窗口布局变了，_units() 的切分跟着变，之后每轮的淘汰对象与
+    working_evicted_units / working_distill_calls 就会偏离旧实现。
+    """
+    llm = StreamingLLM([
+        [{"type": "end", "tool_calls": [{"id": "c1", "function": {"name": "big", "arguments": "{}"}}]}],
+        [{"type": "end", "tool_calls": [{"id": "c2", "function": {"name": "small", "arguments": "{}"}}]}],
+        [{"type": "content", "text": "done"}, {"type": "end", "tool_calls": None}],
+    ])
+    reg = FakeRegistry({"big": "x" * 6000, "small": "ok"})
+    a = Agent(name="t", system_prompt="s", tools=["big", "small"], llm=llm, model=EventScriptChatModel(llm=llm))
+    # 预算只够留下第二轮的交互：第一轮的大结果被淘汰并蒸馏成摘要
+    out, _ = await a.run_stream("go", [], reg, context_budget=600)
+    assert out == "done"
+    last = llm.calls[2]  # 第三轮（答案轮）模型所见 = 淘汰后的窗口
+    assert [m["role"] for m in last] == ["system", "system", "assistant", "tool", "user"]
+    assert str(last[1]["content"]).startswith("[早期交互摘要]")  # 摘要在保留窗口之前
+    assert last[-1]["content"] == "go"  # 用户指令在最后

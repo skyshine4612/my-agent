@@ -140,37 +140,65 @@ class _ToolExecMiddleware(AgentMiddleware):
 
 
 class _WorkingMemoryMiddleware(AgentMiddleware):
-    """工作记忆中间件：每轮模型调用前按 token 预算淘汰最老的工具交互（超预算时 LLM 蒸馏成摘要兜底）。
+    """工作记忆中间件：每轮模型调用前按 token 预算淘汰最老的工具交互（超预算时 LLM 蒸馏成摘要兜底），
+    并把「模型所见窗口」复位成旧循环的布局。
 
-    只裁剪「本轮可变窗口」——最后一条 user 消息之后的消息，即本轮的工具交互；
+    淘汰只裁剪「本轮可变窗口」——最后一条 user 消息之后的消息，即本轮的工具交互；
     固定头（system prompt / 历史摘要）与短期记忆（历史原文）不参与淘汰，与旧实现一致。
+
+    布局复位：旧循环每轮重建 `fixed + short_term + working + [user_msg]`，故模型所见是
+    「固定头 → 淘汰摘要 → 保留窗口 → 本轮用户指令」。图化后 state 只追加（用户指令停在原位、
+    摘要只能追加到末尾），这套顺序只在「模型所见」这一层复位 —— 不改 state，
+    否则 rounds / 落库 / 淘汰单元切分都会跟着漂。
     """
 
-    def __init__(self, wm):
+    def __init__(self, wm=None):
         super().__init__()
         self.wm = wm
+        # 蒸馏摘要不进 state：它由本 middleware 持有，只用于拼接模型所见窗口，
+        # 这样下一轮喂给 fit 的窗口仍是旧的 [摘要] + 保留单元，淘汰单元与计数器口径不变
+        self.summary = None
 
     async def abefore_model(self, state, runtime):
+        if self.wm is None:
+            return None
         messages = state["messages"]
         # 窗口起点 = 最后一条 user 消息（本轮用户指令）：其后才是本轮工具交互
         start = max((i for i, m in enumerate(messages) if isinstance(m, HumanMessage)), default=-1)
         window = list(messages[start + 1:])
-        if not window:
-            return None
-        # WorkingMemory 的既有实现处理 OpenAI 形状的 dict，故先转形状再交给它裁剪
+        # WorkingMemory 的既有实现处理 OpenAI 形状的 dict，故先转形状；
+        # 上轮淘汰留下的摘要按旧实现置于窗口最前，fit 才能在超预算时先淘汰它
         converted = convert_to_openai_messages(window)
+        if self.summary:
+            converted = [{"role": "system", "content": self.summary}] + converted
         fitted = await self.wm.fit(converted)
-        # 未超预算时 fit 原样返回入参本身，此时不改动 state
+        # 未超预算时 fit 原样返回入参本身，此时窗口与摘要都没变
         if fitted is converted:
             return None
-        # 超预算：被淘汰的前缀（按单元成对淘汰，从最老开始）用 RemoveMessage 删除，
-        # 蒸馏摘要作独立 system 消息回填，保留语义、不裸删
+        # 超预算：fit 返回 [新摘要] + 保留单元；被淘汰的前缀（从最老单元开始）从 state 里删除，
+        # 保留单元原地不动，摘要转为 middleware 自己的状态（见 __init__）
         summary = fitted[0] if fitted and fitted[0].get("role") == "system" else None
-        kept = len(fitted) - (1 if summary else 0)
-        updates = [RemoveMessage(id=m.id) for m in window[:len(window) - kept]]
         if summary:
-            updates.append(SystemMessage(content=summary["content"]))
-        return {"messages": updates}
+            self.summary = summary["content"]
+        kept = len(fitted) - (1 if summary else 0)
+        evicted = window[:len(window) - kept]
+        if not evicted:
+            return None
+        return {"messages": [RemoveMessage(id=m.id) for m in evicted]}
+
+    async def awrap_model_call(self, request, handler):
+        # 模型所见 = 框架的 system prompt（request.system_message）+ request.messages，这里只重排后者
+        messages = list(request.messages)
+        humans = [i for i, m in enumerate(messages) if isinstance(m, HumanMessage)]
+        if not humans:
+            return await handler(request)
+        last_user = humans[-1]
+        # 旧布局：固定头与历史 → 淘汰摘要 → 保留窗口 → 本轮用户指令（末尾）
+        ordered = (messages[:last_user]
+                   + ([SystemMessage(content=self.summary)] if self.summary else [])
+                   + messages[last_user + 1:]
+                   + [messages[last_user]])
+        return await handler(request.override(messages=ordered))
 
 
 @dataclass
@@ -240,9 +268,9 @@ class Agent:
         middleware = [_ToolExecMiddleware(self.name, registry, emit,
                                           conversation_id=conversation_id,
                                           tool_result_store=tool_result_store,
-                                          user_id=current_user_id.get())]
-        if wm is not None:
-            middleware.append(_WorkingMemoryMiddleware(wm))
+                                          user_id=current_user_id.get()),
+                      # 即使不淘汰（wm 为 None）也要挂：它同时负责复位「模型所见窗口」的布局
+                      _WorkingMemoryMiddleware(wm)]
         graph = create_agent(self.model, tools=tools, system_prompt=self.system_prompt,
                              middleware=middleware)
         # 累积每轮的 tool_calls（ReAct 轮次）：供上层按轮次落库短期记忆（每轮一条 assistant(tool_calls)）
