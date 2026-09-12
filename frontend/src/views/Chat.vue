@@ -7,10 +7,10 @@ import { Plus } from '@element-plus/icons-vue'
 import { useConversationStore } from '@/stores/conversation'
 import { useAuthStore } from '@/stores/auth'
 import { chatStream, AuthExpiredError } from '@/services/sse'
-import { listConversations, getConversation, deleteConversation, getLongTermMemory, getShortTermMemory } from '@/services/api'
+import { listConversations, getConversation, deleteConversation, getLongTermMemory, getShortTermMemory, uploadFile, fetchFile } from '@/services/api'
 import ChatPanel from '@/components/ChatPanel.vue'
 import KnowledgeDialog from '@/components/KnowledgeDialog.vue'
-import type { ChatMessage, ToolEvent, LongTermMemory, ShortTermMemoryRecord } from '@/types'
+import type { ChatMessage, ToolEvent, LongTermMemory, ShortTermMemoryRecord, StoredFile } from '@/types'
 
 const convStore = useConversationStore()
 const auth = useAuthStore()
@@ -64,6 +64,7 @@ async function send(text: string) {
   const t = text.trim()
   if (!t || streaming.value) return
   pushUser(t)
+  attached.value = []   // 消息发出，附件条收起（文件本身留在会话里）
   streaming.value = true
   assistantOutput.value = false
   phase.value = ''
@@ -116,6 +117,7 @@ async function send(text: string) {
             if (matched) {
               t.status = ev.status
               t.result = ev.result
+              t.artifacts = ev.artifacts   // 脚本产物：渲染成下载卡片
               assistantOutput.value = true
               break
             }
@@ -152,6 +154,7 @@ function newChat() {
   convStore.currentId = null
   localStorage.removeItem('current_conv_id')   // 清除持久化的会话
   messages.value = []
+  attached.value = []   // 换会话了，上一会话的文件不该再提示
 }
 
 // 删除会话：调后端删除，删除的是当前会话则重置
@@ -172,11 +175,52 @@ async function selectConversation(id: string) {
   convStore.currentId = id
   localStorage.setItem('current_conv_id', id)   // 持久化当前会话，刷新后恢复
   messages.value = []
+  attached.value = []   // 换会话了，上一会话的文件不该再提示
   try {
     const history = await getConversation(id)
     messages.value = historyToMessages(history)
   } catch {
     messages.value = []
+  }
+}
+
+// 已上传但还没发消息的文件：输入区上方提示，发出消息后收起（文件本身留在会话里）
+const attached = ref<StoredFile[]>([])
+const uploading = ref(false)
+
+// 上传文件：后端在「没带会话 id」或「带的不是自己的会话」时会新建一个，返回值里给出真正的 id，
+// 前端必须接管它 —— 否则上传件落在 A 会话、接下来的对话在 B 会话，模型看不到这个文件
+async function handleUpload(file: File) {
+  if (uploading.value) return
+  uploading.value = true
+  try {
+    const saved = await uploadFile(file, convStore.currentId)
+    if (saved.conversation_id !== convStore.currentId) {
+      convStore.currentId = saved.conversation_id
+      localStorage.setItem('current_conv_id', saved.conversation_id)
+      await refreshConversations()
+    }
+    attached.value = [saved]
+  } catch {
+    pushAssistantText('文件上传失败：本期只收 .xlsx，单文件不超过 20MB。')
+  } finally {
+    uploading.value = false
+  }
+}
+
+// 下载产物：先取 blob 再本地另存为 —— <a href="/api/files/..."> 带不上 Bearer，会 401
+async function downloadArtifact(f: StoredFile) {
+  if (!convStore.currentId) return
+  try {
+    const blob = await fetchFile(f.file_id, convStore.currentId)
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = f.name
+    a.click()
+    URL.revokeObjectURL(url)
+  } catch {
+    pushAssistantText('文件下载失败，可能这个文件已经被删除了。')
   }
 }
 
@@ -319,7 +363,9 @@ onMounted(async () => {
     <!-- 中间对话区：核心，占主导 -->
     <section class="chat__main">
       <ChatPanel :messages="messages" :streaming="streaming" :thinking="thinking" :phase="phase"
-                 @send="send" @open-memory="openMemory" @open-knowledge="knowledgeVisible = true" />
+                 :attached="attached" :uploading="uploading"
+                 @send="send" @upload="handleUpload" @download="downloadArtifact"
+                 @open-memory="openMemory" @open-knowledge="knowledgeVisible = true" />
     </section>
 
     <!-- 记忆弹窗：长期（全局偏好）/短期（当前会话 running summary）tab 切换 -->

@@ -61,3 +61,19 @@ export async function ingestUrl(url: string) {
 export async function deleteDocument(sourceUrl: string) {
     return (await api.delete('/knowledge/documents', {params: {source_url: sourceUrl}})).data
 }
+
+// 上传会话文件（multipart）：带上的会话 id 若不是自己的，后端会另建一个会话并在返回值里给出
+export async function uploadFile(file: File, conversationId: string | null) {
+    const form = new FormData()
+    form.append('file', file)
+    if (conversationId) form.append('conversation_id', conversationId)
+    return (await api.post('/files', form)).data
+}
+
+// 下载会话文件：走 axios 拿 blob，不用 <a href>——那个 URL 带不上 Authorization，会 401
+export async function fetchFile(fileId: string, conversationId: string) {
+    return (await api.get(`/files/${fileId}`, {
+        params: {conversation_id: conversationId},
+        responseType: 'blob',
+    })).data as Blob
+}

@@ -1,5 +1,12 @@
 // types/index.ts —— 全局共享的 TypeScript 类型定义
 
+// 会话文件：上传件与脚本产物同形（后端 FileStore.save 的返回）
+export interface StoredFile {
+    file_id: string
+    name: string
+    size: number
+}
+
 // 工具事件：SSE 流中 tool_call / tool_result 的渲染单元
 // tool_call 产生 {tool, args, id}，tool_result 随后按 id 回填 status（是否完成）与 result（截断版结果）
 // id 用于同名工具并发时精确配对（历史落库消息不含 id，故设为可选）
@@ -10,6 +17,8 @@ export interface ToolEvent {
     status?: boolean
     result?: string
     id?: string
+    // 脚本产物：沙箱里生成、后端写回会话文件目录的文件，渲染成下载卡片
+    artifacts?: StoredFile[]
 }
 
 // 对话消息：前端聊天区的渲染单元

@@ -293,14 +293,20 @@ class AgentService:
                         entry["status"] = True
                         # result = 模型工作记忆里的截断版结果（模型所见语料），供 critic 校验、修正重写与前端展示复用
                         entry["result"] = ev.get("result", "")
+                        # 产物清单随消息落库：刷新后从历史还原工具气泡时，下载入口还在
+                        if ev.get("artifacts"):
+                            entry["artifacts"] = ev["artifacts"]
                         # id 转成 tool_call_id 保留：供 assemble_history 跨轮还原 role=tool 消息时配对
                         entry["tool_call_id"] = entry.pop("id")
                         state.tools.append(entry)
                     if name in HARD_DATA_TOOLS:
                         # 硬数据工具记模型所见语料（ev["result"]），保证 critic 与模型生成答案时语料一致
                         state.hard_results.append(ev.get("result", ""))
-                    yield {"type": "tool_result", "tool": name, "status": ev.get("status", True),
+                    sse = {"type": "tool_result", "tool": name, "status": ev.get("status", True),
                            "result": ev.get("result", ""), "id": ev["id"], "label": ev.get("label", name)}
+                    if ev.get("artifacts"):
+                        sse["artifacts"] = ev["artifacts"]
+                    yield sse
 
         gen_task = asyncio.create_task(generate())
         async for sse in consume():

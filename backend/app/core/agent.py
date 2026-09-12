@@ -118,6 +118,18 @@ async def postprocess_tool_result(name, raw, tool_result_store, conversation_id,
     return text
 
 
+def _tool_result_event(agent_name, name, label, tool_call_id, text, raw):
+    """构造 tool_result 事件：脚本产物清单额外带一份结构化字段，供前端渲染下载卡片。
+
+    text 是给人看的文本（可能被截断），产物要的是 file_id 与文件名，从文本里再解析出来不可靠。
+    """
+    event = {"type": "tool_result", "agent": agent_name, "tool": name, "status": True,
+             "result": text, "id": tool_call_id, "label": label}
+    if isinstance(raw, dict) and raw.get("artifacts"):
+        event["artifacts"] = raw["artifacts"]
+    return event
+
+
 def _concat(a, b):
     """自定义键的累积 reducer：本轮内只追加（None 视为空）。"""
     return (a or []) + (b or [])
@@ -302,9 +314,8 @@ class _ToolExecMiddleware(AgentMiddleware):
             logger.info("[Agent:%s] 第 %d 轮 工具 %s 完成（id=%s），返回 %.120s",
                         self.agent_name, round_no, name, tc["id"], text)
             # result 字段是模型工作记忆里的截断版结果，供上层 critic 校验，保证校验语料与模型所见一致
-            await self.emit({"type": "tool_result", "agent": self.agent_name, "tool": name,
-                             "status": True, "result": text, "id": tc["id"],
-                             "label": self.registry.label(name)})
+            await self.emit(_tool_result_event(self.agent_name, name, self.registry.label(name),
+                                               tc["id"], text, raw))
         except Exception:
             logger.exception("[Agent:%s] 第 %d 轮 工具 %s（id=%s）结果后处理/上报失败，交由框架降级为错误回填",
                              self.agent_name, round_no, name, tc["id"])

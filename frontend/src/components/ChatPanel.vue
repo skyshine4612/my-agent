@@ -1,16 +1,24 @@
 <script setup lang="ts">
 // ChatPanel.vue —— 通用对话面板：渲染 markdown 消息流 + 工具气泡 + 底部输入框
 import { ref } from 'vue'
-import { Promotion, Collection, Reading, ArrowDown } from '@element-plus/icons-vue'
+import { Promotion, Collection, Reading, ArrowDown, Paperclip } from '@element-plus/icons-vue'
 import { marked } from 'marked'
 import DOMPurify from 'dompurify'
-import type { ChatMessage, ToolEvent } from '@/types'
+import type { ChatMessage, ToolEvent, StoredFile } from '@/types'
 
 // 父级传入的消息列表与流式状态，向上 emit 发送动作
 // streaming：是否在流式请求中（禁用输入）；thinking：是否在等待助手首字（显示呼吸点）
 // phase：工具调用完成后的阶段文案（整理答案/核对事实/修正答案），空串表示不在这些阶段
-const props = defineProps<{ messages: ChatMessage[]; streaming: boolean; thinking: boolean; phase: string }>()
-const emit = defineEmits<{ send: [text: string]; 'open-memory': []; 'open-knowledge': [] }>()
+// attached：已上传但还没发消息的文件（显示成输入区上方的附件条）
+// uploading：上传中，禁用上传按钮避免连点产生多个没人用的文件
+const props = defineProps<{
+  messages: ChatMessage[]; streaming: boolean; thinking: boolean; phase: string
+  attached: StoredFile[]; uploading: boolean
+}>()
+const emit = defineEmits<{
+  send: [text: string]; upload: [file: File]; download: [file: StoredFile]
+  'open-memory': []; 'open-knowledge': []
+}>()
 
 // 输入框草稿
 const draft = ref('')
@@ -43,6 +51,24 @@ function toggleTool(key: string) {
   const next = new Set(expanded.value)
   next.has(key) ? next.delete(key) : next.add(key)
   expanded.value = next
+}
+
+// 文件大小展示：附件条与产物卡片共用
+function formatSize(n: number): string {
+  if (n < 1024) return `${n} B`
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`
+  return `${(n / 1024 / 1024).toFixed(1)} MB`
+}
+
+// 隐藏的文件选择框：交给下面的回形针按钮触发
+const fileInput = ref<HTMLInputElement | null>(null)
+
+// 选完文件清空 value：同一个文件再选一次也要能触发 change
+function pickFile(e: Event) {
+  const input = e.target as HTMLInputElement
+  const f = input.files?.[0]
+  input.value = ''
+  if (f) emit('upload', f)
 }
 </script>
 
@@ -79,6 +105,14 @@ function toggleTool(key: string) {
               <div v-if="expanded.has(`${m.id}-${i}`) && t.result" class="tool__result">
                 <pre>{{ t.result }}</pre>
               </div>
+              <!-- 脚本产物：直接给下载入口（产物是文件，不能让用户自己去读一段文本） -->
+              <div v-if="t.artifacts?.length" class="artifact">
+                <div v-for="a in t.artifacts" :key="a.file_id" class="artifact__item" @click="emit('download', a)">
+                  <span class="artifact__name">{{ a.name }}</span>
+                  <span class="artifact__size">{{ formatSize(a.size) }}</span>
+                  <span class="artifact__action">下载</span>
+                </div>
+              </div>
             </div>
             <!-- markdown 正文（token 流式累积） -->
             <div v-if="m.content" class="msg__markdown" v-html="renderMarkdown(m.content)"></div>
@@ -100,38 +134,56 @@ function toggleTool(key: string) {
       </div>
     </div>
 
-    <!-- 底部输入框 -->
-    <div class="chat-panel__input">
-      <el-input
-        v-model="draft"
-        type="textarea"
-        :autosize="{ minRows: 1, maxRows: 4 }"
-        placeholder="描述你的问题，回车发送…"
-        :disabled="props.streaming"
-        @keydown.enter.exact.prevent="submit"
-      />
-      <el-button
-        class="chat-panel__memory"
-        :icon="Collection"
-        circle
-        title="记忆"
-        @click="emit('open-memory')"
-      />
-      <el-button
-        class="chat-panel__memory"
-        :icon="Reading"
-        circle
-        title="知识库"
-        @click="emit('open-knowledge')"
-      />
-      <el-button
-        class="chat-panel__send"
-        type="primary"
-        :icon="Promotion"
-        :loading="props.streaming"
-        circle
-        @click="submit"
-      />
+    <!-- 底部：附件条 + 输入行共用一个底色与顶边框 -->
+    <div class="chat-panel__bottom">
+      <div v-if="props.attached.length" class="chat-panel__attached">
+        <span v-for="f in props.attached" :key="f.file_id" class="attach">
+          已上传 {{ f.name }}（{{ formatSize(f.size) }}），发消息告诉我怎么处理
+        </span>
+      </div>
+
+      <div class="chat-panel__input">
+        <el-input
+          v-model="draft"
+          type="textarea"
+          :autosize="{ minRows: 1, maxRows: 4 }"
+          placeholder="描述你的问题，回车发送…"
+          :disabled="props.streaming"
+          @keydown.enter.exact.prevent="submit"
+        />
+        <!-- 上传入口：accept 只过滤文件选择器，真正的后缀与大小校验在后端 -->
+        <input ref="fileInput" type="file" accept=".xlsx" class="chat-panel__file" @change="pickFile" />
+        <el-button
+          class="chat-panel__memory"
+          :icon="Paperclip"
+          circle
+          title="上传文件（.xlsx）"
+          :disabled="props.streaming || props.uploading"
+          @click="fileInput?.click()"
+        />
+        <el-button
+          class="chat-panel__memory"
+          :icon="Collection"
+          circle
+          title="记忆"
+          @click="emit('open-memory')"
+        />
+        <el-button
+          class="chat-panel__memory"
+          :icon="Reading"
+          circle
+          title="知识库"
+          @click="emit('open-knowledge')"
+        />
+        <el-button
+          class="chat-panel__send"
+          type="primary"
+          :icon="Promotion"
+          :loading="props.streaming"
+          circle
+          @click="submit"
+        />
+      </div>
     </div>
   </div>
 </template>
@@ -371,13 +423,67 @@ function toggleTool(key: string) {
     opacity: 0.9;
   }
 }
-.chat-panel__input {
+/* 附件条与输入行共用一个顶边框：附件条不存在时不能多出一条线 */
+.chat-panel__bottom {
   border-top: 1px solid var(--border);
+  background: var(--bg);
+}
+.chat-panel__attached {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 12px 24px 0;
+}
+.attach {
+  font-size: 12px;
+  color: var(--text-secondary);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 3px 10px;
+}
+/* 原生文件框藏起来，由回形针按钮触发 */
+.chat-panel__file {
+  display: none;
+}
+.chat-panel__input {
   padding: 16px 24px 20px;
   display: flex;
   gap: 12px;
   align-items: flex-end;
-  background: var(--bg);
+}
+/* 产物下载卡片：挂在工具气泡下方 */
+.artifact {
+  margin: 4px 0 0 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.artifact__item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  max-width: 340px;
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 13px;
+  cursor: pointer;
+}
+.artifact__item:hover {
+  border-color: var(--accent);
+}
+.artifact__name {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.artifact__size {
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+.artifact__action {
+  color: var(--accent);
 }
 .chat-panel__send {
   flex-shrink: 0;
