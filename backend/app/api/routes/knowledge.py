@@ -16,6 +16,11 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
+# 抓到的正文短于此值就不入库。真实短页面都在 270 字以上（澎湃详情 278、政府网政策 323、
+# 新华网领导人 456），而抓不到时同样会产出「内容」——知乎限流页返回的是一段 117 字的
+# JSON 错误体，越过阈值就成了知识库里的噪声。
+_MIN_CONTENT_LEN = 200
+
 
 class TextIn(BaseModel):
     """粘贴文本入库的请求体。"""
@@ -72,9 +77,9 @@ async def ingest_url(body: UrlIn, user_id: str = Depends(get_current_user)):
     except Exception as e:
         logger.warning("[知识库] 抓取失败 url=%s：%s", url, e)
         raise HTTPException(status_code=502, detail=f"抓取失败：{e}") from e
-    # 正文太短基本是没抓到（纯 JS 渲染 / 需要登录 / 被反爬），宁可报错也不入库一堆噪声
-    if len(content) < 50:
-        raise HTTPException(status_code=400, detail="没抓到有效正文，可能是纯 JS 渲染或需要登录的页面")
+    # 正文太短基本是没抓到（纯 JS 渲染 / 被反爬 / 需要登录），宁可报错也不入库一堆噪声
+    if len(content) < _MIN_CONTENT_LEN:
+        raise HTTPException(status_code=400, detail="没抓到有效正文，可能是纯 JS 渲染、被反爬拦截或需要登录的页面")
     chunks = await _ingest(user_id, content, title=title, source_url=url)
     return {"chunks": chunks, "title": title, "source_url": url}
 
