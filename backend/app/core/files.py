@@ -26,7 +26,7 @@ class FileStore:
     def _file_dir(self, user_id, conversation_id, file_id) -> Path:
         """把 file_id 解析成会话目录下的子目录；非法 uuid 一律拒绝。
 
-        file_id 来自请求（模型填的 args 或前端 URL），拼路径前必须先确认它是合法 uuid——
+        file_id 来自请求（模型填的 params 或前端 URL），拼路径前必须先确认它是合法 uuid——
         这是防路径穿越的唯一一道校验，缺了就等于开放 file_dir 之外的任意路径读写。
         """
         try:

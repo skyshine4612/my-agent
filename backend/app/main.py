@@ -4,7 +4,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-from app.api.routes import chat, conversation, knowledge, memory
+from app.api.routes import chat, conversation, files, knowledge, memory
 from app.config import settings
 from app.core.db import close_pool, init_pool
 from app.core.logging import setup_logging
@@ -35,6 +35,7 @@ app.include_router(chat.router, prefix="/api")
 app.include_router(conversation.router, prefix="/api")
 app.include_router(memory.router, prefix="/api")
 app.include_router(knowledge.router, prefix="/api")
+app.include_router(files.router, prefix="/api")
 
 
 @app.get("/api/health")
