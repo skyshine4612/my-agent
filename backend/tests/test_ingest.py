@@ -75,3 +75,55 @@ def test_extract_with_images_returns_both():
     text, images = extract_with_images(html, "https://example.com/guide/hz")
     assert images == ["https://cdn.example.com/a.jpg"]
     assert "\x00IMG0\x00" in text
+
+
+def test_scrub_marks_never_leaves_null_bytes():
+    """要守的不变量只有一条：**输出里没有 \\x00**。
+
+    它会让 asyncpg 抛「a str must not contain null bytes」——丢的不是一张图，是整篇。
+
+    半截占位符的残留字母（`前\\x00IM` 里的 `IM`、`G3\\x00后` 里的 `G3`）刻意不清理：
+    想同时吃掉前后两种残尾就得写一条会误伤正文的正则，而它们在按字符计的语料里可以忽略。
+    """
+    from app.core.ingest import scrub_marks
+    assert scrub_marks("前\x00IMG3\x00后") == "前后"      # 完整占位符整体消失
+    assert scrub_marks("前\x00IM") == "前IM"              # 硬切留下的半截：\x00 走，字母留
+    assert scrub_marks("G3\x00后") == "G3后"
+    for s in ("前\x00IMG3\x00后", "前\x00IM", "G3\x00后", "\x00", "IMG3\x00"):
+        assert "\x00" not in scrub_marks(s)
+
+
+def test_assign_images_puts_image_in_the_chunk_holding_its_offset():
+    """偏移法：按占位符在原文里的起始位置归属，跨边界归第一块。"""
+    from app.core.chunking import chunk_spans
+    from app.core.ingest import assign_images
+
+    text = "甲。\x00IMG0\x00\n\n乙。丙。丁。戊。己。庚。辛。壬。癸。"
+    spans = chunk_spans(text, 12, 2)
+    assert len(spans) >= 2
+    got = assign_images(text, [{"n": 0, "desc": "西湖"}], spans)
+    assert len(got) == len(spans)
+    assert got[0] == [{"n": 0, "desc": "西湖"}]          # 第一张图挂在第一块
+    assert all(g == [] for g in got[1:])
+
+
+def test_assign_images_skips_images_without_a_mark():
+    """describe_images 会 urls[:MAX_IMAGES]，IMG10+ 的图没有对应的占位符 —— 不能瞎挂。"""
+    from app.core.ingest import assign_images
+    text = "甲。\x00IMG0\x00乙。"
+    got = assign_images(text, [{"n": 0, "desc": "a"}, {"n": 9, "desc": "b"}], [(0, len(text))])
+    assert got == [[{"n": 0, "desc": "a"}]]
+
+
+def test_offset_method_survives_a_hard_cut_placeholder():
+    """硬切把占位符切成两半时，\\x00 绝不进块文本 —— 这条是整篇 502 的护栏。"""
+    from app.core.chunking import chunk_spans, chunk_text
+    from app.core.ingest import assign_images, scrub_marks
+
+    text = "甲" * 8 + "\x00IMG0\x00" + "乙" * 8
+    spans = chunk_spans(text, 10, 2)
+    got = assign_images(text, [{"n": 0, "desc": "西湖"}], spans)
+    # 图归到含它起始位置的那一块（跨边界归第一块）
+    assert [i for i, g in enumerate(got) if g] == [0]
+    for chunk in chunk_text(text, 10, 2):
+        assert "\x00" not in scrub_marks(chunk)

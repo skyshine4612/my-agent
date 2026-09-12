@@ -41,13 +41,17 @@ def _fallback_title(content: str, title: str) -> str:
     return title.strip() or content.strip()[:20]
 
 
-async def _ingest(user_id: str, content: str, title: str, source_url: str) -> int:
+async def _ingest(user_id: str, content: str, title: str, source_url: str,
+                  images: list[dict] | None = None) -> int:
     """入库并对失败打日志：切块与向量化可能跑几十秒，中途失败必须留痕。
 
+    images 只在抓 URL 时有（粘贴文本没有图片通道），形如
+    [{"n": 占位符序号, "desc", "data", "mime"}]，由 KnowledgeStore 按偏移挂块并上传。
     错误文本会随 HTTP 响应发给前端，按值抹掉已配置的凭据再外发。
     """
     try:
-        return await service.knowledge.ingest(user_id, content, title=title, source_url=source_url)
+        return await service.knowledge.ingest(user_id, content, title=title,
+                                              source_url=source_url, images=images)
     except Exception as e:
         logger.exception("[知识库] 入库失败 source=%s", source_url)
         raise HTTPException(status_code=502, detail=f"入库失败：{_redact_secrets(str(e))}") from e
@@ -73,14 +77,14 @@ async def ingest_url(body: UrlIn, user_id: str = Depends(get_current_user)):
     if not url.startswith(("http://", "https://")):
         raise HTTPException(status_code=400, detail="URL 必须以 http:// 或 https:// 开头")
     try:
-        title, content = await fetch_url_text(url)
+        title, content, images = await fetch_url_text(url)
     except Exception as e:
         logger.warning("[知识库] 抓取失败 url=%s：%s", url, e)
         raise HTTPException(status_code=502, detail=f"抓取失败：{e}") from e
     # 正文太短基本是没抓到（纯 JS 渲染 / 被反爬 / 需要登录），宁可报错也不入库一堆噪声
     if len(content) < _MIN_CONTENT_LEN:
         raise HTTPException(status_code=400, detail="没抓到有效正文，可能是纯 JS 渲染、被反爬拦截或需要登录的页面")
-    chunks = await _ingest(user_id, content, title=title, source_url=url)
+    chunks = await _ingest(user_id, content, title=title, source_url=url, images=images)
     return {"chunks": chunks, "title": title, "source_url": url}
 
 

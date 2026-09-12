@@ -106,23 +106,50 @@ def extract_text(html: str, base_url: str = "") -> str:
     return re.sub(_IMAGE_MARK, "", text)
 
 
-async def _fill_image_descriptions(text: str, urls: list[str], referer: str = "") -> str:
-    """把正文里的图片占位符换成多模态模型给的描述。
+def _mark_offsets(text: str) -> dict[int, int]:
+    """占位符序号 → 它在正文里的起始偏移。"""
+    return {int(m.group()[4:-1]): m.start() for m in re.finditer(_IMAGE_MARK, text)}
 
-    拿不到描述的（下载失败 / 模型报错 / 模型判定无有效信息）直接删掉占位符——
-    留一个「[图片]」空壳对检索只是噪声。超出单页上限的占位符同样被清掉。
-    referer 传页面地址，供图床的防盗链校验。
+
+def _chunk_of(spans: list[tuple[int, int]], offset: int) -> int | None:
+    """偏移落在哪一块（跨边界归第一块）；落在所有块之前/之后时夹到最近的一块。"""
+    if not spans:
+        return None
+    for i, (s, e) in enumerate(spans):
+        if s <= offset < e:
+            return i
+    return 0 if offset < spans[0][0] else len(spans) - 1
+
+
+def assign_images(text: str, images: list[dict], spans: list[tuple[int, int]]) -> list[list[dict]]:
+    """把图片按「起始偏移落在哪一块」挂到唯一一块，返回与 spans 等长的列表。
+
+    为什么不用「占位符穿过 chunk_text、切完逐块扫」：`chunk_text` 的字符硬切分支
+    （piece = sent[i:i + chunk_size]）会把 8 字符的 \\x00IMG3\\x00 从中间切开，前半截留在
+    上一块、匹配不上完整占位符，\\x00 就原样进了 documents.content —— asyncpg 直接抛
+    「a str must not contain null bytes」，丢的不是一张图而是整篇，且表现为「偶发抓取失败」。
+
+    找不到对应占位符的图（describe_images 内部 urls[:MAX_IMAGES] 会让 IMG10+ 无人回填）
+    直接跳过，不瞎挂。
     """
-    if not urls:
-        return text
-    descs = await describe_images(urls, referer=referer)
-    filled = 0
-    for i, desc in enumerate(descs):
-        if desc:
-            filled += 1
-        text = text.replace(f"\x00IMG{i}\x00", f"【图片：{desc}】" if desc else "")
-    logger.info("[知识库] 图片描述 url=%s 候选 %d 张，拿到描述 %d 张", referer, len(descs), filled)
-    return re.sub(_IMAGE_MARK, "", text)
+    buckets: list[list[dict]] = [[] for _ in spans]
+    offsets = _mark_offsets(text)
+    for img in images:
+        offset = offsets.get(img["n"])
+        if offset is None:
+            continue
+        i = _chunk_of(spans, offset)
+        if i is not None:
+            buckets[i].append(img)
+    return buckets
+
+
+def scrub_marks(chunk: str) -> str:
+    """入库前兜底清掉占位符与 \\x00 残留。**不可省略**：
+
+    除了 IMG10+，硬切分支切开的半截占位符也靠它兜住 —— 留下一个 \\x00 就是整篇 502。
+    """
+    return re.sub(_IMAGE_MARK, "", chunk).replace("\x00", "")
 
 
 def _fetch_html_sync(url: str) -> tuple[str, str]:
@@ -152,8 +179,25 @@ def _fetch_html_sync(url: str) -> tuple[str, str]:
             browser.close()
 
 
-async def fetch_url_text(url: str) -> tuple[str, str]:
-    """用 playwright 打开 URL（跑完 JS 再取 DOM），返回 (标题, 正文文本)。
+async def _describe_images_indexed(urls: list[str], referer: str = "") -> list[dict]:
+    """描述图片并附上它在正文里的占位符序号。
+
+    原始序号用 enumerate 保住：describe_images 内部会 urls[:MAX_IMAGES]，返回列表比 urls 短，
+    但前 N 张的序号仍与占位符 \\x00IMG{i}\\x00 一一对应。
+    """
+    if not urls:
+        return []
+    results = await describe_images(urls, referer=referer)
+    return [{"n": i, "desc": r["desc"], "data": r["data"], "mime": r["mime"]}
+            for i, r in enumerate(results) if r["desc"]]
+
+
+async def fetch_url_text(url: str) -> tuple[str, str, list[dict]]:
+    """用 playwright 打开 URL（跑完 JS 再取 DOM），返回 (标题, 带图片占位的正文, 图片列表)。
+
+    **不做回填**：回填要等切块之后才知道每张图归哪一块（偏移法），而图片字节要一路留到
+    KnowledgeStore.ingest —— 那里才有 user_id 可用来上传。
+    图片列表形如 [{"n": 占位符序号, "desc", "data", "mime"}]，无描述的项已剔除。
 
     攻略站多为前端渲染，直接抓 HTML 拿不到正文，所以走真实浏览器。
     建库是低频操作，每次起一个浏览器实例即可，不做常驻连接池。
@@ -161,8 +205,8 @@ async def fetch_url_text(url: str) -> tuple[str, str]:
     logger.info("[知识库] 开始抓取 url=%s", url)
     started = time.monotonic()
     title, html = await asyncio.to_thread(_fetch_html_sync, url)
-    text, images = extract_with_images(html, url)
-    text = await _fill_image_descriptions(text, images, referer=url)
-    logger.info("[知识库] 抓取完成 url=%s 正文 %d 字，图片候选 %d 张，耗时 %.1fs",
-                url, len(text), len(images), time.monotonic() - started)
-    return title, text
+    text, urls = extract_with_images(html, url)
+    images = await _describe_images_indexed(urls, referer=url)
+    logger.info("[知识库] 抓取完成 url=%s 正文 %d 字，图片候选 %d 张，拿到描述 %d 张，耗时 %.1fs",
+                url, len(text), len(urls), len(images), time.monotonic() - started)
+    return title, text, images

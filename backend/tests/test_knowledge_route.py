@@ -51,8 +51,9 @@ async def test_ingest_failure_redacts_secrets(monkeypatch):
 
 
 def _fake_fetch(monkeypatch, content: str) -> None:
+    """假抓取器：与真 fetch_url_text 同形的三元组（标题、带占位符的正文、图片列表）。"""
     async def fetch(url):
-        return "标题", content
+        return "标题", content, []
 
     monkeypatch.setattr(route, "fetch_url_text", fetch)
 
@@ -99,8 +100,9 @@ async def test_page_at_threshold_is_ingested(monkeypatch):
     """阈值边界：刚好达标放行，少一个字拦下。"""
     called = {}
 
-    async def ingest(user_id, content, title, source_url):
+    async def ingest(user_id, content, title, source_url, images=None):
         called["content"] = content
+        called["images"] = images
         return 3
 
     monkeypatch.setattr(route, "_ingest", ingest)
