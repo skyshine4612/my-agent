@@ -1,6 +1,5 @@
 # tests/test_tool_schema_snapshot.py
-# 工具 schema 金标准：本次迁移把工具从手写 JSON Schema 换成 pydantic 生成，
-# 参数名/类型/描述/必填性必须逐字段不变，故落锁；任何漂移立即转红。
+# 工具 schema 金标准：参数名/类型/描述/必填性锁成快照，任何漂移立即转红。
 import json
 import pathlib
 
@@ -16,15 +15,13 @@ def _golden():
 
 
 def _project(schema: dict) -> dict:
-    """把 schema 投影成「本次迁移承诺逐字不变的契约」再比对。
+    """把 schema 投影成要比对的契约：工具名、工具描述、每个参数的
+    名称/类型/description/其余一切键（含 enum）、required 清单。
 
-    保留工具名、工具描述、每个参数的名称/类型/description/其余一切键（含 enum）、required 清单。
-    **刻意排除 `default`**：pydantic 生成的 schema 会为每个带默认值的参数多出 default 字段，
-    而手写 schema 把默认值写在参数描述文案里（「默认 20」）—— 信息等价、载体不同，
-    是本次改造**每个带默认值的参数都会发生**的一致副作用，不是漂移。
-    用黑名单而非白名单排除，是为了让将来 pydantic 多出的任何键都被这条测试抓住。
-    默认值本身的正确性由 Task 4 的规则（签名默认值必须等于旧描述文案里写的那个数）
-    与既有行为用例（如 test_weather_query_default_days）覆盖。
+    **刻意排除 `default`**：默认值同时写在参数描述文案里（「默认 20」），
+    default 字段是同一信息的第二份载体，排掉它比对才稳定。
+    用黑名单而非白名单排除，是为了让 pydantic 新增的任何键都被这条测试抓住。
+    默认值的正确性由行为用例（如 test_weather_query_default_days）覆盖。
     """
     fn = schema["function"]
     params = fn["parameters"]
