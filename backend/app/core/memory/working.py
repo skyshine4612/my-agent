@@ -15,12 +15,12 @@ class WorkingMemory:
     """工作记忆：token 预算淘汰器（规则化淘汰 + LLM 摘要兜底，对齐 Claude Code 的 layered defense）。
 
     属性：
-        llm:            LLM 客户端（实现 complete 方法，用于蒸馏被淘汰单元）
+        model:          langchain 模型实例（ainvoke 用于蒸馏被淘汰单元）
         budget_tokens:  token 预算上限，超限触发淘汰 + 蒸馏
     """
 
-    def __init__(self, llm, budget_tokens=128000):
-        self.llm = llm
+    def __init__(self, model, budget_tokens=128000):
+        self.model = model
         self.budget_tokens = budget_tokens
 
     def _estimate(self, messages):
@@ -32,7 +32,7 @@ class WorkingMemory:
 
     @staticmethod
     def _serialize_message(m):
-        """把单条消息序列化为纯文本（保留角色），使带 tool_calls / tool_call_id 的消息可安全喂给 complete。
+        """把单条消息序列化为纯文本（保留角色），使带 tool_calls / tool_call_id 的消息可安全喂给模型。
 
         返回只含 role 与 content 的 dict，剥离 tool_calls / tool_call_id 等结构化字段，
         把工具调用/工具结果改写为可读文本（如 [工具调用 name(args)] / [工具结果 ...]）。
@@ -91,18 +91,19 @@ class WorkingMemory:
     async def _distill(self, messages):
         """把一批被淘汰的消息 LLM 蒸馏成一段摘要，保留关键工具、参数与结果要点。
 
-        LLM 蒸馏失败（超时/报错，或 FallbackLLM 无 key 返回空串）时降级为「序列化文本拼接截断」，
+        LLM 蒸馏失败（超时/报错，或模型无 key 返回空内容）时降级为「序列化文本拼接截断」，
         保证 fit 永不因蒸馏失败抛错——否则一次蒸馏异常会沿 run_stream 传播、炸掉整轮对话。
         降级摘要保留被淘汰单元的可读内容（而非裸删），牺牲精简度换取不丢失关键信息。
         """
         serialized = [self._serialize_message(m) for m in messages]
         try:
-            summary = await self.llm.complete([
+            resp = await self.model.ainvoke([
                 {"role": "system",
                  "content": "把下面这段已查过的工具调用与结果蒸馏成一段摘要，保留关键工具、参数与结果要点。"
                             "车次号/航班号/票价/时间/日期/地点名等硬数据必须保留精确原值，"
                             "不要概括成「有航班」「价格中等」这类模糊描述。"}
             ] + serialized)
+            summary = resp.content if isinstance(resp.content, str) else ""
             if summary:
                 return summary
         except Exception as e:

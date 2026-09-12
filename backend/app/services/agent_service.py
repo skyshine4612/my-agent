@@ -12,7 +12,7 @@ from app.core.agent import Agent
 from app.core.context import current_user_id
 from app.core.critic import run_critic
 from app.core.knowledge import KnowledgeStore
-from app.core.llm import get_chat_model, get_llm
+from app.core.llm import close_chat_model, get_chat_model
 from app.core.memory import ConversationStore, LongTermMemory, ShortTermMemory, ToolResultStore
 from app.core.memory.manager import MemoryManager
 from app.core.memory.metrics import log_snapshot
@@ -62,15 +62,13 @@ class AgentService:
         self.knowledge = KnowledgeStore()
         # 工具结果地址索引：超长结果写临时文件，read_file/grep 按需读；本轮结束即清，避免堆积
         self.tool_result_store = ToolResultStore(settings.result_dir)
-        # LLM 客户端
-        self.llm = get_llm()
-        # langchain 模型：critic 子图（create_agent）用，与 self.llm 并存的过渡态
+        # langchain 模型：全项目唯一的 LLM 通路口（主循环 / critic / 记忆蒸馏 / 修正重写共用）
         self.chat_model = get_chat_model()
         # critic 子图的工具：与主循环共用同一套 read_file/grep 实现，启动时装配一次
         self.critic_tools = [make_read_file(self.tool_result_store), make_grep(self.tool_result_store)]
         # 记忆管理器：编排短期记忆组装/压缩与长期记忆提炼，四个 store 与 AgentService 共享同一实例
         self.memory = MemoryManager(self.conversation_store, self.short_term_memory,
-                                    self.long_term_memory, self.tool_result_store, self.llm)
+                                    self.long_term_memory, self.tool_result_store, self.chat_model)
         # 加载 skills 清单（name/description/body）：name+description 进 system prompt，body 由 get_skill 按需加载
         self.skills = load_skills()
         # 一次性装配扁平 ToolRegistry（旅行 + 系统 + 网络工具）并缓存到 self。
@@ -94,26 +92,24 @@ class AgentService:
         register_file_tools(registry, self.tool_result_store)
         # search_knowledge：知识库语义检索（需要 knowledge store，同理由 service 层注册）
         register_knowledge_tools(registry, self.knowledge)
-        # 注册 call_sub_agent（子 Agent 委派，需要 llm + skill 清单 + 工具结果地址索引，只能在 service 层注册）
-        sub_agent_tool = make_call_sub_agent(self.llm, registry, [s["name"] for s in self.skills],
+        # 注册 call_sub_agent（子 Agent 委派，需要模型 + skill 清单 + 工具结果地址索引，只能在 service 层注册）
+        sub_agent_tool = make_call_sub_agent(self.chat_model, registry, [s["name"] for s in self.skills],
                                              settings.llm_context_budget,
-                                             self.tool_result_store, model=self.chat_model)
+                                             self.tool_result_store)
         registry.register_tool(sub_agent_tool, "委派子任务")
         return registry
 
     async def close(self):
-        """优雅关闭所有数据源与 LLM 客户端（进程退出前由 lifespan 调用）。
+        """优雅关闭所有数据源与 LLM 连接池（进程退出前由 lifespan 调用）。
 
         数据源持有从不显式关闭的 httpx 客户端 / MCP session，统一在这里关闭，
-        避免热重载/测试时留下未关闭连接。LLM 客户端若无 close 方法（Fake/Fallback）则跳过。
+        避免热重载/测试时留下未关闭连接。
         """
         for ds in self._datasources:
             ds_close = getattr(ds, "close", None)
             if ds_close is not None:
                 await ds_close()
-        llm_close = getattr(self.llm, "close", None)
-        if llm_close is not None:
-            await llm_close()
+        await close_chat_model()
 
     async def delete_conversation(self, user_id, conv_id):
         """删除会话及其消息，并清理该会话的短期记忆与工具结果地址索引；归属校验失败返回 False。"""
@@ -218,7 +214,7 @@ class AgentService:
             long_term_hint=render_long_term_hint(hint_parts),
         )
         agent = Agent(name="assistant", system_prompt=system, tools=self.registry.list_names(),
-                      llm=self.llm, model=self.chat_model)
+                      model=self.chat_model)
         return system, history, summary_hint, agent
 
     async def _stream_agent_reply(self, agent, history, conv_id, message, state, summary_hint=""):
@@ -330,7 +326,8 @@ class AgentService:
         if summary_hint:
             msgs.append({"role": "system", "content": summary_hint})
         msgs.append({"role": "user", "content": correction_prompt})
-        state.answer = await self.llm.complete(msgs)
+        resp = await self.chat_model.ainvoke(msgs)
+        state.answer = resp.content if isinstance(resp.content, str) else ""
         logger.info("[service] 修正答案完成，耗时 %.1fs，%d 字", time.perf_counter() - t0, len(state.answer))
 
 

@@ -84,12 +84,12 @@ class MemoryManager:
     这里只做编排，不负责 store 的创建。
     """
 
-    def __init__(self, conversation_store, short_term_memory, long_term_memory, tool_result_store, llm):
+    def __init__(self, conversation_store, short_term_memory, long_term_memory, tool_result_store, model):
         self.conversation_store = conversation_store
         self.short_term_memory = short_term_memory
         self.long_term_memory = long_term_memory
         self.tool_result_store = tool_result_store
-        self.llm = llm
+        self.model = model
         # 长期记忆提炼的 per-user 锁：fire-and-forget 提炼按用户串行，避免并发写长期记忆 + 重复提炼
         self._extract_locks: dict[str, asyncio.Lock] = {}
 
@@ -175,11 +175,12 @@ class MemoryManager:
         async with lock:
             try:
                 logger.info("[memory] 开始提炼长期记忆 user=%s", user_id)
-                resp = await self.llm.complete([
+                resp = await self.model.ainvoke([
                     {"role": "system",
                      "content": "从这条用户发言里，只提取【稳定的、跨会话可复用的】偏好或事实（如常住城市、长期的兴趣偏好、习惯性要求，例：'偏好经济型酒店'、'喜欢自然风光'）。不要提取一次性的行程请求参数（如'去成都玩2天预算2000'这种某次旅行的具体目的地/天数/预算），也不要提取助手推荐的内容。没有稳定偏好就输出空列表。每条 fact 不超过 100 个字。每条打 importance(0~1)。输出 JSON:{\"facts\":[{\"fact\":\"...\",\"importance\":0.8}]}"},
                     {"role": "user", "content": user_message}])
-                data = json.loads(resp[resp.index("{"):resp.rindex("}") + 1])
+                text = resp.content if isinstance(resp.content, str) else ""
+                data = json.loads(text[text.index("{"):text.rindex("}") + 1])
                 new_facts = data.get("facts", [])
                 if not new_facts:
                     return
@@ -223,12 +224,13 @@ class MemoryManager:
         完整传入 compressed_text、不做截断，避免关键数据（硬数据）被静默丢弃。
         """
         try:
-            return await self.llm.complete([
+            resp = await self.model.ainvoke([
                 {"role": "system",
                  "content": "把下面的「旧摘要 + 更早对话」浓缩成一个新的累积摘要（100-300 字），保留核心结论、关键数据（菜名/价格/时间/结构要点），以及调用了哪些工具、查了什么参数（如「菜谱做法(宫保鸡丁)」）。"},
                 {"role": "user",
                  "content": f"旧摘要：{old_summary or '（无）'}\n\n更早对话：\n{compressed_text}"},
             ])
+            return resp.content if isinstance(resp.content, str) else ""
         except Exception:
             logger.warning("[memory] 摘要浓缩失败，回退拼接")
             return (old_summary or "") + "\n" + compressed_text

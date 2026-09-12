@@ -27,10 +27,10 @@ def _lc_tool_call(tc):
 
 
 class EventScriptChatModel(BaseChatModel):
-    """把事件式假 LLM 的 stream_chat 脚本适配成 langchain 模型（主循环由 create_agent 驱动）。
+    """把事件式假 LLM 的 stream_chat 脚本适配成 langchain 模型。
 
     content 事件拼成答案文本、end 事件的 tool_calls 转 langchain 形状；传给 stream_chat 的 messages
-    转回 OpenAI 形状，故本文件里对 llm.calls 的断言逐字不变。
+    转回 OpenAI 形状，故对 llm.calls 的断言可按 OpenAI 形状书写。
     """
 
     llm: Any = None
@@ -196,7 +196,7 @@ async def test_run_stream_spills_oversize_result(tmp_path):
     store = ToolResultStore(str(tmp_path / "results"))
     current_user_id.set("u1")  # spill 按 current_user_id 分目录，读回要用同一个
     spill_before = snapshot().get("spill_writes", 0)
-    a = Agent(name="t", system_prompt="s", tools=["big"], llm=llm, model=EventScriptChatModel(llm=llm))
+    a = Agent(name="t", system_prompt="s", tools=["big"], model=EventScriptChatModel(llm=llm))
     await a.run_stream("go", [], reg, on_event=None, conversation_id="conv1", tool_result_store=store)
     # 埋点增量：run_stream 的超长结果分支写一次文件
     assert snapshot().get("spill_writes", 0) == spill_before + 1
@@ -220,7 +220,7 @@ async def test_run_stream_spills_large_dict(tmp_path):
     # 2 个键，但 steps 每条 500 字符 × 20 条，str(dict) 超阈值
     reg = FakeRegistry({"big": {"title": "菜", "steps": [{"step": i, "text": "x" * 500} for i in range(20)]}})
     store = ToolResultStore(str(tmp_path / "results"))
-    a = Agent(name="t", system_prompt="s", tools=["big"], llm=llm, model=EventScriptChatModel(llm=llm))
+    a = Agent(name="t", system_prompt="s", tools=["big"], model=EventScriptChatModel(llm=llm))
     await a.run_stream("go", [], reg, on_event=None, conversation_id="conv1", tool_result_store=store)
     tool_msgs = [m for m in llm.calls[1] if m["role"] == "tool"]
     content = tool_msgs[0]["content"]

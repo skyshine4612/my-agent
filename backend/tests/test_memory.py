@@ -3,6 +3,7 @@
 import json
 
 import pytest
+from langchain_core.messages import AIMessage
 
 from app.core.memory import ConversationStore, LongTermMemory, ShortTermMemory, ToolResultStore
 from app.core.memory import long_term as long_term_module
@@ -18,13 +19,13 @@ class _BrokenEmbedder:
 
 
 class _FakeExtractLLM:
-    """只实现 complete 的假 LLM：无论输入什么都返回预设的 facts（供提炼链路测试）。"""
+    """只实现 ainvoke 的假模型：无论输入什么都返回预设的 facts（供提炼链路测试）。"""
 
     def __init__(self, facts):
         self._facts = facts
 
-    async def complete(self, messages):
-        return json.dumps({"facts": self._facts}, ensure_ascii=False)
+    async def ainvoke(self, messages):
+        return AIMessage(content=json.dumps({"facts": self._facts}, ensure_ascii=False))
 
 
 @pytest.mark.asyncio

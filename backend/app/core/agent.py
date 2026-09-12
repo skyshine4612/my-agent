@@ -217,15 +217,12 @@ class Agent:
         name:            Agent 名称（用于日志与追踪）
         system_prompt:   系统提示词，注入每轮对话的最前
         tools:           本 Agent 可调用的工具名列表
-        llm:             LLM 客户端（实现 LLMClient 接口，含 chat / complete / stream_chat）——
-                         工作记忆蒸馏与 critic 修正走它，主循环的模型调用走 model
-        model:           langchain 模型实例（create_agent 驱动主循环）
+        model:           langchain 模型实例（create_agent 驱动主循环，工作记忆蒸馏也走它）
         max_iters:       单次 run_stream 的 ReAct 最大迭代轮数，防止无限循环
     """
     name: str
     system_prompt: str
     tools: list[str] = field(default_factory=list)
-    llm: object = None
     model: object = None
     max_iters: int = 20
 
@@ -258,8 +255,8 @@ class Agent:
                 await on_event(event)
 
         logger.info("[Agent:%s] 开始执行（流式），输入：%.60s", self.name, user_message)
-        # 工作记忆（预算淘汰器）：传入 llm 与预算时启用，否则禁用（不淘汰）
-        wm = WorkingMemory(self.llm, context_budget) if context_budget else None
+        # 工作记忆（预算淘汰器）：传入 model 与预算时启用，否则禁用（不淘汰）
+        wm = WorkingMemory(self.model, context_budget) if context_budget else None
         # 输入消息：主 system 提示词（含 long_term_hint）由 create_agent 的 system_prompt 注入在最前、
         # 永不淘汰；历史摘要作为独立 system 消息紧随其后；之后拼短期记忆（最近几轮对话原文，
         # 持久，不参与淘汰）与当前用户指令

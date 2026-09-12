@@ -25,10 +25,10 @@ def _lc_tool_call(tc):
 
 
 class EventScriptChatModel(BaseChatModel):
-    """把事件式假 LLM 的 stream_chat 脚本适配成 langchain 模型（图化后主循环由 create_agent 驱动）。
+    """把事件式假 LLM 的 stream_chat 脚本适配成 langchain 模型。
 
-    content 事件拼成答案文本、end 事件的 tool_calls 转 langchain 形状；主循环用 chat_model、
-    工作记忆与 critic 修正仍用 llm，故测试同时注入两者（同一份脚本）。
+    content 事件拼成答案文本、end 事件的 tool_calls 转 langchain 形状；
+    主循环、critic 与记忆蒸馏共用这一个模型实例（同一份脚本）。
     """
 
     llm: Any = None
@@ -81,7 +81,7 @@ class FakeStreamingLLM:
 
 
 def test_service_assembles_and_tools_non_empty():
-    """AgentService 装配成功（会话历史/短期/长期记忆/llm/ds 就位），扁平工具注册表非空。
+    """AgentService 装配成功（会话历史/短期/长期记忆/chat_model/ds 就位），扁平工具注册表非空。
 
     store 的 __init__ 不做任何 IO（表结构由数据库侧建），因此这里不需要数据库 fixture。
     """
@@ -89,7 +89,7 @@ def test_service_assembles_and_tools_non_empty():
     assert svc.conversation_store is not None
     assert svc.short_term_memory is not None
     assert svc.long_term_memory is not None
-    assert svc.llm is not None
+    assert svc.chat_model is not None
     names = svc.registry.list_names()
     assert names, "工具注册表不应为空"
     assert "get_skill" in names
@@ -101,8 +101,7 @@ def test_service_assembles_and_tools_non_empty():
 async def test_chat_stream_flow(user_id):
     """chat_stream 用 fake LLM 跑通：产出 conversation_id/token/done 事件，并落库结构化 assistant 消息。"""
     svc = AgentService()
-    svc.llm = FakeStreamingLLM()
-    svc.chat_model = EventScriptChatModel(llm=svc.llm)  # 主循环图化后由 langchain 模型驱动
+    svc.chat_model = EventScriptChatModel(llm=FakeStreamingLLM())
 
     async def noop(user_id, conv_id):
         pass
@@ -147,8 +146,7 @@ async def test_registry_built_once_and_reused_across_requests(user_id, monkeypat
     assert len(register_calls) == 1  # __init__ 只装配一次（数据源只 new 一次）
     cached = svc.registry
 
-    svc.llm = FakeStreamingLLM()
-    svc.chat_model = EventScriptChatModel(llm=svc.llm)  # 主循环图化后由 langchain 模型驱动
+    svc.chat_model = EventScriptChatModel(llm=FakeStreamingLLM())
 
     async def noop(user_id, conv_id):
         pass
@@ -219,8 +217,7 @@ class SlowFastRegistry:
 async def test_tool_result_pairs_by_call_id_same_name_parallel(user_id):
     """同名工具并行且乱序完成时，tool_result 按 tool_call_id 精确配对 summary，不串。"""
     svc = AgentService()
-    svc.llm = SameNameStreamLLM()
-    svc.chat_model = EventScriptChatModel(llm=svc.llm)  # 主循环图化后由 langchain 模型驱动
+    svc.chat_model = EventScriptChatModel(llm=SameNameStreamLLM())
     svc.registry = SlowFastRegistry()
 
     async def noop(user_id, conv_id):
@@ -245,15 +242,15 @@ async def test_tool_result_pairs_by_call_id_same_name_parallel(user_id):
 
 
 class RecordingLLM:
-    """记录 complete 调用次数的 LLM 假实现，验证增量压缩不重复调用摘要浓缩。"""
+    """记录蒸馏调用次数的假模型，验证增量压缩不重复调用摘要浓缩。"""
 
     def __init__(self, summary="累积摘要"):
         self.summary = summary
-        self.complete_calls = 0
+        self.calls = 0
 
-    async def complete(self, messages):
-        self.complete_calls += 1
-        return self.summary
+    async def ainvoke(self, messages):
+        self.calls += 1
+        return AIMessage(content=self.summary)
 
 
 @pytest.mark.asyncio
@@ -263,8 +260,7 @@ async def test_assemble_history_no_recompression(user_id, tmp_path, monkeypatch)
     monkeypatch.setattr(settings, "llm_context_budget", 100)  # 小预算强制早期回合压缩
     svc = AgentService()
     llm = RecordingLLM()
-    svc.llm = llm
-    svc.memory.llm = llm
+    svc.memory.model = llm
 
     cid = await svc.conversation_store.create_conversation(user_id)
     # 写 4 个回合到短期记忆表（每回合 user + assistant），远超小预算，必然触发早期回合压缩
@@ -273,11 +269,11 @@ async def test_assemble_history_no_recompression(user_id, tmp_path, monkeypatch)
 
     # 第一次 assemble：触发压缩，摘要浓缩调用一次
     await svc.memory.assemble_history(user_id, cid)
-    assert llm.complete_calls == 1
+    assert llm.calls == 1
 
     # 第二次 assemble：早期回合已被物理删除，不应再压缩
     await svc.memory.assemble_history(user_id, cid)
-    assert llm.complete_calls == 1  # 仍为 1，未重复压缩
+    assert llm.calls == 1  # 仍为 1，未重复压缩
 
 
 @pytest.mark.asyncio
@@ -285,7 +281,6 @@ async def test_assemble_history_restores_structured_tool_messages(user_id, tmp_p
     """append_turn 写结构化回合后，assemble_history 从短期记忆表还原成 tool_calls + role=tool 消息。"""
     monkeypatch.setattr(settings, "result_dir", str(tmp_path / "results"))
     svc = AgentService()
-    svc.llm = FakeStreamingLLM()
 
     cid = await svc.conversation_store.create_conversation(user_id)
     # 一轮 tool_calls（OpenAI 格式）
@@ -335,8 +330,7 @@ async def test_disconnect_still_persists_answer(user_id):
     然后轮询等待后台落库，断言历史里出现 assistant 消息。
     """
     svc = AgentService()
-    svc.llm = SlowStreamingLLM()
-    svc.chat_model = EventScriptChatModel(llm=svc.llm)  # 主循环图化后由 langchain 模型驱动
+    svc.chat_model = EventScriptChatModel(llm=SlowStreamingLLM())
 
     async def noop(user_id, conv_id):
         pass

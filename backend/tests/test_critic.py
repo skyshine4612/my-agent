@@ -236,28 +236,30 @@ async def test_critic_filters_empty_correction():
 
 
 class ScriptedStreamLLM:
-    """按脚本产出 stream_chat 事件（每轮生成吐一个 turn），并记录 complete（修正轮）调用。"""
+    """按脚本产出 stream_chat 事件（每轮生成吐一个 turn）；脚本耗尽后的那次调用即 critic 修正轮。"""
 
     def __init__(self, stream_turns, complete_response=""):
         self.stream_turns = list(stream_turns)
         self.i = 0
-        self.stream_messages = []  # 记录每次 stream_chat 收到的 messages
-        self.complete_calls = []  # 记录修正轮的 complete 调用
+        self.stream_messages = []
+        self.correction_calls = []  # 记录修正轮收到的 messages
         self.complete_response = complete_response
 
     async def stream_chat(self, messages, tools=None):
         self.stream_messages.append(messages)
+        # 脚本已按序吐完，这次调用只可能是 critic 的修正重写：产出修正答案并记账
+        if self.i >= len(self.stream_turns):
+            self.correction_calls.append(messages)
+            yield {"type": "content", "text": self.complete_response}
+            yield {"type": "end", "tool_calls": None}
+            return
         turn = self.stream_turns[self.i]
         self.i += 1
         for e in turn:
             yield e
 
-    async def complete(self, messages):
-        self.complete_calls.append(messages)
-        return self.complete_response
 
-
-def _make_svc(tmp_path, monkeypatch, llm, chat_model=None):
+def _make_svc(tmp_path, monkeypatch, chat_model=None):
     """构造带假 LLM 的 service，并摘掉异步 LTM 提炼、mock 天气数据源避免真实网络。
 
     数据库由 db fixture 提供（连 agent_test），result_dir 仍隔离到 tmp_path。
@@ -269,7 +271,6 @@ def _make_svc(tmp_path, monkeypatch, llm, chat_model=None):
         return [{"date": "2026-09-01", "day_weather": "晴", "night_weather": "晴", "day_temp": 30, "night_temp": 20}]
     monkeypatch.setattr(UapisDataSource, "get_weather", fake_weather)
     svc = AgentService()
-    svc.llm = llm
     svc.chat_model = chat_model if chat_model is not None else _verdict_model(ok=True)
 
     async def noop(user_id, conv_id):
@@ -289,7 +290,7 @@ async def test_critic_triggers_on_hard_data(user_id, tmp_path, monkeypatch):
         _verdict_turn(ok=True),
     ])
     chat_model = EventScriptChatModel(llm=llm)
-    svc = _make_svc(tmp_path, monkeypatch, llm, chat_model)
+    svc = _make_svc(tmp_path, monkeypatch, chat_model)
     [e async for e in svc.chat_stream(user_id, None, "成都天气")]
     assert chat_model.verdict_calls == 1  # weather_query 是硬数据工具，critic 被触发
 
@@ -304,14 +305,14 @@ async def test_critic_skips_without_hard_data(user_id, tmp_path, monkeypatch):
         _verdict_turn(ok=True),  # 只在 critic 被误触发时才会被消费，届时下结论次数会变成 1
     ])
     chat_model = EventScriptChatModel(llm=llm)
-    svc = _make_svc(tmp_path, monkeypatch, llm, chat_model)
+    svc = _make_svc(tmp_path, monkeypatch, chat_model)
     [e async for e in svc.chat_stream(user_id, None, "成都景点")]
     assert chat_model.verdict_calls == 0  # poi_search 非硬数据，不触发 critic
 
 
 @pytest.mark.asyncio
 async def test_critic_corrects_answer_when_rejected(user_id, tmp_path, monkeypatch):
-    """ok=false 分支：critic 拒绝后，复用第一轮工具结果，用 complete 直接生成修正答案（不重新调工具）。"""
+    """ok=false 分支：critic 拒绝后，复用第一轮工具结果直接重写答案（不重新调工具）。"""
     llm = ScriptedStreamLLM([
         # 第一轮生成：调 weather_query 后给出含编造票价的回答
         [{"type": "end",
@@ -320,16 +321,17 @@ async def test_critic_corrects_answer_when_rejected(user_id, tmp_path, monkeypat
         _verdict_turn(ok=False, issues=[{"claim": "机票100元", "problem": "编造票价", "correction": "删除票价"}]),
     ], complete_response="成都明天晴")
     chat_model = EventScriptChatModel(llm=llm)
-    svc = _make_svc(tmp_path, monkeypatch, llm, chat_model)
+    svc = _make_svc(tmp_path, monkeypatch, chat_model)
     events = [e async for e in svc.chat_stream(user_id, None, "成都天气")]
     conv_id = next(e["conversation_id"] for e in events if e["type"] == "conversation_id")
     history = await svc.conversation_store.get_history(user_id, conv_id)
     saved = json.loads(history[-1]["content"])
     assert saved["content"] == "成都明天晴"  # 修正后的回答被落库
     assert chat_model.verdict_calls == 1  # critic 调一次
-    assert len(llm.complete_calls) == 1  # 修正轮用 complete（不再重新 stream_chat 调工具）
-    # 修正轮的 complete 收到工具结果 + 修正要点
-    correction_user = [m for m in llm.complete_calls[0] if m["role"] == "user"][-1]
+    # 修正轮不再重新调工具，而是把「工具结果 + 修正要点」直接喂回模型重写
+    assert len(llm.correction_calls) == 1
+    assert llm.i == len(llm.stream_turns)  # 脚本被完整消费，多出来的那次调用确实是修正轮
+    correction_user = [m for m in llm.correction_calls[0] if m["role"] == "user"][-1]
     assert "原始问题：成都天气" in correction_user["content"]
     assert "修正要点" in correction_user["content"]
     assert "工具结果" in correction_user["content"]

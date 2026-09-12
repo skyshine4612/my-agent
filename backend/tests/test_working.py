@@ -1,21 +1,22 @@
 # tests/test_working.py
 # 工作记忆契约测试：token 预算淘汰 + LLM 摘要兜底（成对淘汰不拆散配对、保留固定头）
 import pytest
+from langchain_core.messages import AIMessage
 
 from app.core.memory import WorkingMemory
 from app.core.memory.metrics import snapshot
 
 
 class FakeLLM:
-    """记录 complete 调用并返回固定摘要的 LLM 假实现，供断言蒸馏触发与摘要生成。"""
+    """记录蒸馏调用次数并返回固定摘要的假模型，供断言蒸馏触发与摘要生成。"""
 
     def __init__(self, summary="摘要"):
         self.summary = summary
-        self.complete_calls = 0
+        self.calls = 0
 
-    async def complete(self, messages):
-        self.complete_calls += 1
-        return self.summary
+    async def ainvoke(self, messages):
+        self.calls += 1
+        return AIMessage(content=self.summary)
 
 
 @pytest.mark.asyncio
@@ -26,7 +27,7 @@ async def test_fit_no_eviction_when_under_budget():
     window = [{"role": "user", "content": "hi"}]
     out = await wm.fit(window)
     assert out == window
-    assert llm.complete_calls == 0
+    assert llm.calls == 0
 
 
 @pytest.mark.asyncio
@@ -50,7 +51,7 @@ async def test_fit_evicts_and_distills():
     # 摘要作为 system 消息放回最前
     assert out[0]["role"] == "system"
     assert "[早期交互摘要]" in out[0]["content"]
-    assert llm.complete_calls == 1
+    assert llm.calls == 1
     # 埋点增量：淘汰计数按消息条数算（最老单元 = assistant + tool = 2 条），非单元个数；每淘汰一批即一次蒸馏
     assert snapshot().get("working_evicted_units", 0) == evicted_before + 2
     assert snapshot().get("working_distill_calls", 0) == distill_before + 1
@@ -82,9 +83,9 @@ async def test_fit_evicts_pairwise_not_split():
 
 
 class FailingLLM:
-    """complete 抛异常的 LLM 假实现，验证蒸馏失败时降级为拼接截断而非抛错。"""
+    """ainvoke 抛异常的假模型，验证蒸馏失败时降级为拼接截断而非抛错。"""
 
-    async def complete(self, messages):
+    async def ainvoke(self, messages):
         raise RuntimeError("LLM 超时")
 
 

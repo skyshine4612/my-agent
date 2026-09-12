@@ -1,6 +1,6 @@
 # app/core/embedding.py
 # Embedding 客户端：知识库与长期记忆共用的向量化管道。
-# 与 LLMClient 同构（抽象接口 + OpenAI 兼容实现 + 单例工厂），但**不做降级兜底**：
+# 与 get_chat_model() 的单例工厂同构（抽象接口 + OpenAI 兼容实现 + 单例缓存），但**不做降级兜底**：
 # 知识库没有向量就检索不到，属于必须失败的情形；长期记忆允许降级，由 store 自己接异常。
 from abc import ABC, abstractmethod
 

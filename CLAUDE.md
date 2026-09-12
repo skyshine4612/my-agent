@@ -19,12 +19,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 uv sync                                              # 安装依赖
 uv run python run.py                                 # 启动开发服务（uvicorn reload，端口 8000）
 uv run pytest                                        # 跑全部测试
-uv run pytest tests/test_llm.py::test_llm_contract   # 跑单个测试
+uv run pytest tests/test_llm_model.py::test_get_chat_model_is_singleton   # 跑单个测试
 ```
 
 - 测试配置在 `backend/pyproject.toml`：`asyncio_mode = "auto"`（async 测试无需 `@pytest.mark.asyncio`，但现有测试仍显式加了），`testpaths = ["tests"]`。
-- 测试模式：不依赖真实 LLM / 网络，用 `Fake*LLM` 类注入 `service.llm`；数据层连真实 Postgres 测试库 `agent_test`（`SUPABASE_TEST_DATABASE_URL` 由 `tests/conftest.py` 的 `db` fixture 建池并在用例间清表），未配该变量时相关用例整体 skip。
-- 配置：复制 `backend/.env.example` → `backend/.env` 填真实 key；未配 `LLM_API_KEY` 时后端仍可启动（`FallbackLLM` 返回空内容），未配 `SUPABASE_DATABASE_URL` 时启动会因建池失败而报错。
+- 测试模式：不依赖真实 LLM / 网络，用假 langchain 模型注入 `service.chat_model`；数据层连真实 Postgres 测试库 `agent_test`（`SUPABASE_TEST_DATABASE_URL` 由 `tests/conftest.py` 的 `db` fixture 建池并在用例间清表），未配该变量时相关用例整体 skip。
+- 配置：复制 `backend/.env.example` → `backend/.env` 填真实 key；未配 `LLM_API_KEY` 时后端仍可启动（`get_chat_model()` 返回产出空内容的假模型），未配 `SUPABASE_DATABASE_URL` 时启动会因建池失败而报错。
 - 知识库的「抓取网址」入口依赖 Playwright 浏览器，首次需 `uv run playwright install chromium`（约 700MB，含完整 chromium + headless shell）。直连 `cdn.playwright.dev` 在国内约 27KB/s 且频繁断流，加镜像快约 600 倍：`PLAYWRIGHT_DOWNLOAD_HOST=https://cdn.npmmirror.com/binaries/playwright uv run playwright install chromium`。未装时粘贴文本 / 上传文件入口照常可用，只有抓网址会失败。
 
 前端（在 `frontend/` 目录下）：
@@ -51,13 +51,13 @@ docker compose up --build   # 前端 nginx 对外 :80，反代 /api → backend:
 api/routes/chat.py  →  services/agent_service.py  →  core/agent.py (ReAct 循环)
   POST /api/agent/chat    AgentService.chat_stream         Agent.run_stream
   (SSE 流)                装配会话历史/短期·长期记忆/LLM/工具/技能  → core/registry.py (工具执行)
-                          + 知识库检索 + critic 校验 + LTM 提炼  → core/llm.py (LLM 客户端)
+                          + 知识库检索 + critic 校验 + LTM 提炼  → core/llm.py (模型工厂)
 ```
 
 - **`app/services/agent_service.py`**：核心编排器，进程级单例 `service`（路由层直接 `import` 复用）。`chat_stream` 依次做：会话归属校验/新建 → 落库用户消息 → LTM 召回偏好 → 组装历史 → 注入 system prompt（含可用业务清单 + 事实规范 + 今天日期）→ 驱动 `Agent.run_stream` → critic 校验 → 落库结构化 assistant 消息 → 流式输出答案 → fire-and-forget 提炼长期记忆。记忆的组装/压缩/提炼委托给 `core/memory/manager.py` 的 `MemoryManager`。
 - **`app/core/agent.py`**：`Agent.run_stream` 实现 ReAct 循环（LLM 决策 → 工具调用 → 回填结果 → 再决策，最多 `max_iters=20` 轮）。同一轮多个 tool_calls 用 `asyncio.gather` 并行执行；工具结果用 `call_raw` 拿结构化原始结果后做结构化截断（list 前 20 / dict 前 20 键 / str `truncate_limit` 默认 4000），完整结果 spill 到文件供 `read_file`/`grep` 读回；工作记忆（本轮工具结果）的 token 预算淘汰委托给 `core/memory/working.py` 的 `WorkingMemory`。
 - **`app/core/registry.py`**：`ToolRegistry` 统一管理工具元信息（name/description/parameters/fn/label），转成 OpenAI function-calling schema 供 LLM 决策，并执行同步/异步工具函数。
-- **`app/core/llm.py`**：`LLMClient` 抽象（`chat`/`complete`/`stream_chat` 三方法）+ `OpenAICompatLLM`（DashScope）+ `FallbackLLM`（无 key 兜底）+ `get_llm()` 单例工厂。
+- **`app/core/llm.py`**：LLM 接入层，全项目唯一的 LLM 通路 —— `get_chat_model()` 单例工厂返回 langchain 模型（DashScope 走 OpenAI 兼容协议，故用 `ChatOpenAI`）；无 key 时返回 `_EmptyFakeChatModel`（产出空内容），保证服务仍可启动。`close_chat_model()` 由 lifespan 调用，关闭模型持有的 httpx 连接池。
 - **`app/core/critic.py`**：`run_critic` 事实校验专家——多轮带工具（`read_file`/`grep` 定向读完整落库结果做 grounded 校验），比对「工具结果 vs 回答」，输出 `{ok, issues}`；注入当天日期避免年份误判，过滤「correction 为空」的误报 issue，限轮数 + fail-open（失败/超限按通过处理，不阻塞主流程）。
 
 ### 关键机制 / 不变量

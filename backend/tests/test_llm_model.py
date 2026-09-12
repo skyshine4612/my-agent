@@ -30,7 +30,7 @@ async def test_get_chat_model_without_key_drives_create_agent(monkeypatch):
 
     agent = create_agent(llm.get_chat_model(), tools=[_dummy_tool])
     result = await agent.ainvoke({"messages": [HumanMessage("你好")]})
-    # 无 key 时不产出内容，与 FallbackLLM 同一行为：服务能起、对话返回空
+    # 无 key 时不产出内容：服务能起、对话返回空
     assert result["messages"][-1].content == ""
 
 

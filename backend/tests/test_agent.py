@@ -24,10 +24,10 @@ def _lc_tool_call(tc):
 
 
 class EventScriptChatModel(BaseChatModel):
-    """把事件式假 LLM 的 stream_chat 脚本适配成 langchain 模型（主循环由 create_agent 驱动）。
+    """把事件式假 LLM 的 stream_chat 脚本适配成 langchain 模型。
 
     content 事件拼成答案文本、end 事件的 tool_calls 转 langchain 形状；传给 stream_chat 的 messages
-    转回 OpenAI 形状，故本文件里对 llm.calls 的断言逐字不变。
+    转回 OpenAI 形状，故对 llm.calls 的断言可按 OpenAI 形状书写。
     """
 
     llm: Any = None
@@ -144,7 +144,7 @@ async def test_run_stream_tokens_in_order():
     llm = StreamingLLM([
         [{"type": "content", "text": "成"}, {"type": "content", "text": "都晴"}, {"type": "end", "tool_calls": None}],
     ])
-    a = Agent(name="t", system_prompt="s", tools=[], llm=llm, model=EventScriptChatModel(llm=llm))
+    a = Agent(name="t", system_prompt="s", tools=[], model=EventScriptChatModel(llm=llm))
     events = []
 
     async def on_event(e):
@@ -165,7 +165,7 @@ async def test_run_stream_tool_call_and_accumulated_text():
         [{"type": "content", "text": "成都晴"}, {"type": "end", "tool_calls": None}],
     ])
     reg = FakeRegistry({"w": "晴"})
-    a = Agent(name="t", system_prompt="s", tools=["w"], llm=llm, model=EventScriptChatModel(llm=llm))
+    a = Agent(name="t", system_prompt="s", tools=["w"], model=EventScriptChatModel(llm=llm))
     events = []
 
     async def on_event(e):
@@ -191,7 +191,7 @@ async def test_run_stream_parallel_tools_keep_order():
         [{"type": "content", "text": "done"}, {"type": "end", "tool_calls": None}],
     ])
     reg = ConcurrentRegistry({"a": "a_result", "b": "b_result"})
-    a = Agent(name="t", system_prompt="s", tools=["a", "b"], llm=llm, model=EventScriptChatModel(llm=llm))
+    a = Agent(name="t", system_prompt="s", tools=["a", "b"], model=EventScriptChatModel(llm=llm))
     out, _ = await a.run_stream("go", [], reg, on_event=None)
     assert out == "done"
     # 并发度达到 2，证明两个工具是并行执行而非串行
@@ -211,7 +211,7 @@ async def test_run_stream_struct_truncates_tool_result():
         [{"type": "content", "text": "ok"}, {"type": "end", "tool_calls": None}],
     ])
     reg = FakeRegistry({"big": "x" * 6000})
-    a = Agent(name="t", system_prompt="s", tools=["big"], llm=llm, model=EventScriptChatModel(llm=llm))
+    a = Agent(name="t", system_prompt="s", tools=["big"], model=EventScriptChatModel(llm=llm))
     out, _ = await a.run_stream("go", [], reg, on_event=None)
     assert out == "ok"
     tool_msgs = [m for m in llm.calls[1] if m["role"] == "tool"]
@@ -234,7 +234,7 @@ async def test_parallel_tool_calls_keep_order_and_ids():
         [{"type": "content", "text": "done"}, {"type": "end", "tool_calls": None}],
     ])
     reg = ConcurrentRegistry({"a": "a_result", "b": "b_result"}, delays={"a": 0.05, "b": 0.0})
-    a = Agent(name="t", system_prompt="s", tools=["a", "b"], llm=llm, model=EventScriptChatModel(llm=llm))
+    a = Agent(name="t", system_prompt="s", tools=["a", "b"], model=EventScriptChatModel(llm=llm))
     events = []
 
     async def on_event(e):
@@ -267,7 +267,7 @@ async def test_model_sees_user_message_last():
         [{"type": "content", "text": "done"}, {"type": "end", "tool_calls": None}],
     ])
     reg = FakeRegistry({"w": "晴"})
-    a = Agent(name="t", system_prompt="s", tools=["w"], llm=llm, model=EventScriptChatModel(llm=llm))
+    a = Agent(name="t", system_prompt="s", tools=["w"], model=EventScriptChatModel(llm=llm))
     out, _ = await a.run_stream("go", [], reg)
     assert out == "done"
     # 第二轮模型调用所见：system → assistant(tool_calls) → tool → user，用户指令压在最后
@@ -284,7 +284,7 @@ async def test_status_event_precedes_first_content_block():
         [{"type": "content", "text": "done"}, {"type": "end", "tool_calls": None}],
     ])
     reg = FakeRegistry({"w": "晴"})
-    a = Agent(name="t", system_prompt="s", tools=["w"], llm=llm, model=EventScriptChatModel(llm=llm))
+    a = Agent(name="t", system_prompt="s", tools=["w"], model=EventScriptChatModel(llm=llm))
     events = []
 
     async def on_event(e):
@@ -309,7 +309,7 @@ async def test_never_converging_model_hits_max_iters_limit():
         [{"type": "end", "tool_calls": [{"id": "c3", "function": {"name": "w", "arguments": "{}"}}]}],
     ])
     reg = FakeRegistry({"w": "晴"})
-    a = Agent(name="t", system_prompt="s", tools=["w"], llm=llm,
+    a = Agent(name="t", system_prompt="s", tools=["w"],
               model=EventScriptChatModel(llm=llm), max_iters=3)
     events = []
 
@@ -335,7 +335,7 @@ async def test_default_max_iters_is_20_rounds():
         [{"type": "end", "tool_calls": [{"id": f"c{i}", "function": {"name": "w", "arguments": "{}"}}]}]
         for i in range(20)])
     reg = FakeRegistry({"w": "晴"})
-    a = Agent(name="t", system_prompt="s", tools=["w"], llm=llm, model=EventScriptChatModel(llm=llm))
+    a = Agent(name="t", system_prompt="s", tools=["w"], model=EventScriptChatModel(llm=llm))
     out, rounds = await a.run_stream("go", [], reg)
     assert len(rounds) == 20
     assert reg.called == [("w", {})] * 20
@@ -352,14 +352,16 @@ async def test_model_sees_distilled_summary_before_kept_window():
     llm = StreamingLLM([
         [{"type": "end", "tool_calls": [{"id": "c1", "function": {"name": "big", "arguments": "{}"}}]}],
         [{"type": "end", "tool_calls": [{"id": "c2", "function": {"name": "small", "arguments": "{}"}}]}],
+        # 淘汰单元的蒸馏同样走这一份脚本：它取走的这个 turn 的文本即淘汰摘要本体
+        [{"type": "content", "text": "早期摘要"}, {"type": "end", "tool_calls": None}],
         [{"type": "content", "text": "done"}, {"type": "end", "tool_calls": None}],
     ])
     reg = FakeRegistry({"big": "x" * 6000, "small": "ok"})
-    a = Agent(name="t", system_prompt="s", tools=["big", "small"], llm=llm, model=EventScriptChatModel(llm=llm))
+    a = Agent(name="t", system_prompt="s", tools=["big", "small"], model=EventScriptChatModel(llm=llm))
     # 预算只够留下第二轮的交互：第一轮的大结果被淘汰并蒸馏成摘要
     out, _ = await a.run_stream("go", [], reg, context_budget=600)
     assert out == "done"
-    last = llm.calls[2]  # 第三轮（答案轮）模型所见 = 淘汰后的窗口
+    last = llm.calls[3]  # 答案轮的模型所见（calls[2] 是淘汰单元的蒸馏调用）
     assert [m["role"] for m in last] == ["system", "system", "assistant", "tool", "user"]
-    assert str(last[1]["content"]).startswith("[早期交互摘要]")  # 摘要在保留窗口之前
+    assert last[1]["content"] == "[早期交互摘要] 早期摘要"  # 摘要在保留窗口之前
     assert last[-1]["content"] == "go"  # 用户指令在最后

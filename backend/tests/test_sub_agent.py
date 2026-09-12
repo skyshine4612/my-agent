@@ -10,20 +10,6 @@ from app.core.registry import ToolRegistry
 from app.tools.sub_agent import make_call_sub_agent
 
 
-class FakeSubLLM:
-    """子 Agent 的假 LLM：直接吐「子任务完成」，不调工具。"""
-
-    async def stream_chat(self, messages, tools=None):
-        yield {"type": "content", "text": "子任务完成"}
-        yield {"type": "end", "tool_calls": None}
-
-    async def chat(self, messages, tools=None, response_format=None):
-        return {"content": "{}", "tool_calls": None}
-
-    async def complete(self, messages):
-        return ""
-
-
 class SubChatModel(BaseChatModel):
     """子 Agent 的假 langchain 模型（子 Agent 的循环由 create_agent 驱动）：直接回答案、不调工具。"""
 
@@ -49,6 +35,6 @@ async def test_call_sub_agent_returns_answer(tmp_path):
 
     registry.register_tool(get_skill, "读取业务规则")
 
-    fn = make_call_sub_agent(FakeSubLLM(), registry, ["travel"], 32000, model=SubChatModel())
+    fn = make_call_sub_agent(SubChatModel(), registry, ["travel"], 32000)
     result = await fn.ainvoke({"task": "查北京到上海的火车票"})
     assert result["answer"] == "子任务完成"
