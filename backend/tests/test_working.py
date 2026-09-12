@@ -3,6 +3,7 @@
 import pytest
 
 from app.core.memory import WorkingMemory
+from app.core.memory.metrics import snapshot
 
 
 class FakeLLM:
@@ -43,11 +44,16 @@ async def test_fit_evicts_and_distills():
          "tool_calls": [{"id": "2", "function": {"name": "poi", "arguments": "{}"}}]},
         {"role": "tool", "tool_call_id": "2", "content": "y" * 10},
     ]
+    evicted_before = snapshot().get("working_evicted_units", 0)
+    distill_before = snapshot().get("working_distill_calls", 0)
     out = await wm.fit(window)
     # 摘要作为 system 消息放回最前
     assert out[0]["role"] == "system"
     assert "[早期交互摘要]" in out[0]["content"]
     assert llm.complete_calls == 1
+    # 埋点增量：淘汰计数按消息条数算（最老单元 = assistant + tool = 2 条），非单元个数；每淘汰一批即一次蒸馏
+    assert snapshot().get("working_evicted_units", 0) == evicted_before + 2
+    assert snapshot().get("working_distill_calls", 0) == distill_before + 1
     # 最新单元的 assistant+tool 配对保留，未被拆散
     tool_msgs = [m for m in out if m.get("role") == "tool"]
     assert [m["tool_call_id"] for m in tool_msgs] == ["2"]
@@ -95,11 +101,14 @@ async def test_fit_distill_failure_falls_back():
          "tool_calls": [{"id": "2", "function": {"name": "poi", "arguments": "{}"}}]},
         {"role": "tool", "tool_call_id": "2", "content": "y" * 10},
     ]
+    fallback_before = snapshot().get("working_distill_fallbacks", 0)
     out = await wm.fit(window)  # 不应抛异常
     # 降级摘要作为 system 消息放回最前，且保留被淘汰单元的可读内容（x*100 拼进摘要）
     assert out[0]["role"] == "system"
     assert "[早期交互摘要]" in out[0]["content"]
     assert "x" in out[0]["content"]
+    # 埋点增量：蒸馏抛异常走降级分支，恰好记一次
+    assert snapshot().get("working_distill_fallbacks", 0) == fallback_before + 1
 
 
 @pytest.mark.asyncio

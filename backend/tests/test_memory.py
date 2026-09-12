@@ -5,7 +5,9 @@ import json
 import pytest
 
 from app.core.memory import ConversationStore, LongTermMemory, ShortTermMemory, ToolResultStore
+from app.core.memory import long_term as long_term_module
 from app.core.memory.manager import MemoryManager
+from app.core.memory.metrics import snapshot
 
 
 class _BrokenEmbedder:
@@ -95,11 +97,45 @@ async def test_extract_facts_dedups_semantically(user_id, fake_embedder, tmp_pat
                             ToolResultStore(str(tmp_path)),
                             _FakeExtractLLM([{"fact": "订酒店要经济型", "importance": 0.9}]))
 
+    dedup_before = snapshot().get("dedup_hits", 0)
     await manager.extract_facts(user_id, "帮我订个经济型的酒店")
 
     facts = await l.get_all(user_id)
     assert len(facts) == 1                          # 没有新增重复条目
     assert facts[0]["importance"] == 0.9            # 改为把已有条目的 importance 提到较大值
+    # 埋点增量：提炼出的 fact 命中语义去重，走「只提升不新增」分支一次
+    assert snapshot().get("dedup_hits", 0) == dedup_before + 1
+
+
+class _FakeRlsConn:
+    """顶替 rls_conn 的假事务上下文：update_importance 只经它发一条 update。"""
+
+    def __init__(self):
+        self.executed = []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def execute(self, sql, *args):
+        self.executed.append((sql, args))
+
+
+@pytest.mark.asyncio
+async def test_update_importance_bumps_dedup_metric(monkeypatch):
+    """语义去重命中即 dedup_hits +1。
+
+    不依赖真实 Postgres：测试库不可达时其余长期记忆用例整体 skip，这条守卫必须仍然生效。
+    """
+    conn = _FakeRlsConn()
+    monkeypatch.setattr(long_term_module, "rls_conn", lambda user_id: conn)
+    l = LongTermMemory()
+    before = snapshot().get("dedup_hits", 0)
+    await l.update_importance("u1", "偏好经济型酒店", 0.9)
+    assert len(conn.executed) == 1                            # 确实走了 update 分支，而非提前返回
+    assert snapshot().get("dedup_hits", 0) == before + 1      # 埋点增量恰为一次
 
 
 @pytest.mark.asyncio

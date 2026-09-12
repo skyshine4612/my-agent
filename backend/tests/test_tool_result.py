@@ -7,6 +7,7 @@ import pytest
 from app.core.agent import Agent
 from app.core.context import current_user_id
 from app.core.memory import ToolResultStore
+from app.core.memory.metrics import snapshot
 from app.core.registry import ToolRegistry
 from app.tools.file import register_file_tools
 
@@ -136,8 +137,11 @@ async def test_run_stream_spills_oversize_result(tmp_path):
     reg = FakeRegistry({"big": "x" * 5000})
     store = ToolResultStore(str(tmp_path / "results"))
     current_user_id.set("u1")  # spill 按 current_user_id 分目录，读回要用同一个
+    spill_before = snapshot().get("spill_writes", 0)
     a = Agent(name="t", system_prompt="s", tools=["big"], llm=llm)
     await a.run_stream("go", [], reg, on_event=None, conversation_id="conv1", tool_result_store=store)
+    # 埋点增量：run_stream 的超长结果分支写一次文件
+    assert snapshot().get("spill_writes", 0) == spill_before + 1
     tool_msgs = [m for m in llm.calls[1] if m["role"] == "tool"]
     content = tool_msgs[0]["content"]
     assert "read_file" in content  # 提示含 read_file/grep
