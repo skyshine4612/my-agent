@@ -4,6 +4,7 @@ import json
 import pathlib
 
 import pytest
+from langchain_core.utils.function_calling import convert_to_openai_tool
 
 from app.services.agent_service import service
 
@@ -41,10 +42,13 @@ def _project(schema: dict) -> dict:
 
 @pytest.mark.parametrize("name", sorted(_golden()))
 def test_tool_schema_matches_golden(name):
-    """逐个工具比对：参数名、类型、description、required 必须与快照完全一致。"""
-    live = service.registry.to_openai_schemas([name])
-    assert len(live) == 1, f"{name} 未注册"
-    assert _project(live[0]) == _golden()[name]
+    """逐个工具比对：参数名、类型、description、required 必须与快照完全一致。
+
+    取数走 langchain 的转换函数 —— 主循环正是把 tool 对象交给 create_agent、
+    由框架做同一转换，所以这里钉的就是模型实际收到的 schema。
+    """
+    live = convert_to_openai_tool(service.registry.get(name).fn)
+    assert _project(live) == _golden()[name]
 
 
 def test_golden_covers_every_registered_tool():

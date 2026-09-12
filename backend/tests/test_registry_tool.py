@@ -1,27 +1,9 @@
 # tests/test_registry_tool.py
-# register_tool：从 langchain tool 提取 schema，执行走 tool.ainvoke，拿到的仍是结构化原始结果。
+# register_tool / call_raw：注册后按名执行走 tool.ainvoke，拿到的仍是结构化原始结果。
 import pytest
 from langchain_core.tools import tool
 
 from app.core.registry import ToolRegistry
-
-
-def test_register_tool_extracts_schema():
-    registry = ToolRegistry()
-
-    @tool
-    def sample(city: str, days: int = 1) -> dict:
-        """查询示例城市的天气。"""
-        return {"city": city, "days": days}
-
-    registry.register_tool(sample, "查天气")
-    schemas = registry.to_openai_schemas(["sample"])
-    assert len(schemas) == 1
-    fn = schemas[0]["function"]
-    assert fn["name"] == "sample"
-    assert fn["description"] == "查询示例城市的天气。"
-    assert "city" in fn["parameters"]["properties"]
-    assert fn["parameters"]["properties"]["city"]["type"] == "string"
 
 
 def test_register_tool_label():
@@ -81,18 +63,3 @@ async def test_call_raw_coerces_types():
     registry.register_tool(sample, "查天数")
     raw = await registry.call_raw("sample", {"days": "3"})
     assert raw == {"days": 3, "type": "int"}
-
-
-def test_optional_param_schema_is_flattened():
-    """Optional 参数产生 anyOf:[X, null]，压平成 X —— OpenAI 对 anyOf 支持有限。"""
-    registry = ToolRegistry()
-
-    @tool
-    def sample(city: str, note: str | None = None) -> dict:
-        """查询示例城市的天气。"""
-        return {"city": city, "note": note}
-
-    registry.register_tool(sample, "查天气")
-    props = registry.to_openai_schemas(["sample"])[0]["function"]["parameters"]["properties"]
-    assert props["note"]["type"] == "string"
-    assert "anyOf" not in props["note"]

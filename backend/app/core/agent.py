@@ -452,7 +452,7 @@ class Agent:
         inputs.extend(history)
         inputs.append(HumanMessage(content=user_message))
         # 工具取注册表里的 langchain tool 对象：create_agent 需要真工具对象，middleware 才拿得到
-        # request.tool；工具 schema 由工具自身的 args_schema 生成，与 to_openai_schemas 同源
+        # request.tool；工具 schema 由框架从各自的 args_schema 生成
         tools = [registry.get(n).fn for n in self.tools] if self.tools else []
         # conversation_id 每轮不同，middleware 实例与本轮图一起 new，不挂成可变共享属性
         # （并发两轮对话时共享实例会互相踩）

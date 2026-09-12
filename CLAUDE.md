@@ -49,7 +49,7 @@ api/routes/chat.py  →  services/agent_service.py  →  core/agent.py (ReAct �
 ```
 
 - **`app/core/agent.py`**：`Agent.run_stream` 实现 ReAct 循环，图侧额度 `RECURSION_LIMIT` 固定 60 步（一轮 ReAct 占 3 步，即最多 20 轮）；同一轮多个 tool_calls 由框架的 tools 节点并行执行。
-- **`app/core/registry.py`**：`ToolRegistry` 统一管理工具元信息（name/description/parameters/fn/label），转成 OpenAI function-calling schema 供 LLM 决策，并执行同步/异步工具函数。
+- **`app/core/registry.py`**：`ToolRegistry` 统一管理工具元信息（name/description/fn/label）并执行工具函数。模型侧的 schema 不在这里生成——langchain 装配时从各 tool 对象的 pydantic `args_schema` 直接转，中间无后处理。
 - **`app/core/llm.py`**：全项目唯一的 LLM 通路。`get_chat_model()` 单例工厂返回 langchain 模型（DashScope 走 OpenAI 兼容协议，故用 `ChatOpenAI`）；`close_chat_model()` 由 lifespan 调用，关闭模型持有的 httpx 连接池。
 
 ### 关键机制 / 不变量

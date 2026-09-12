@@ -1,63 +1,29 @@
 # app/core/registry.py
-# 工具注册表（ToolRegistry）：统一管理工具元信息（schema 由 langchain tool 对象的 pydantic
-# args_schema 生成），把工具转成 OpenAI function calling schema 供 LLM 决策调用。
+# 工具注册表（ToolRegistry）：统一管理工具元信息并执行工具函数。模型侧的 schema 由 langchain
+# 在装配时从各 tool 对象的 pydantic args_schema 生成，本模块不经手。
 from dataclasses import dataclass
 from typing import Callable
 
 
-def _openai_safe_schema(schema: dict) -> dict:
-    """把 pydantic 生成的 schema 收拾成 OpenAI function calling 能吃的形式。
-
-    三处清理：递归去掉 pydantic 塞的 title（冗余且会撑大 prompt）；
-    去掉根节点 description（pydantic 复制模型 docstring 而来，与工具级 description 文本重复）；
-    把 Optional 产生的 anyOf:[{type:X},{type:null}] 压平成 {type:X}（OpenAI 对 anyOf 支持有限）。
-    """
-    def walk(node):
-        if isinstance(node, dict):
-            node.pop("title", None)
-            variants = node.get("anyOf")
-            if isinstance(variants, list):
-                non_null = [v for v in variants if v.get("type") != "null"]
-                if len(non_null) == 1:
-                    node.pop("anyOf", None)
-                    node.update(walk(non_null[0]))
-                    return node
-            return {k: walk(v) for k, v in node.items()}
-        if isinstance(node, list):
-            return [walk(v) for v in node]
-        return node
-
-    schema.pop("title", None)
-    # pydantic 把模型 docstring 复制成根节点 description，与工具级 description 文本重复，清掉
-    schema.pop("description", None)
-    return walk(schema)
-
-
 @dataclass
 class Tool:
-    """单个工具的元信息 + 可调用函数。
+    """单个工具的条目：可调用函数 + 前端展示短语。
 
-    属性：
-        name:        工具名（LLM 通过它选择要调用的工具）
-        description: 工具用途描述，写入 OpenAI schema 供 LLM 理解何时调用
-        parameters:  JSON Schema 形式的入参定义，约束工具接受的参数结构
-        fn:          可调用对象：langchain tool 对象（走 ainvoke），或普通同步/异步函数
-        label:       中文动作短语（如「查询火车票」），供前端工具气泡展示；空则回退英文名
+    工具名由 `_tools` 的字典键承载；description 与参数定义在 langchain tool 对象上，
+    模型侧的 schema 由框架直接从那里生成。
     """
-    name: str
-    description: str
-    parameters: dict
+
     fn: Callable
+    # 中文动作短语（如「查询火车票」），供前端工具气泡展示；空则回退英文名
     label: str = ""
 
 
 class ToolRegistry:
-    """工具注册表：统一管理工具，转成 OpenAI function schema 供 LLM 调用。
+    """工具注册表：统一管理工具并执行。
 
     职责：
-        - register_tool：注册 langchain tool 对象（schema 取自其 args_schema）
-        - to_openai_schemas：把指定名字的工具转成 OpenAI function calling schema 列表
-        - call：按名字执行工具，统一返回字符串（委托 call_raw 后 str()）
+        - register_tool：注册 langchain tool 对象
+        - call_raw：按名字执行工具并返回结构化原始结果
     """
 
     def __init__(self):
@@ -65,13 +31,12 @@ class ToolRegistry:
         self._tools = {}
 
     def register_tool(self, tool, label=""):
-        """从 langchain tool 对象注册：schema 由 pydantic 生成，执行走 tool.ainvoke。
+        """从 langchain tool 对象注册，执行走 tool.ainvoke。
 
         存 tool 对象而非底层函数：ainvoke 返回结构化原始对象，截断与 spill 判断拿得到结构；
         同时白拿 pydantic 校验——类型强转、缺必填报错、多余参数静默忽略。
         """
-        params = _openai_safe_schema(tool.args_schema.model_json_schema())
-        self._tools[tool.name] = Tool(tool.name, tool.description, params, tool, label)
+        self._tools[tool.name] = Tool(tool, label)
 
     def get(self, name):
         """按名字取回工具对象。"""
@@ -86,13 +51,6 @@ class ToolRegistry:
         t = self._tools.get(name)
         return (t.label or name) if t else name
 
-    def to_openai_schemas(self, names):
-        """把指定名字的工具转成 OpenAI function calling 的 schema 列表。"""
-        # 遍历请求的名字，仅保留已注册的工具，逐个转成 {"type":"function","function":{...}} 结构
-        return [{"type": "function", "function": {"name": t.name, "description": t.description,
-                                                  "parameters": t.parameters}} for n in names if
-                (t := self._tools.get(n))]
-
     async def call_raw(self, name, arguments):
         """执行工具并返回结构化原始结果（dict/list/str 等），不做 str() 转换。
 
@@ -100,9 +58,3 @@ class ToolRegistry:
         `str()` 会把结构信息压平丢失。
         """
         return await self._tools[name].fn.ainvoke(arguments)
-
-    async def call(self, name, arguments) -> str:
-        """执行工具，支持同步/异步函数，统一返回字符串结果（委托 call_raw 后 str()）。"""
-        res = await self.call_raw(name, arguments)
-        # 统一转成字符串返回，方便 LLM 后续把观察结果回填进对话
-        return str(res)
