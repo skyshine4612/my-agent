@@ -4,15 +4,30 @@
 # 子 agent 由 create_agent 构造（与主循环共用同一套 ReAct 实现）：多轮带工具，
 # critic 可用 read_file/grep 定向读回完整结果做 grounded 校验（对齐 CRITIC/CoV），
 # 限轮数 + fail-open，避免「把完整结果一次性塞进上下文」撞窗口上限。
+import json
 import logging
 import time
 
 from langchain.agents import create_agent
+from langchain_core.callbacks import BaseCallbackHandler
+from langgraph.errors import GraphRecursionError
 from pydantic import BaseModel, Field
 
 from app.core.prompts import load_prompt, today_hint
 
 logger = logging.getLogger(__name__)
+
+
+class _CriticToolLogger(BaseCallbackHandler):
+    """把 critic 实际调用过的工具与入参记进日志，便于事后排查「它到底读了哪些结果文件」。
+
+    结构化输出工具由模型节点内部消化、不经 tools 节点，故不会触发本回调——日志里只有真实读文件动作。
+    """
+
+    def on_tool_start(self, serialized, input_str, **kwargs):
+        inputs = kwargs.get("inputs") or input_str
+        logger.info("[critic] 调用工具 %s，参数 %s",
+                    (serialized or {}).get("name", ""), json.dumps(inputs, ensure_ascii=False))
 
 
 # 注意：下面两个模型既是内部数据结构，也是模型可见的调用契约——它们的 docstring 与字段描述
@@ -70,10 +85,16 @@ async def run_critic(model, tool_results: str, answer: str, read_file_tool=None,
             {"messages": [{"role": "user", "content": user}]},
             # create_agent 每轮「模型 + 工具」各占一个超步，N 轮需 2N-1：第 N 轮模型调用仍放行，
             # 它若还在调工具，下一超步即触顶抛 GraphRecursionError
-            config={"recursion_limit": 2 * max_iter - 1},
+            config={"recursion_limit": 2 * max_iter - 1,
+                    "callbacks": [_CriticToolLogger()]},
         )
+    except GraphRecursionError:
+        # 达到 max_iter 仍未下结论（每轮都在读）：fail-open，不阻塞主流程。
+        # 与「调用失败」分开一条日志：这是校验主动放弃，不是校验器故障，运维需要能分辨
+        logger.info("[critic] 达到 %d 轮上限未收敛，按通过处理", max_iter)
+        return {"ok": True, "issues": []}
     except Exception as e:
-        # LLM 调用失败（配额耗尽 403 / 网络抖动等）/ 超轮数 / 其他异常：
+        # LLM 调用失败（配额耗尽 403 / 网络抖动等）或其他异常：
         # 跳过校验，不因校验器故障中断 SSE 主流程
         logger.warning("[critic] 校验调用失败，跳过事实校验：%s", e)
         return {"ok": True, "issues": []}

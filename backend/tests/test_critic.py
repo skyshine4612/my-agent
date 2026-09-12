@@ -2,14 +2,16 @@
 # critic 回路契约测试：run_critic 的 ok=true/ok=false、多轮带工具（read_file/grep）、限轮 fail-open，
 # 以及 service 层的触发条件（仅硬数据工具触发）与修正答案流程。
 import json
+import logging
 
 import pytest
+from langchain.agents.structured_output import ToolStrategy
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
 
 from app.config import settings
-from app.core.critic import run_critic
+from app.core.critic import CriticVerdict, run_critic
 from app.datasource.uapis import UapisDataSource
 from app.services.agent_service import AgentService
 from app.tools.file import make_grep, make_read_file
@@ -38,6 +40,13 @@ class ScriptedChatModel(BaseChatModel):
         msg = self.responses[self.idx]
         self.idx += 1
         return ChatResult(generations=[ChatGeneration(message=msg)])
+
+
+class BoomChatModel(ScriptedChatModel):
+    """一调用就抛异常的假模型：模拟 401 / 网络抖动等真实 provider 调用失败。"""
+
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+        raise RuntimeError("模拟 LLM 调用失败")
 
 
 def _tool_call(call_id, name, args):
@@ -88,7 +97,7 @@ async def test_run_critic_ok_false():
 
 
 @pytest.mark.asyncio
-async def test_critic_multi_turn_reads_file():
+async def test_critic_multi_turn_reads_file(caplog):
     """critic 多轮：第一轮调用 read_file 读完整结果，第二轮下结论 ok=false + issue。"""
     model = ScriptedChatModel(responses=[
         AIMessage(content="", tool_calls=[
@@ -98,12 +107,16 @@ async def test_critic_multi_turn_reads_file():
     ])
     store = _FakeStore()
 
-    verdict = await run_critic(model, "工具结果：票价70元", "票价100元",
-                               read_file_tool=make_read_file(store), grep_tool=make_grep(store), max_iter=3)
+    with caplog.at_level(logging.INFO, logger="app.core.critic"):
+        verdict = await run_critic(model, "工具结果：票价70元", "票价100元",
+                                   read_file_tool=make_read_file(store), grep_tool=make_grep(store), max_iter=3)
     assert verdict["ok"] is False
     assert len(verdict["issues"]) == 1
     assert store.reads == [("conv1/a.txt", 0, 3500)]  # critic 确实调用了 read_file 读完整结果
     assert model.bound_tools[0] == ["read_file", "grep", "CriticVerdict"]  # 附了 read_file/grep 工具 schema
+    # 读了哪个文件必须留在日志里（由 on_tool_start 回调打的），否则误判无从排查
+    assert "[critic] 调用工具 read_file，参数" in caplog.text
+    assert "conv1/a.txt" in caplog.text
 
 
 @pytest.mark.asyncio
@@ -117,7 +130,7 @@ async def test_critic_single_call_without_read_fn():
 
 
 @pytest.mark.asyncio
-async def test_critic_fail_open_on_max_iter():
+async def test_critic_fail_open_on_max_iter(caplog):
     """critic 每轮都在读、不收敛时，达到 max_iter 上限 fail-open（ok=True）且不再无限调工具。"""
     model = ScriptedChatModel(responses=[
         AIMessage(content="", tool_calls=[_tool_call(f"c{i}", "read_file", {"path": "a.txt"})])
@@ -125,10 +138,38 @@ async def test_critic_fail_open_on_max_iter():
     ])
     store = _FakeStore()
 
-    verdict = await run_critic(model, "工具结果：x", "答案",
-                               read_file_tool=make_read_file(store), grep_tool=make_grep(store), max_iter=3)
+    with caplog.at_level(logging.INFO, logger="app.core.critic"):
+        verdict = await run_critic(model, "工具结果：x", "答案",
+                                   read_file_tool=make_read_file(store), grep_tool=make_grep(store), max_iter=3)
     assert verdict == {"ok": True, "issues": []}
     assert model.idx == 3  # 触顶即停：轮数映射到 recursion_limit，不会无限调工具
+    # 超轮数是「校验主动放弃」，必须与「校验器故障」用不同日志区分
+    assert "[critic] 达到 3 轮上限未收敛，按通过处理" in caplog.text
+    assert "校验调用失败" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_critic_fail_open_on_model_error(caplog):
+    """LLM 调用失败（401 / 网络抖动）时 fail-open（ok=True），不因校验器故障中断主流程。"""
+    store = _FakeStore()
+
+    with caplog.at_level(logging.INFO, logger="app.core.critic"):
+        verdict = await run_critic(BoomChatModel(), "工具结果：晴", "天气晴",
+                                   read_file_tool=make_read_file(store), grep_tool=make_grep(store))
+    assert verdict == {"ok": True, "issues": []}
+    assert "校验调用失败，跳过事实校验" in caplog.text
+    assert "轮上限未收敛" not in caplog.text
+
+
+def test_critic_verdict_docstring_becomes_tool_description():
+    """CriticVerdict 的 docstring 会成为结构化输出工具的 description。
+
+    为空则工具没有任何说明，而 create_agent 在有结构化输出工具时强制 tool_choice="any"，
+    模型只能靠猜该调哪个工具；猜错即 structured_response=None → 走 fail-open 静默恒判通过。
+    """
+    assert CriticVerdict.__doc__ and CriticVerdict.__doc__.strip()
+    spec = ToolStrategy(schema=CriticVerdict).schema_specs[0]
+    assert spec.description.strip() == CriticVerdict.__doc__.strip()
 
 
 @pytest.mark.asyncio
