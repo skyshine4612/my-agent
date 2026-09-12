@@ -581,6 +581,11 @@ services:
         # 换机器/换源只改这一行，Dockerfile 本身保持中立。
         PIP_INDEX_URL: https://pypi.tuna.tsinghua.edu.cn/simple
     restart: unless-stopped
+    # 必须开：不开的话 PID 1 就是 uvicorn（Python），而 Python 当 PID 1 不会 wait() 孤儿进程。
+    # 脚本派生的子孙在脚本被杀后 reparent 到 PID 1，就变成永不回收的僵尸，照样占 pids_limit 的槽位——
+    # 实测 fork 炸弹跑完攒下 61 个僵尸、pids 64/64 打满，此后每次执行都在 fork 处
+    # BlockingIOError: Resource temporarily unavailable，等于沙箱永久失效直到重启。tini 当 PID 1 收尸
+    init: true
     read_only: true                       # 根文件系统只读：挡持久化后门与写坏镜像
     tmpfs:
       # 唯一可写处，占内存、算在下面的 mem_limit 里。noexec 挡「往 /tmp 丢个二进制再跑」；
