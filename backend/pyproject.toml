@@ -17,6 +17,7 @@ dependencies = [
     "asyncpg>=0.30.0",
     "pyjwt>=2.9.0",
     "playwright>=1.40.0",
+    "trafilatura>=2.2.0",
     "langgraph>=1.2.11",
     "langchain>=1.4.0",
     "langchain-core>=1.6.2",

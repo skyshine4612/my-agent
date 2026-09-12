@@ -4,91 +4,97 @@ import asyncio
 import logging
 import re
 import time
-from html.parser import HTMLParser
+from copy import deepcopy
 from urllib.parse import urljoin
+
+import trafilatura
+from trafilatura.settings import DEFAULT_CONFIG
 
 from app.core.vision import describe_images
 
 logger = logging.getLogger(__name__)
 
-# 非正文标签：整棵子树丢弃（head 里的 title/meta 也算，标题另外用 page.title() 取）
-_SKIP_TAGS = {"head", "script", "style", "noscript", "svg", "iframe", "canvas",
-              "nav", "header", "footer", "aside", "form", "button", "select"}
-# 块级标签：进出各补一个换行，避免段落被黏成一行
-_BLOCK_TAGS = {"p", "div", "br", "li", "tr", "td", "th", "h1", "h2", "h3", "h4",
-               "h5", "h6", "section", "article", "blockquote", "pre", "figure"}
-
 # 图片占位符：正文里留住图的位置，描述生成后原地回填
 _IMAGE_MARK = r"\x00IMG\d+\x00"
 
+# 主提取产出低于此值才会去走 readability / jusText 兜底链。默认的 250 太低：主提取只拿到
+# 几百字导航的页面会直接返回导航、触发不了兜底，正文整块丢。代价是本来干净的结果可能混进
+# 「登录/无障碍」这类短碎片，对检索无害。
+_EXTRACTOR_CONFIG = deepcopy(DEFAULT_CONFIG)
+_EXTRACTOR_CONFIG["DEFAULT"]["MIN_EXTRACTED_SIZE"] = "800"
 
-class _TextExtractor(HTMLParser):
-    """HTML → 纯文本：跳过非正文标签，块级标签处断行，图片位置留占位符。"""
+# trafilatura 的 markdown 图片与链接语法
+_MD_IMAGE = re.compile(r"!\[[^\]]*\]\(\s*([^)\s]+)[^)]*\)")
+_MD_LINK = re.compile(r"\[([^\]]*)\]\([^)]*\)")
+# 行内标记：粗体与行内代码只留内容。标题的 # 保留，层级对语义有用。
+_MD_INLINE = re.compile(r"\*\*|`")
 
-    def __init__(self, base_url: str = ""):
-        super().__init__(convert_charrefs=True)
-        self.parts: list[str] = []
-        # 按出现顺序记图片 src，占位符里的序号即这里的下标
-        self.images: list[str] = []
-        # 页面地址：用于把根相对路径（/a.jpg）补成绝对 URL
-        self.base_url = base_url
-        # 嵌套的 script/style 要按深度计数，否则内层闭合后就提前恢复采集
-        self._skip_depth = 0
 
-    def _image_src(self, attrs: dict) -> str:
-        """从 img 标签属性里挑出可下载的图片地址，挑不出返回空串。
+def _image_url(src: str, base_url: str) -> str:
+    """补全图片地址：协议相对（//host/a.jpg）补 https，根相对（/a.jpg）用页面地址补。"""
+    if src.startswith("//"):
+        return "https:" + src
+    return urljoin(base_url, src)
 
-        懒加载站点把真身放在 data-src 一类属性、src 只留占位图，所以 src 为空或 data URI
-        时回退到这些属性。地址还得是绝对或可补全的：协议相对（//host/a.jpg）直接补 https，
-        根相对（/a.jpg）用页面地址补，data URI 是站点内联的小图标、一律丢弃。
-        """
-        src = attrs.get("src", "")
-        if not src or src.startswith("data:"):
-            src = (attrs.get("data-src") or attrs.get("data-original")
-                   or attrs.get("data-lazy-src") or "")
-        if not src or src.startswith("data:"):
-            return ""
-        full = "https:" + src if src.startswith("//") else urljoin(self.base_url, src)
-        # svg 基本是图标/logo，交给多模态模型只会返回噪声
-        if not full.startswith(("http://", "https://")) or full.split("?")[0].lower().endswith(".svg"):
-            return ""
-        return full
 
-    def handle_starttag(self, tag, attrs):
-        if tag in _SKIP_TAGS:
-            self._skip_depth += 1
-        elif tag == "img":
-            if self._skip_depth == 0:
-                src = self._image_src(dict(attrs))
-                if src:
-                    self.parts.append(f"\x00IMG{len(self.images)}\x00")
-                    self.images.append(src)
-        elif tag in _BLOCK_TAGS:
-            self.parts.append("\n")
+def _keep_image(url: str) -> bool:
+    """筛掉交付不了或注定是噪声的图片地址。传补全后的地址——判据只看最终形态。
 
-    def handle_endtag(self, tag):
-        if tag in _SKIP_TAGS:
-            self._skip_depth = max(0, self._skip_depth - 1)
-        elif tag in _BLOCK_TAGS:
-            self.parts.append("\n")
+    svg 基本是图标/logo，交给多模态模型只会得到噪声；非 http(s) 的取不到。
+    其余图标、二维码、装饰图靠模型自判（vision 侧返回「无有效信息」即丢弃）。
+    """
+    if not url.startswith(("http://", "https://")):
+        return False
+    return not url.split("?")[0].lower().endswith(".svg")
 
-    def handle_data(self, data):
-        if self._skip_depth == 0:
-            # 源码里的换行/缩进只是排版，一律压成空格；段落边界只能由块级标签产生，
-            # 否则源码怎么折行会直接影响切块结果。
-            self.parts.append(re.sub(r"\s+", " ", data))
+
+def markdown_to_text(md: str, base_url: str = "") -> tuple[str, list[str]]:
+    """trafilatura 的 markdown 输出 → (带图片占位的正文, 按出现顺序的图片 URL 列表)。
+
+    图片换成占位符，让描述回填在文中真实位置而不是全堆到文末；链接只留文本，
+    URL 进知识库对检索没有价值。被筛掉的图片连占位符一起丢弃，不留空壳。
+    """
+    images: list[str] = []
+    parts: list[str] = []
+    last = 0
+    for m in _MD_IMAGE.finditer(md):
+        parts.append(md[last:m.start()])
+        last = m.end()
+        url = _image_url(m.group(1), base_url)
+        if not _keep_image(url):
+            continue
+        parts.append(f"\x00IMG{len(images)}\x00")
+        images.append(url)
+    parts.append(md[last:])
+    text = _MD_LINK.sub(r"\1", "".join(parts))
+    return _MD_INLINE.sub("", text), images
+
+
+def _normalize(text: str) -> str:
+    """连续空行压成一个空行、去首尾空白——段落边界与 chunk_text 的切分粒度对齐。"""
+    paras = (p.strip() for p in re.split(r"\n\s*\n", text))
+    return "\n\n".join(p for p in paras if p)
 
 
 def extract_with_images(html: str, base_url: str = "") -> tuple[str, list[str]]:
     """HTML → (带图片占位的正文, 按出现顺序的图片 URL 列表)。
 
-    占位符让图片描述回填在它在文中的真实位置附近，而不是全堆到文末。
-    base_url 是页面地址，用于补全根相对路径的图片。
+    正文由 trafilatura 提取（配置见 _EXTRACTOR_CONFIG），本函数只把它输出的 markdown
+    转成建库管道要的形状。base_url 传页面地址：trafilatura 靠它启用站点特定规则。
     """
-    p = _TextExtractor(base_url)
-    p.feed(html)
-    lines = [ln.strip() for ln in "".join(p.parts).split("\n")]
-    return "\n\n".join(ln for ln in lines if ln), p.images
+    md = trafilatura.extract(
+        html,
+        url=base_url or None,
+        output_format="markdown",
+        include_tables=True,
+        include_images=True,
+        include_links=True,
+        # 攻略页的「用户问答」落在评论区容器里，对检索有价值，不按噪音丢弃
+        include_comments=True,
+        config=_EXTRACTOR_CONFIG,
+    ) or ""
+    text, images = markdown_to_text(md, base_url)
+    return _normalize(text), images
 
 
 def extract_text(html: str, base_url: str = "") -> str:
