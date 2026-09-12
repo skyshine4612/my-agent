@@ -20,6 +20,7 @@ dependencies = [
     "langgraph>=1.2.11",
     "langchain>=1.4.0",
     "langchain-core>=1.6.2",
+    "langchain-openai>=1.6.2",
 ]
 [dependency-groups]
 dev = ["pytest>=8.0.0", "pytest-asyncio>=0.24.0"]
