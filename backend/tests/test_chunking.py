@@ -1,6 +1,6 @@
 # tests/test_chunking.py
 # 切块纯函数测试：覆盖累积成块与三级降级（段落 / 句子 / 字符硬切）的边界情形。
-from app.core.chunking import chunk_text
+from app.core.chunking import chunk_spans, chunk_text, chunk_units
 
 
 def test_short_text_stays_single_chunk():
@@ -66,3 +66,35 @@ def test_hard_split_keeps_overlap():
 def test_blank_and_whitespace_paragraphs_skipped():
     """纯空白段落不产出空块。"""
     assert chunk_text("\n\n   \n\n\n\n", chunk_size=100) == []
+
+
+# 快照测试：chunk_text 的输出是喂 embedding 的语料，带偏移的重构不许动它一个字。
+# 期望值是重构前跑真实实现打印出来的（见 git 历史），不是照新实现猜的。
+_CHUNK_SNAPSHOT_CASES = [
+    ("段落一。\n\n段落二。", 600, 100, ["段落一。\n段落二。"]),
+    ("甲。乙。丙。", 4, 1, ["甲。", "乙。", "丙。"]),
+    ("a" * 12, 5, 2, ["aaaaa", "aaaaa", "aaaaa", "aaa"]),
+    ("![]()\x00IMG0\x00尾。", 600, 100, ["![]()\x00IMG0\x00尾。"]),
+]
+
+
+def test_chunk_units_matches_snapshot():
+    for text, size, overlap, expected in _CHUNK_SNAPSHOT_CASES:
+        assert [c for c, _, _ in chunk_units(text, size, overlap)] == expected
+
+
+def test_chunk_units_spans_point_at_the_chunk():
+    """区间只用来判「图片起始偏移落在哪一块」，不要求块文本等于 text[s:e]：
+    块内单元是用 "\\n" 拼起来的，原文里那些位置可能是别的空白。"""
+    text = "段落一。\n\n段落二。"
+    units = chunk_units(text, 600, 100)
+    assert len(units) == 1
+    _, s, e = units[0]
+    assert text[s:e] == text             # 单块覆盖全文
+
+
+def test_chunk_spans_are_ordered_and_disjoint():
+    spans = chunk_spans("甲。乙。丙。丁。戊。", 4, 1)
+    assert spans == sorted(spans)
+    for (s1, e1), (s2, _) in zip(spans, spans[1:]):
+        assert s1 <= s2 and e1 <= s2
