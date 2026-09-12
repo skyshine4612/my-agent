@@ -49,6 +49,10 @@ class Settings(BaseSettings):
     supabase_test_database_url: str = ""
     # Supabase JWT 密钥（与 supabase/docker 的 .env 中 JWT_SECRET 完全一致，本地 HS256 验签用）
     supabase_jwt_secret: str = ""
+    # Supabase 网关地址（后端访问 Storage 用），**不是** SUPABASE_DATABASE_URL——
+    # 那是 Postgres 连接串。填后端所在主机能访问到的地址，浏览器那个是 docker/.env 的
+    # SUPABASE_PUBLIC_URL（http://localhost:8000），两者不是一回事。
+    supabase_url: str = ""
     # 工作记忆 token 预算上限：每次 LLM 调用前估算上下文，超预算淘汰最老交互 + LLM 摘要兜底
     # 应 ≤ 模型上下文上限（qwen3.7-plus 为 1M）并预留输出余量（128K）；取 128K 平衡成本与长上下文能力
     llm_context_budget: int = 128000
