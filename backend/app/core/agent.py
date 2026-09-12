@@ -450,8 +450,9 @@ class Agent:
                     # 限额按「任务」计，一轮 ReAct 占 3 个：before_model 钩子 + 模型 + 工具，
                     # 故取 3 * max_iters —— 刚好允许跑满 max_iters 轮，之后下一次钩子即触顶抛
                     # GraphRecursionError，落到兜底文案。
-                    # critic 在场时收口钩子也是真实图节点（占一步），故抬 2 步；抬到 +3 会让
-                    # floor((3n+3)/3) = n + 1 而多放行一轮，破坏「永不停歇仍恰 max_iters 轮」这条契约。
+                    # critic 在场时收口钩子也是真实图节点、要占一步，单一 step 计数器下只能靠抬额度补给它，
+                    # 故 +2 步（这正是「工具刚好用满 max_iters 轮、随后收口」那一轮校验能否跑到的差别）。
+                    # 抬到 +3 会让 floor((3n+3)/3) = n + 1 而多放行一轮，破坏「永不停歇仍恰 max_iters 轮」这条契约。
                     # 有界代价：「把 max_iters 轮工具全部用完、下一次才收口」的那一轮会多放行一步模型决策，
                     # 于是答案能产出、收口钩子却仍触顶 —— 该轮的事实校验被跳过（单一 step 计数器下无法两全）。
                     config={"recursion_limit": 3 * self.max_iters + (2 if critic is not None else 0)},

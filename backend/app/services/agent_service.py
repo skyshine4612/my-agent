@@ -138,10 +138,10 @@ class AgentService:
             state = _TurnState()
             try:
                 # 工具调用阶段：run_stream 产出的事件转发进 queue（token 不立即下发，等 critic 后统一输出）。
-                # critic 校验与修正重写已是父图节点，其 checking / correcting 状态随事件流按序到达
+                # critic 校验与修正改写挂在 ReAct 收口钩子上，其 checking / correcting 状态随事件流按序到达
                 async for sse in self._stream_agent_reply(agent, history, conv_id, message, state, summary_hint):
                     await queue.put(sse)
-                # 工具调用结束，进入「整理答案」阶段：硬数据轮次的 checking 已由 critic 节点发出，这里只补非校验轮次的标记
+                # 工具调用结束，进入「整理答案」阶段：硬数据轮次的 checking 已由收口钩子发出，这里只补非校验轮次的标记
                 if not state.hard_results:
                     await queue.put({"type": "status", "status": "generating"})
 
@@ -214,7 +214,7 @@ class AgentService:
 
         结束时把最终答案（critic 修正过则为修正版）写入 state.answer；
         summary_hint 作为历史摘要传给 run_stream（独立 system 消息）。
-        critic 回路随本轮装配一起交给父图（校验语料与修正所需的工具结果都从图 state 取）。
+        critic 回路随本轮装配一起交给 run_stream（校验语料与修正所需的工具结果都从图 state 取）。
         """
         queue: asyncio.Queue = asyncio.Queue()
         pending_calls: list[dict] = []  # 待配对的 tool_call（工具并行执行时按 tool_call_id 匹配回 result）
@@ -232,7 +232,7 @@ class AgentService:
                     context_budget=settings.llm_context_budget,
                     tool_result_store=self.tool_result_store,
                     summary=summary_hint,
-                    # critic 回路随本轮装配交给父图：校验与修正所需的本轮工具结果从图 state 取
+                    # critic 回路随本轮装配交给 run_stream：校验与修正所需的本轮工具结果从图 state 取
                     critic=CriticConfig(read_file_tool=self.critic_tools[0],
                                         grep_tool=self.critic_tools[1],
                                         skills=self.skills),
