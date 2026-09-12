@@ -193,6 +193,8 @@ grant usage, select on sequence
     to authenticated;
 ```
 
+> **主库实际的表级 ACL 比这里宽**：自托管 Supabase 的初始化脚本把 `public` schema 下全部表的全量权限授给了 `anon` / `authenticated` / `service_role`（`arwdDxtm`，含 update 与 truncate）。上面这段 grant 是幂等子集，**只增不减**，不会撤销已有授权。所以**表级权限不是防线，RLS 才是**：`documents` 有 update 权限却没有 update 策略，更新照样被拒；`anon` 有全部权限，但六条策略都只对 `authenticated` 生效——实测它读这六张表全返 0 行（表里分别有 2 行会话 / 8 条消息 / 15 条短期记忆 / 2 条长期记忆，不是空表）。
+
 ## 检索函数
 
 两个函数都是 `language sql stable` + 默认 `security invoker`，所以 RLS 照常生效——**不能改成 `security definer`**，那会绕过策略。都显式 `set search_path = public, extensions`：函数体用到 `public` 的表与 `extensions` 的 `<=>` 运算符，固定下来防 search_path 注入。相似度统一取 `1 - (embedding <=> query)`。
