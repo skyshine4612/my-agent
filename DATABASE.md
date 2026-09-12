@@ -176,3 +176,34 @@ grant usage, select on sequence
 | 存 | 超长工具结果（`truncate_limit` 超阈值时）+ 历史答案（历史会话压缩） |
 | 读 | 模型用 `read_file` / `grep` 按需读回 |
 | 清理 | spill 文件本轮结束即清（保留 `_history.txt`）；`delete_conversation` 删整个目录（含 `_history.txt`） |
+
+### 对象存储（Supabase Storage）
+
+知识库图片与会话文件的**字节**存这里，元数据仍在 Postgres。桶与 `storage.objects` 的策略写在 `deploy/storage.sql`，**必须等 storage-api 首次健康启动之后执行**——它自己建 storage schema 与 `storage.foldername()`。
+
+| 桶 | 用途 | key 约定 | 隔离 |
+|---|---|---|---|
+| `files` | 会话文件（上传件 + 脚本产物） | `<user_id>/<conversation_id>/<file_id>/original.<ext>` | 按用户，key 首段必须是 `auth.uid()` |
+| `knowledge` | 知识库图片 | `<source_key>/<ingest_id>/<序号>.<ext>` | 全局共享（与 `documents` 表定位一致） |
+
+两个桶都 `public: false`，桶级 `file_size_limit` **留空**（单件上限由后端 `MAX_UPLOAD_SIZE` 把关；Studio 的输入框单位是 MB，按字节填会乘 1048576）。
+
+| 策略 | 判定 |
+|---|---|
+| `storage_files_own` | `bucket_id = 'files' and (storage.foldername(name))[1] = auth.uid()::text` |
+| `storage_knowledge_all` | `bucket_id = 'knowledge'` |
+
+> **storage schema 每张表都开着 RLS 却没有任何内置策略**，所以「不加策略」不等于「不限制」，而是除 `service_role` 外**全拒——包括后端自己**。这两条策略是必需的，不是额外保险。
+
+**后端访问方式是「每次调用内现签的短时 HS256 JWT」**（`app/core/storage.py`）：RLS 判定发生在 storage-api 进程里，不是后端进程里，后端说不了话（`rls_conn` 能直说是因为后端自己就是那个 PG 连接的主人），storage-api 能取到的 `auth.uid()` 唯一来源就是请求头里的签名。所以**启用非对称密钥会同时打断后端本地验签与 storage 链路**。
+
+**storage-api v1.74.0 的实测行为**（2026-09-12）：
+
+| 判据 | 结论 |
+|---|---|
+| 无策略时以 authenticated 身份上传 | 拒绝。**HTTP 400**，真实状态码在 body 的 `statusCode` 里（`{"statusCode":"403","code":"AccessDenied"}`）；service_role 同一请求 200 |
+| 跨用户 key / 不含斜杠的 key | 均拒绝 —— `(storage.foldername(name))[1]` 取不到段时 fail-closed |
+| `DELETE /object/{bucket}` + `{"prefixes":[…]}` | **不做前缀匹配**，只认精确对象路径（字段名来自 S3 `DeleteObjects`）。传目录路径返回 `200 []` 且一个都不删 |
+| `POST /object/list/{bucket}` + `{"prefix":…}` | **目录式列举**：返回下一段路径名而非完整 key，伪目录 `id` 为 `null`、真对象 `id` 是真 uuid；`limit` / `offset` 可用 |
+
+> 由此，`StorageClient.delete_prefix` 的实现是**递归 list + 按精确路径批量删**，而不是把目录路径丢给批量删端点——后者不报错也不生效，`delete_conversation` 会永远留孤儿。错误分类也**不能只看 HTTP 状态码**：RLS 拒绝是 400，只认 401/403 会让「有人动了 auth 密钥」那条告警永远不触发。
