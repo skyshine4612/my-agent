@@ -97,7 +97,7 @@ class AgentService:
         # 注册 call_sub_agent（子 Agent 委派，需要 llm + skill 清单 + 工具结果地址索引，只能在 service 层注册）
         sub_agent_tool = make_call_sub_agent(self.llm, registry, [s["name"] for s in self.skills],
                                              settings.llm_context_budget,
-                                             self.tool_result_store)
+                                             self.tool_result_store, model=self.chat_model)
         registry.register_tool(sub_agent_tool, "委派子任务")
         return registry
 
@@ -217,7 +217,8 @@ class AgentService:
             today=today_hint(),
             long_term_hint=render_long_term_hint(hint_parts),
         )
-        agent = Agent(name="assistant", system_prompt=system, tools=self.registry.list_names(), llm=self.llm)
+        agent = Agent(name="assistant", system_prompt=system, tools=self.registry.list_names(),
+                      llm=self.llm, model=self.chat_model)
         return system, history, summary_hint, agent
 
     async def _stream_agent_reply(self, agent, history, conv_id, message, state, summary_hint=""):

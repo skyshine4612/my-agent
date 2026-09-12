@@ -68,12 +68,14 @@ class Agent:
         system_prompt:   系统提示词，注入每轮对话的最前
         tools:           本 Agent 可调用的工具名列表
         llm:             LLM 客户端（实现 LLMClient 接口，含 chat / complete / stream_chat）
+        model:           langchain 模型实例（create_agent 驱动主循环）
         max_iters:       单次 run_stream 的 ReAct 最大迭代轮数，防止无限循环
     """
     name: str
     system_prompt: str
     tools: list[str] = field(default_factory=list)
     llm: object = None
+    model: object = None
     max_iters: int = 20
 
     async def run_stream(self, user_message, history, registry, on_event=None,
