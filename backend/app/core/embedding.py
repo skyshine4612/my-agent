@@ -2,6 +2,7 @@
 # Embedding 客户端：知识库与长期记忆共用的向量化管道。
 # 与 get_chat_model() 的单例工厂同构（均为进程级单例），但**不做降级兜底**：
 # 知识库没有向量就检索不到，属于必须失败的情形；长期记忆允许降级，由 store 自己接异常。
+import asyncio
 from abc import ABC, abstractmethod
 
 import httpx
@@ -54,14 +55,23 @@ def get_embedding() -> EmbeddingClient:
 # DashScope 的 embedding 接口对单次 input 条数有上限，超上限直接报错；
 # 长文档切出几十块时不能一把传，按此分批。
 _EMBED_BATCH = 10
+# 批次并发数：总耗时约为批数的 _EMBED_CONCURRENCY 分之一，同时不给接口打满并发
+_EMBED_CONCURRENCY = 8
 
 
 async def embed_batched(embedder: EmbeddingClient, texts: list[str]) -> list[list[float]]:
-    """分批调用 embed()，返回顺序与 texts 一一对应。"""
-    out: list[list[float]] = []
-    for i in range(0, len(texts), _EMBED_BATCH):
-        out.extend(await embedder.embed(texts[i:i + _EMBED_BATCH]))
-    return out
+    """分批并发调用 embed()，返回顺序与 texts 一一对应。"""
+    if not texts:
+        return []
+    batches = [texts[i:i + _EMBED_BATCH] for i in range(0, len(texts), _EMBED_BATCH)]
+    sem = asyncio.Semaphore(_EMBED_CONCURRENCY)
+
+    async def run(batch: list[str]) -> list[list[float]]:
+        async with sem:
+            return await embedder.embed(batch)
+
+    # gather 按入参顺序返回，逐批展开即与 texts 对齐
+    return [v for batch in await asyncio.gather(*(run(b) for b in batches)) for v in batch]
 
 
 def to_vector_literal(vec: list[float]) -> str:

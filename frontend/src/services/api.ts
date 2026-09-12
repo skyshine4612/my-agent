@@ -3,6 +3,8 @@ import axios from 'axios'
 import {getAccessToken} from '@/services/supabase'
 
 const api = axios.create({baseURL: '/api', timeout: 120000})
+// 建库要爬页面再逐批向量化，耗时远超普通接口（几十秒到几分钟），单独放宽
+const INGEST_TIMEOUT = 600000
 // 统一注入登录凭证：后端按 JWT 的 sub 判定用户身份
 api.interceptors.request.use(async config => {
     const token = await getAccessToken()
@@ -47,12 +49,12 @@ export async function listDocuments() {
 
 // 粘贴文本入库（文件也走这条：前端读成文本后当正文提交）
 export async function ingestText(content: string, title: string) {
-    return (await api.post('/knowledge/text', {content, title})).data
+    return (await api.post('/knowledge/text', {content, title}, {timeout: INGEST_TIMEOUT})).data
 }
 
 // 抓取网址正文入库（后端用无头浏览器打开页面，插图会转成文字描述）
 export async function ingestUrl(url: string) {
-    return (await api.post('/knowledge/url', {url})).data
+    return (await api.post('/knowledge/url', {url}, {timeout: INGEST_TIMEOUT})).data
 }
 
 // 按来源删除整篇文档的所有片段

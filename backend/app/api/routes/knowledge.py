@@ -7,6 +7,7 @@ import uuid
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
+from app.core.agent import _redact_secrets
 from app.core.auth import get_current_user
 from app.core.ingest import fetch_url_text
 from app.services.agent_service import service
@@ -35,14 +36,26 @@ def _fallback_title(content: str, title: str) -> str:
     return title.strip() or content.strip()[:20]
 
 
+async def _ingest(user_id: str, content: str, title: str, source_url: str) -> int:
+    """入库并对失败打日志：切块与向量化可能跑几十秒，中途失败必须留痕。
+
+    错误文本会随 HTTP 响应发给前端，按值抹掉已配置的凭据再外发。
+    """
+    try:
+        return await service.knowledge.ingest(user_id, content, title=title, source_url=source_url)
+    except Exception as e:
+        logger.exception("[知识库] 入库失败 source=%s", source_url)
+        raise HTTPException(status_code=502, detail=f"入库失败：{_redact_secrets(str(e))}") from e
+
+
 @router.post("/knowledge/text")
 async def ingest_text(body: TextIn, user_id: str = Depends(get_current_user)):
     """粘贴文本入库：切块 + 向量化 + 写入 documents，返回写入的块数。"""
     # 文本入口没有真实 URL，但 source_url 是文档的唯一标识（列表聚合 / 删除都靠它），
     # 所以生成一个合成标识补上，保证任何文档都能被删掉。
     source = body.source_url.strip() or f"text://{uuid.uuid4().hex}"
-    chunks = await service.knowledge.ingest(
-        user_id, body.content, title=_fallback_title(body.content, body.title), source_url=source)
+    chunks = await _ingest(user_id, body.content,
+                           title=_fallback_title(body.content, body.title), source_url=source)
     if not chunks:
         raise HTTPException(status_code=400, detail="内容为空，没有可入库的文本")
     return {"chunks": chunks, "source_url": source}
@@ -62,7 +75,7 @@ async def ingest_url(body: UrlIn, user_id: str = Depends(get_current_user)):
     # 正文太短基本是没抓到（纯 JS 渲染 / 需要登录 / 被反爬），宁可报错也不入库一堆噪声
     if len(content) < 50:
         raise HTTPException(status_code=400, detail="没抓到有效正文，可能是纯 JS 渲染或需要登录的页面")
-    chunks = await service.knowledge.ingest(user_id, content, title=title, source_url=url)
+    chunks = await _ingest(user_id, content, title=title, source_url=url)
     return {"chunks": chunks, "title": title, "source_url": url}
 
 

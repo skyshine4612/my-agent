@@ -1,5 +1,5 @@
 # tests/test_chunking.py
-# 切块纯函数测试：覆盖三级降级（段落 / 句子 / 字符硬切）与边界情形。
+# 切块纯函数测试：覆盖累积成块与三级降级（段落 / 句子 / 字符硬切）的边界情形。
 from app.core.chunking import chunk_text
 
 
@@ -8,10 +8,33 @@ def test_short_text_stays_single_chunk():
     assert chunk_text("西湖值得去。", chunk_size=600) == ["西湖值得去。"]
 
 
-def test_split_by_blank_line():
-    """段落边界优先：多段短文本各成一块，空段被丢掉。"""
+def test_short_paragraphs_merge_into_one_chunk():
+    """短段落累积成一块，块内保留段落边界（换行分隔），空段被丢掉。"""
     text = "第一段\n\n\n\n第二段\n\n第三段"
-    assert chunk_text(text, chunk_size=600) == ["第一段", "第二段", "第三段"]
+    assert chunk_text(text, chunk_size=600) == ["第一段\n第二段\n第三段"]
+
+
+def test_chunk_never_exceeds_chunk_size():
+    """累积不越界：每块都不超过 chunk_size，且块数按字符数算而非一段一块。"""
+    text = "\n\n".join(f"第{i}段的内容" for i in range(200))
+    out = chunk_text(text, chunk_size=60)
+    assert all(len(c) <= 60 for c in out)
+    assert 1 < len(out) < 200
+
+
+def test_long_paragraph_is_not_merged_with_others():
+    """整段就顶满 chunk_size 时单独成块，不与前后段落合并。"""
+    long_para = "西" * 100
+    assert chunk_text(f"{long_para}\n\n短段\n\n{long_para}", chunk_size=100) == \
+           [long_para, "短段", long_para]
+
+
+def test_fragmented_lines_merge_instead_of_one_chunk_per_line():
+    """碎行合并成块：网页正文一行一个 DOM 文本节点，逐行成块会让块数放大两个数量级。"""
+    text = "\n\n".join(f"导航项{i}" for i in range(8525))
+    out = chunk_text(text, chunk_size=600, overlap=100)
+    assert all(len(c) <= 600 for c in out)
+    assert 50 < len(out) < 200
 
 
 def test_long_paragraph_splits_on_sentence():
@@ -20,6 +43,13 @@ def test_long_paragraph_splits_on_sentence():
     text = "".join(sents)
     out = chunk_text(text, chunk_size=12)
     assert out == sents
+
+
+def test_long_paragraph_sentences_merge_into_chunks():
+    """降到句子一级后同样累积成块，不是一句一块。"""
+    out = chunk_text("西湖很美。" * 100, chunk_size=60)
+    assert all(len(c) <= 60 for c in out)
+    assert len(out) < 20
 
 
 def test_hard_split_keeps_overlap():
