@@ -12,7 +12,7 @@ from app.core.agent import Agent
 from app.core.context import current_user_id
 from app.core.critic import run_critic
 from app.core.knowledge import KnowledgeStore
-from app.core.llm import get_llm
+from app.core.llm import get_chat_model, get_llm
 from app.core.memory import ConversationStore, LongTermMemory, ShortTermMemory, ToolResultStore
 from app.core.memory.manager import MemoryManager
 from app.core.memory.metrics import log_snapshot
@@ -23,7 +23,7 @@ from app.core.skills import load_skills
 from app.core.token_utils import estimate_tokens
 from app.datasource.amap_web import AmapWebDataSource
 from app.tools import register_all_tools
-from app.tools.file import register_file_tools
+from app.tools.file import make_grep, make_read_file, register_file_tools
 from app.tools.knowledge import register_knowledge_tools
 from app.tools.sub_agent import make_call_sub_agent
 
@@ -64,6 +64,10 @@ class AgentService:
         self.tool_result_store = ToolResultStore(settings.result_dir)
         # LLM 客户端
         self.llm = get_llm()
+        # langchain 模型：critic 子图（create_agent）用，与 self.llm 并存的过渡态
+        self.chat_model = get_chat_model()
+        # critic 子图的工具：与主循环共用同一套 read_file/grep 实现，启动时装配一次
+        self.critic_tools = [make_read_file(self.tool_result_store), make_grep(self.tool_result_store)]
         # 记忆管理器：编排短期记忆组装/压缩与长期记忆提炼，四个 store 与 AgentService 共享同一实例
         self.memory = MemoryManager(self.conversation_store, self.short_term_memory,
                                     self.long_term_memory, self.tool_result_store, self.llm)
@@ -150,7 +154,7 @@ class AgentService:
                 # 工具调用结束，进入「整理答案」阶段：有硬数据先做事实校验，校验不过再修正
                 await queue.put({"type": "status", "status": "checking" if state.hard_results else "generating"})
                 if state.hard_results:
-                    async for sse in self._critic_correct(state, system, message, user_id, summary_hint):
+                    async for sse in self._critic_correct(state, system, message, summary_hint):
                         await queue.put(sse)
 
                 answer = state.answer
@@ -287,20 +291,14 @@ class AgentService:
             yield sse
         state.answer, state.rounds = await gen_task
 
-    async def _critic_correct(self, state, system, message, user_id, summary_hint=""):
+    async def _critic_correct(self, state, system, message, summary_hint=""):
         """critic 事实校验：不通过时复用已查工具结果让 LLM 重写答案（不重新调工具）；可能更新 state.answer。
 
         summary_hint 作为独立 system 消息随修正 prompt 一起注入，保持与主生成一致的历史上下文。
         """
-        # read_file_fn / grep_fn：绑定当前 user_id 的完整结果读取，供 critic 多轮定向读文件
-        async def read_file_fn(path, offset, limit):
-            return await self.tool_result_store.read(path, offset, limit, user_id=user_id)
-
-        async def grep_fn(pattern, path):
-            return await self.tool_result_store.search(path, pattern, user_id=user_id)
-
-        verdict = await run_critic(self.llm, json.dumps(state.hard_results, ensure_ascii=False), state.answer,
-                                   read_file_fn=read_file_fn, grep_fn=grep_fn)
+        # critic_tools 走 current_user_id contextvar 取用户（本 worker task 创建时已复制请求上下文）
+        verdict = await run_critic(self.chat_model, json.dumps(state.hard_results, ensure_ascii=False), state.answer,
+                                   read_file_tool=self.critic_tools[0], grep_tool=self.critic_tools[1])
         if verdict.get("ok", True):
             return
         # ok=false：第一轮工具结果本身是准的，问题只在模型生成答案时编造了价格。
