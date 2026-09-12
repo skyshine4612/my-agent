@@ -120,6 +120,7 @@ async function send(text: string) {
               t.status = ev.status
               t.result = ev.result
               t.artifacts = ev.artifacts   // 脚本产物：渲染成下载卡片
+              t.images = ev.images         // 知识库图片：渲染成缩略图
               assistantOutput.value = true
               break
             }

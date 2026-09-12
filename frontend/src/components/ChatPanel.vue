@@ -5,6 +5,7 @@ import { Promotion, Collection, Reading, ArrowDown, Paperclip } from '@element-p
 import { marked } from 'marked'
 import DOMPurify from 'dompurify'
 import type { ChatMessage, ToolEvent, StoredFile } from '@/types'
+import KnowledgeThumbs from '@/components/KnowledgeThumbs.vue'
 
 // 父级传入的消息列表与流式状态，向上 emit 发送动作
 // streaming：是否在流式请求中（禁用输入）；thinking：是否在等待助手首字（显示呼吸点）
@@ -120,6 +121,8 @@ function pickFile(e: Event) {
                   <span class="artifact__action">下载</span>
                 </div>
               </div>
+              <!-- 知识库图片：与产物并列，但它不可下载，只做缩略图 -->
+              <KnowledgeThumbs v-if="t.images?.length" :images="t.images" />
             </div>
             <!-- markdown 正文（token 流式累积） -->
             <div v-if="m.content" class="msg__markdown" v-html="renderMarkdown(m.content)"></div>

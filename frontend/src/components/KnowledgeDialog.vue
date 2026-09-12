@@ -3,11 +3,14 @@
 import {computed, ref, watch} from 'vue'
 import {ElMessage, ElMessageBox, type UploadFile} from 'element-plus'
 import {deleteDocument, ingestText, ingestUrl, listDocuments} from '@/services/api'
+import KnowledgeThumbs from '@/components/KnowledgeThumbs.vue'
 
 interface DocItem {
   title: string
   source_url: string | null
   chunks: number
+  // 该文档收录的图片对象 key 列表（后端已按 key 去重）
+  image_keys: string[]
 }
 
 const props = defineProps<{ modelValue: boolean }>()
@@ -40,6 +43,9 @@ async function onFileChange(uploadFile: UploadFile) {
 }
 
 const canSubmit = computed(() => (mode.value === 'url' ? !!url.value.trim() : !!content.value.trim()))
+
+// 列表只有 key 没有 desc，补一个空 desc 凑成缩略图组件要的形状
+const thumbs = (d: DocItem) => (d.image_keys || []).map(key => ({key, desc: ''}))
 
 async function submit() {
   saving.value = true
@@ -119,6 +125,7 @@ async function remove(doc: DocItem) {
               <span class="kb-doc__title">{{ d.title }}</span>
               <span class="kb-doc__meta">{{ d.chunks }} 个片段</span>
             </div>
+            <KnowledgeThumbs :images="thumbs(d)" :size="40" />
             <el-button link type="danger" @click="remove(d)">删除</el-button>
           </div>
         </div>
@@ -178,7 +185,13 @@ async function remove(doc: DocItem) {
   display: flex;
   flex-direction: column;
   gap: 3px;
+  flex: 1;
   min-width: 0;
+}
+
+/* 缩略图在行内与文字居中对齐：组件自带的 margin-top 是给聊天气泡里的堆叠留的间距 */
+.kb-doc :deep(.thumbs) {
+  margin-top: 0;
 }
 
 .kb-doc__title {
