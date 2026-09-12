@@ -57,14 +57,15 @@ class AgentService:
         self.conversation_store = ConversationStore()
         self.short_term_memory = ShortTermMemory()
         self.long_term_memory = LongTermMemory()
-        # 知识库：全局共享的攻略语料，与长期记忆共用同一个 embedder 单例
-        self.knowledge = KnowledgeStore()
         # 工具结果地址索引：超长结果写临时文件，read_file/grep 按需读；本轮结束即清，避免堆积
         self.tool_result_store = ToolResultStore(settings.result_dir)
         # 对象存储：会话文件与知识库图片共用，启动时 new 一次（httpx 构造不开连接，仍是零 IO）
         self.storage = StorageClient(settings.supabase_url, settings.supabase_jwt_secret)
         # 会话文件：上传件与沙箱产物，与 result_dir（spill）分两棵树
         self.file_store = FileStore(self.storage)
+        # 知识库：全局共享的攻略语料，与长期记忆共用同一个 embedder 单例；
+        # 原图存 knowledge 桶，与 FileStore 共用同一个 storage 客户端
+        self.knowledge = KnowledgeStore(self.storage)
         # 沙箱客户端：长连接复用，随 registry 一起装配一次
         self.sandbox = SandboxClient(settings.sandbox_url, settings.sandbox_timeout)
         # 脚本白名单：启动时扫描一次，run_skill_script 的 enum 与校验都用这份索引
