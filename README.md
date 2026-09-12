@@ -1,15 +1,16 @@
 # 个人智能助手
 
-多业务对话式 Agent 平台。后端基于 FastAPI 实现「通用 ReAct agent → 工具调用 → critic 事实校验」链路，前端是 Vue 3 通用对话界面。当前内置旅行助手、饮食规划、网页搜索、节假日、天气、翻译、热榜，可通过接入更多工具自然扩展业务场景。
+多业务对话式 Agent 平台。后端基于 FastAPI + LangGraph 实现「通用 agent → 工具调用 → critic 事实校验」链路，前端是 Vue 3 通用对话界面。当前内置旅行助手、饮食规划、网页搜索、节假日、天气、翻译、热榜，另有一个本地知识库（RAG）存放自己收录的攻略语料，可通过接入更多工具自然扩展业务场景。
 
 ## 功能特性
 
-- **ReAct 推理-行动循环**：LLM 自主决策调用工具、并行执行、回填结果、再决策。
+- **ReAct 推理-行动循环**：基于 LangGraph 的 `create_agent` 图，LLM 自主决策调用工具、并行执行、回填结果、再决策。
 - **事实校验回路（critic）**：调用硬数据工具（车票/机票/天气/节假日）后，多轮带工具自动比对回答与完整工具结果，发现编造事实时基于真实结果重写答案。
 - **真实数据源**：高德（POI/推荐菜，Web 服务 API）、天气/节假日/翻译/热榜/菜谱/营养（UAPIS，天气最多 7 天预报）、搜索（Tavily）经 HTTP 直连；12306 火车票经 ModelScope 托管 MCP；机票直连 variflight 官方 MCP。
 - **标准 skill 两段式**：业务规则（`SKILL.md`）的清单常驻 system prompt，正文按需加载，新增业务无需改装配代码。
 - **子 Agent 委派**：复杂子任务可委派给独立上下文的子 Agent 处理、只返回摘要，避免主上下文被大量工具结果淹没。
 - **三层记忆**：工作记忆（本轮工具结果，易失）+ 短期记忆（summary 摘要 + 最近几轮结构化对话含工具调用，独立表持久化，是喂 LLM 的权威源）+ 长期记忆（跨会话偏好），记忆与会话历史分离：长期/短期记忆各从各表读，messages/conversations 仅前端展示；短期记忆超预算压成摘要（物理删除早期回合），工作记忆超长 spill（摘要 + 文件地址索引），子 Agent 按子会话隔离工具结果地址索引。
+- **本地知识库（RAG）**：自己收录的攻略语料（粘贴文本 / 上传文件 / 抓取网址三种入库方式）切块后用 `text-embedding-v4` 向量化存进 pgvector，检索按余弦相似度取 top-k。攻略页插图先转成文字描述再入库——知识库是文本语义检索，图片不转成文字就搜不到。知识库优先于通用查询工具：它记的是 POI 接口给不出的细节（具体店名、营业时间、避坑经验）。
 - **长结果地址索引 + 历史会话压缩**：工具结果超阈值时完整结果写临时文件，模型用 `read_file`/`grep` 按需读回；历史会话按 running summary 压缩——一个会话的短期记忆 = 累积摘要 + 最近几轮原文 + 完整历史文件，上下文到阈值才触发，早期答案压成摘要、最近几轮保留原文，跨轮引用靠 `read_file` 读回，既避免截断丢信息，也避免模型凭标题编造细节。
 - **记忆查看**：输入框旁「记忆」入口，弹窗内 tab 切换长期偏好与当前会话的短期记忆（摘要 + 最近几轮对话）。
 - **SSE 流式对话**：逐字输出答案，实时展示工具调用进度；完整回复在流式输出前已落库，刷新后自动恢复会话与历史。
@@ -19,9 +20,10 @@
 
 | 层 | 技术                                                                                    |
 |---|-----------------------------------------------------------------------------------------|
-| 后端 | Python 3.11+ · FastAPI · pydantic-settings · openai SDK · mcp · sse-starlette · asyncpg · PyJWT · tiktoken |
+| 后端 | Python 3.11+ · FastAPI · LangGraph · langchain · pydantic-settings · openai SDK · mcp · sse-starlette · asyncpg · PyJWT · tiktoken |
 | 前端 | Vue 3 · Vite · TypeScript · Element Plus · Pinia · supabase-js · marked + DOMPurify      |
-| 存储 / 身份 | 自托管 Supabase（Postgres + GoTrue），业务表全开 RLS                              |
+| 存储 / 身份 | 自托管 Supabase（Postgres + pgvector + GoTrue），5 张业务表全开 RLS                    |
+| 抓取 | Playwright（跑完 JS 再取 DOM）+ trafilatura（提取正文）                                    |
 | LLM | 阿里云百炼 DashScope（`qwen3.7-plus`，OpenAI 兼容协议）                                 |
 | 部署 | Docker + docker-compose · nginx                                                         |
 
@@ -31,8 +33,9 @@
 my-agent/
 ├── backend/
 │   ├── app/
-│   │   ├── api/routes/        # 路由：SSE 对话 + 会话管理
-│   │   ├── core/              # 核心：agent(ReAct)/llm/critic/registry/memory(三层记忆)/db(连接池+RLS)/auth(JWT)/prompts/skills
+│   │   ├── api/routes/        # 路由：SSE 对话 + 会话 + 记忆 + 知识库
+│   │   ├── core/              # 核心：agent(ReAct 图)/llm/critic/registry/db(连接池+RLS)/auth(JWT)/prompts/skills
+│   │   │                      #   memory(三层记忆)/knowledge(RAG)/ingest(抓取)/vision(插图转文字)/embedding/logging
 │   │   ├── datasource/        # 数据源：MCP（12306/机票）+ HTTP（高德/UAPIS/Tavily）
 │   │   ├── models/            # Pydantic 请求模型
 │   │   ├── prompts/           # 提示词 .md（system/grounding/critic）
@@ -46,8 +49,8 @@ my-agent/
 │   └── run.py                 # 开发启动入口
 ├── frontend/
 │   └── src/
-│       ├── views/             # Login.vue（登录/注册）+ Chat.vue（SSE 事件分发 + 会话管理 + 记忆弹窗）
-│       ├── components/        # ChatPanel（markdown + 工具气泡）
+│       ├── views/             # Login.vue（登录/注册）+ Chat.vue（SSE 事件分发 + 会话管理 + 记忆/知识库弹窗）
+│       ├── components/        # ChatPanel（markdown + 工具气泡 + 输入框）/ KnowledgeDialog（建库与文档列表）
 │       ├── services/          # api.ts / sse.ts / supabase.ts
 │       ├── router/            # 路由 + 登录守卫
 │       ├── stores/            # Pinia（auth / conversation）
@@ -72,7 +75,7 @@ docker compose up -d            # 起完整栈，Kong 网关默认 8000 端口
 
 拿到 `docker/.env` 里的 `JWT_SECRET` 与 `ANON_KEY`，并在 Studio（Kong 的 `/`）里建两个库：
 
-- 主库 `postgres` 的 `public` schema：4 张业务表（`conversations` / `messages` / `short_term_memory` / `long_term_memory`）+ 各自的 RLS 策略。
+- 主库 `postgres` 的 `public` schema：先 `create extension vector`（pgvector，`documents` 与 `long_term_memory` 的向量列都依赖它），再建 5 张业务表（`conversations` / `messages` / `short_term_memory` / `long_term_memory` / `documents`）+ 各自的 RLS 策略 + 两个向量检索函数（`match_documents` / `match_long_term`）。
 - 测试库 `agent_test`：建最小 `auth` 桩（`auth.users(id uuid primary key)` + `auth.uid()`）后套同样的 DDL，用于跑 pytest。
 
 > 这套 DDL 与策略就是 `backend/tests/conftest.py` 里的 `AUTH_STUB_SQL` / `BUSINESS_SQL`（测试库由它自动建）。主库按同一份语句在 Studio 里执行即可。
@@ -107,6 +110,8 @@ npm run dev             # 启动于 http://127.0.0.1:5173，/api 代理到 8000
 
 浏览器访问前端地址，注册账号后即可对话。
 
+> 知识库的「抓取网址」入口要跑无头浏览器，首次需装 Chromium（约 700MB）：`uv run playwright install chromium`。直连 `cdn.playwright.dev` 在国内约 27KB/s 且频繁断流，加镜像快约 600 倍：`PLAYWRIGHT_DOWNLOAD_HOST=https://cdn.npmmirror.com/binaries/playwright uv run playwright install chromium`。未装时粘贴文本 / 上传文件入口照常可用，只有抓网址会失败。
+
 > `VITE_` 前缀的变量在构建时被内联进产物，改完 `.env` 需重启 dev server / 重新 build。
 
 ### Docker 部署
@@ -130,6 +135,11 @@ docker compose up --build
 | `LLM_MODEL` | 使用的模型 | `qwen3.7-plus`                                      |
 | `ENABLE_THINKING` | Qwen 思考模式开关（`false` 关闭更快，`true` 更强推理但更慢） | `false`                                            |
 | `LLM_TEMPERATURE` | LLM 采样温度 | `0.5`                                                |
+| `EMBEDDING_API_KEY` | 向量化 API Key（知识库与长期记忆共用），留空复用 `LLM_API_KEY` | 空 |
+| `EMBEDDING_MODEL` | 向量化模型 | `text-embedding-v4`                                 |
+| `EMBEDDING_DIMENSIONS` | 向量维度，**必须与建表的 `vector(N)` 一致** | `1024`                                              |
+| `VISION_MODEL` | 多模态模型（攻略页插图转文字描述），留空复用 `LLM_MODEL` | 空 |
+| `VISION_API_KEY` | 多模态 API Key，留空复用 `LLM_API_KEY` | 空                                                  |
 | `MODELSCOPE_TOKEN` | ModelScope 访问令牌（调用 MCP 服务） | 空                                                  |
 | `TRAIN_12306_URL` | 12306 火车票 MCP 服务地址 | 空                                                  |
 | `FLIGHT_VARIFLIGHT_URL` | variflight 官方 MCP 服务地址 | 空                                                  |
@@ -179,6 +189,10 @@ docker compose up --build
 | `DELETE` | `/api/conversations/{id}` | 删除会话 |
 | `GET` | `/api/memory/long-term` | 当前用户长期记忆（跨会话偏好） |
 | `GET` | `/api/memory/short-term/{conversation_id}` | 某会话短期记忆（summary 摘要 + 最近几轮对话） |
+| `POST` | `/api/knowledge/text` | 粘贴文本入库（切块 + 向量化） |
+| `POST` | `/api/knowledge/url` | 抓取网址正文入库（无头浏览器 + 正文提取 + 插图转文字） |
+| `GET` | `/api/knowledge/documents` | 已入库文档列表（按来源聚合，含块数与入库时间） |
+| `DELETE` | `/api/knowledge/documents` | 按来源删除整篇文档的所有块 |
 | `GET` | `/api/health` | 健康检查 |
 
 ## 测试
@@ -186,10 +200,10 @@ docker compose up --build
 ```bash
 cd backend
 uv run pytest                          # 全部测试
-uv run pytest tests/test_llm.py -k stream   # 按关键字筛选
+uv run pytest tests/test_agent.py -k critic   # 按关键字筛选
 ```
 
-测试不依赖真实 LLM 与网络：用 `Fake*LLM` 注入 service，数据层连真实 Postgres 测试库 `agent_test`（`SUPABASE_TEST_DATABASE_URL`，`tests/conftest.py` 负责建表与逐用例清表）；未配该变量时相关用例整体 skip。
+测试不依赖真实 LLM 与网络：用假 langchain 模型注入 `service.chat_model`，数据层连真实 Postgres 测试库 `agent_test`（`SUPABASE_TEST_DATABASE_URL`，`tests/conftest.py` 负责建表与逐用例清表）；未配该变量时相关用例整体 skip。
 
 ## 如何扩展新业务
 
@@ -197,7 +211,7 @@ uv run pytest tests/test_llm.py -k stream   # 按关键字筛选
 
 2. **工具（三步，缺一不可）**：
    1. **写数据源**：走 MCP 继承 `datasource/mcp_base.py` 的 `McpDataSource`（子类传 `url` + 认证头，实现查询方法）；走 HTTP 继承 `datasource/http_base.py` 的 `HttpDataSource`（基类封装了 `httpx.AsyncClient`）。
-   2. **写注册函数**：在 `app/tools/` 下写 `register_xxx_tools(registry, ...)`，内部用 `registry.register(name, description, parameters, fn, label)` 逐个注册，并返回内联 `new` 的数据源（供上层统一 `close`）。
+   2. **写注册函数**：在 `app/tools/` 下写 `register_xxx_tools(registry, ...)`，内部用 langchain 的 `@tool` 装饰工具函数（类型注解即参数 schema），再用 `registry.register_tool(tool_obj, "<中文动作短语>")` 登记，并返回内联 `new` 的数据源（供上层统一 `close`）。
    3. **登记**：在 `app/tools/__init__.py` 的 `register_all_tools()` 里加一行 `datasources.extend(xxx.register_xxx_tools(registry, ...))`。
 
    service 的 `_build_registry()` 只在启动时装配一次（数据源 `__init__` 会创建从不 `close` 的 httpx 客户端），新工具接入 `register_all_tools` 后即自动生效，无需改 service 装配代码。
