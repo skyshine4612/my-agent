@@ -67,9 +67,8 @@ class ToolRegistry:
     def register_tool(self, tool, label=""):
         """从 langchain tool 对象注册：schema 由 pydantic 生成，执行走 tool.ainvoke。
 
-        存 tool 对象而非底层函数：ainvoke 返回的仍是结构化原始对象（v1 不再包装成
-        ToolMessage），截断与 spill 判断拿得到结构；同时白拿 pydantic 校验——
-        类型强转、缺必填报错、多余参数静默忽略。
+        存 tool 对象而非底层函数：ainvoke 返回结构化原始对象，截断与 spill 判断拿得到结构；
+        同时白拿 pydantic 校验——类型强转、缺必填报错、多余参数静默忽略。
         """
         params = _openai_safe_schema(tool.args_schema.model_json_schema())
         self._tools[tool.name] = Tool(tool.name, tool.description, params, tool, label)
@@ -97,8 +96,8 @@ class ToolRegistry:
     async def call_raw(self, name, arguments):
         """执行工具并返回结构化原始结果（dict/list/str 等），不做 str() 转换。
 
-        供 run_tool 做结构化截断使用：拿到原始结构才能按类型截断（list 前 3 条 / dict 前 10 键），
-        而 `str()` 会把结构信息压平丢失。
+        调用方拿到原始结构才能按类型截断（list 前 20 条 / dict 前 20 键），
+        `str()` 会把结构信息压平丢失。
         """
         return await self._tools[name].fn.ainvoke(arguments)
 

@@ -1,5 +1,5 @@
 # app/core/memory/metrics.py
-# 记忆机制计数器：记录各机制被触发的次数，供重构前后对比与线上观察。
+# 记忆机制计数器：记录各机制被触发的次数；每轮收尾打一条指标快照日志，供线上观察。
 import threading
 
 _LOCK = threading.Lock()

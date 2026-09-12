@@ -9,14 +9,16 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from langchain.agents.middleware import AgentMiddleware
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage
 from langchain_core.messages.utils import convert_to_openai_messages
 from langchain_core.outputs import ChatGeneration, ChatResult
 from langchain_core.tools import tool
 
+import app.core.agent as agent_mod
 from app.config import settings
-from app.core.agent import Agent, CriticConfig
+from app.core.agent import RECURSION_LIMIT, Agent, CriticConfig, _CriticMiddleware
 
 
 def _lc_tool_call(tc):
@@ -379,6 +381,11 @@ async def test_never_converging_model_hits_recursion_limit():
     assert [e for e in events if e["type"] == "token"] == []
 
 
+def test_recursion_limit_is_pinned_at_60():
+    """图侧额度常量就是写死的 60：一轮 ReAct 占 3 步（before_model 钩子 + 模型 + 工具），即最多 20 轮。"""
+    assert RECURSION_LIMIT == 60
+
+
 @pytest.mark.asyncio
 async def test_model_sees_distilled_summary_before_kept_window():
     """淘汰轮的布局：蒸馏摘要在保留窗口之前，用户指令仍在最后。
@@ -541,6 +548,27 @@ async def test_critic_turn_still_hits_recursion_limit(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_recursion_limit_used_up_by_tool_rounds_skips_critic(monkeypatch):
+    """20 轮工具 + 一次答案轮 + 带 critic：落兜底文案，且 critic 一次都没被调用。
+
+    20 轮工具占掉第 1-60 步，答案轮的模型调用与收口钩子都排在更后面，故整轮零校验、零 token、
+    连答案轮的模型调用都没发生（llm.i 停在 20）。额度放宽到 62 时这一档就收敛出答案，本用例转红。
+    """
+    assert RECURSION_LIMIT == 60  # 第 61 步是 before_model 钩子步，只放宽到 61 时行为不可分，故常量单独钉死
+    llm = StreamingLLM([_tool_round(f"c{i}") for i in range(20)]
+                       + [_answer_round("成都明天晴")])
+    calls = _install_critic(monkeypatch, [{"ok": True, "issues": []}])
+    reg = FakeRegistry({_HARD_TOOL: "晴"})
+    a = Agent(name="t", system_prompt="s", tools=[_HARD_TOOL],
+              model=EventScriptChatModel(llm=llm))
+    out, rounds = await a.run_stream("go", [], reg, critic=CriticConfig())
+    assert out == _FALLBACK
+    assert calls == []  # 收口钩子没跑到，critic 零调用
+    assert len(rounds) == 20
+    assert llm.i == 20  # 答案轮的模型调用没发生
+
+
+@pytest.mark.asyncio
 async def test_critic_runs_on_converging_turn_with_critic():
     """收敛 + 带 critic：在额度用尽的最后一轮才收口，收口钩子仍跑得到、critic 确实被触发。
 
@@ -556,3 +584,77 @@ async def test_critic_runs_on_converging_turn_with_critic():
     assert out == "成都明天晴"
     assert chat_model.verdict_calls >= 1  # 收口钩子确实跑到并触发了 critic
     assert len(rounds) == 19
+
+
+class _ProbeAfterAgent(AgentMiddleware):
+    """探针收口中间件：记录自己的钩子被调用，不改 state。"""
+
+    def __init__(self, log):
+        super().__init__()
+        self.log = log
+
+    async def aafter_agent(self, state, runtime):
+        self.log.append("probe")
+        return None
+
+
+def _patch_create_agent(monkeypatch, append=None, capture=None):
+    """包一层 create_agent：按需在 middleware 链末尾追加中间件 / 捕获真实装配出的链。"""
+    real = agent_mod.create_agent
+
+    def build(model, tools=None, system_prompt=None, middleware=None, state_schema=None):
+        chain = list(middleware or [])
+        if capture is not None:
+            capture["chain"] = list(chain)
+        if append is not None:
+            chain.append(append)
+        return real(model, tools=tools, system_prompt=system_prompt,
+                    middleware=chain, state_schema=state_schema)
+
+    monkeypatch.setattr(agent_mod, "create_agent", build)
+
+
+@pytest.mark.asyncio
+async def test_after_agent_chain_runs_every_middleware_probe(monkeypatch):
+    """收口链从 middleware 列表末尾往开头依次全跑：再挂一个收口中间件只会插到 critic 之前。
+
+    框架给每个带 after_agent 的中间件各建一个节点，出口节点取列表里最后一个（它的钩子最先执行），
+    随后沿链回到列表开头、最后到 END —— 故追加收口中间件不会让 critic 失效，依赖漂移探针盯住这条行为。
+    """
+    order = []
+    _patch_create_agent(monkeypatch, append=_ProbeAfterAgent(order))
+
+    async def fake_run_critic(model, tool_results, answer,
+                              read_file_tool=None, grep_tool=None, max_iter=3):
+        order.append("critic")
+        return {"ok": True, "issues": []}
+
+    monkeypatch.setattr("app.core.agent.run_critic", fake_run_critic)
+    llm = StreamingLLM([_tool_round("c1"), _answer_round("成都明天晴")])
+    reg = FakeRegistry({_HARD_TOOL: "晴"})
+    a = Agent(name="t", system_prompt="s", tools=[_HARD_TOOL],
+              model=EventScriptChatModel(llm=llm))
+    out, _ = await a.run_stream("成都天气", [], reg, critic=CriticConfig())
+    assert out == "成都明天晴"
+    assert order == ["probe", "critic"]  # 后挂的收口中间件先跑，critic 仍被调用
+
+
+@pytest.mark.asyncio
+async def test_critic_is_last_after_agent_middleware(monkeypatch):
+    """护栏：真实装配出的 middleware 链里，最后一个带 after_agent 的中间件就是 critic。
+
+    收口链是「列表末尾 → 列表开头」的顺序，critic 必须保持在末尾才能在改写后仍是最先执行的那个；
+    把 critic 挪到非末尾位置（或在它之后再追加收口中间件）时本用例转红。
+    """
+    captured = {}
+    _patch_create_agent(monkeypatch, capture=captured)
+    llm = StreamingLLM([_tool_round("c1"), _answer_round("成都明天晴")])
+    _install_critic(monkeypatch, [{"ok": True, "issues": []}])
+    reg = FakeRegistry({_HARD_TOOL: "晴"})
+    a = Agent(name="t", system_prompt="s", tools=[_HARD_TOOL],
+              model=EventScriptChatModel(llm=llm))
+    await a.run_stream("成都天气", [], reg, critic=CriticConfig())
+    after_agent = [m for m in captured["chain"]
+                   if type(m).aafter_agent is not AgentMiddleware.aafter_agent]
+    assert after_agent, "middleware 链里应有一个带 after_agent 的收口中间件"
+    assert isinstance(after_agent[-1], _CriticMiddleware)

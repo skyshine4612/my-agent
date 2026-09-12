@@ -46,14 +46,14 @@ class McpDataSource:
         """调用 MCP 工具，返回 CallToolResult。连接失效时清理缓存、下次重建。
 
         加 asyncio.wait_for 超时：ModelScope 限流时连接可能挂起（不返回也不抛异常），
-        超时抛 TimeoutError 由上层（run_stream 的 try/except）兜底，避免整个请求卡死。
+        超时抛 TimeoutError 由 _ToolExecMiddleware 的工具兜底处理，避免整个请求卡死。
         """
         session = await self._ensure_session()
         try:
             return await asyncio.wait_for(session.call_tool(tool_name, arguments), timeout=30.0)
         except asyncio.CancelledError as e:
             # MCP 连接中途被任务组取消（如服务器断连），不是上层主动取消本次请求；
-            # 转成普通异常，让 run_stream 的工具兜底当「执行失败」处理，避免 CancelledError
+            # 转成普通异常，让 _ToolExecMiddleware 的工具兜底当「执行失败」处理，避免 CancelledError
             # 一路穿透 except Exception 把整个 SSE 流炸掉。
             await self._discard_session()
             raise ConnectionError(f"MCP 工具 {tool_name} 调用被中断（服务器断连）") from e

@@ -2,8 +2,7 @@
 # 旅行工具工厂 + 注册：POI / 火车票 / 机票 / 模糊搜索。
 # 工具用 langchain @tool 定义（schema 由 pydantic 从函数签名生成），经 registry.register_tool 注册。
 # 参数描述用 Annotated[T, Field(description=...)]：它是模型可见契约，裸注解会静默丢掉。
-# 注意：train_ticket_query / flight_query 的 date / from_city / to_city 六个参数
-# 原本就没有描述（既有缺口），迁移期逐字保持缺失——补描述属契约增强，会污染本次纯重构。
+# 注意：train_ticket_query / flight_query 的 date / from_city / to_city 六个参数不写描述。
 from typing import Annotated
 
 from langchain_core.tools import tool

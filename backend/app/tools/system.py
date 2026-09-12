@@ -21,7 +21,7 @@ def register_system_tools(registry, skill_names):
         SkillName = Literal[tuple(skill_names)]
     else:
         # 空清单时 Literal[()] 会让 pydantic 建模抛 AssertionError，而 service 在 import 期构造，等于启动崩溃。
-        # 退化为 str：无 enum 约束，模型传任何值都落到下面「未知业务」分支，与旧 schema 的 enum:[] 一样不可用于选值。
+        # 退化为 str：无 enum 约束，模型传任何值都落到下面「未知业务」分支。
         SkillName = str
 
     @tool

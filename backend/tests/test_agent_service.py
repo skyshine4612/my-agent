@@ -73,7 +73,6 @@ class FakeStreamingLLM:
         yield {"type": "end", "tool_calls": None}
 
 
-
 def test_service_assembles_and_tools_non_empty():
     """AgentService 装配成功（会话历史/短期/长期记忆/chat_model/ds 就位），扁平工具注册表非空。
 

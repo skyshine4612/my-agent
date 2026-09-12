@@ -113,7 +113,8 @@ class AgentService:
 
         返回 AsyncIterator[dict]，每个 dict 的 "type" 字段标识事件类型。
         """
-        # 设置请求级 user_id contextvar，供工具层（read_file/grep 按用户隔离读）与 run_tool 写文件使用
+        # 设置请求级 user_id contextvar，供工具层（read_file/grep 按用户隔离读、
+        # _ToolExecMiddleware 写文件）使用
         current_user_id.set(user_id)
         logger.info("[service] 收到请求，user=%s，消息：%.60s", user_id, message)
 
@@ -158,7 +159,7 @@ class AgentService:
                 # 清理本轮 spill 文件（保留 _history.txt）；异步提炼长期记忆（fire-and-forget，不影响主流程返回）
                 await self.tool_result_store.clear_spill(conv_id, user_id)
                 asyncio.create_task(self.memory.extract_facts(user_id, message))
-                # 观测出口：本轮收尾打一条记忆指标快照日志，供重构前后对比
+                # 观测出口：每轮收尾打一条指标快照日志，供线上观察
                 log_snapshot()
                 await queue.put({"type": "done"})
             finally:

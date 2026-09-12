@@ -53,10 +53,10 @@ def _redact_secrets(text):
     return text
 
 
-def _struct_truncate_to_str(raw, list_limit=15, dict_limit=20, str_limit=4000):
+def _struct_truncate_to_str(raw, list_limit=20, dict_limit=20, str_limit=4000):
     """结构化截断：list 取前 list_limit 条 / dict 取前 dict_limit 键 / str 截断 str_limit。
 
-    返回 (截断文本, 截断描述)：截断描述如「仅展示前15条（共20条）」或「已截断」，未截断时为空串。
+    返回 (截断文本, 截断描述)：截断描述如「仅展示前20条（共30条）」或「已截断」，未截断时为空串。
     由调用方决定如何拼提示（spill 时合并成一句话，无 spill 时单独加标记）。
     """
     note = ""
@@ -81,7 +81,7 @@ def _struct_truncate_to_str(raw, list_limit=15, dict_limit=20, str_limit=4000):
     return s, note
 
 
-def _needs_spill(raw, list_limit=15, dict_limit=20, str_limit=4000) -> bool:
+def _needs_spill(raw, list_limit=20, dict_limit=20, str_limit=4000) -> bool:
     """判断完整结果是否被结构化截断（触发地址索引落库的条件）。
 
     与 _struct_truncate_to_str 的截断维度对齐：list 超 list_limit / dict 超 dict_limit 键 /
@@ -174,8 +174,8 @@ class _CriticMiddleware(AgentMiddleware):
     环对本钩子之外完全不可见：校验与改写都是普通 async 调用，不新增图节点、不占 recursion_limit。
     触发条件与图外时代一致：本轮真的调用了硬数据工具（hard_results 由 _ToolExecMiddleware 累积）。
 
-    不包 try/except：run_critic 内部已吞掉三条 fail-open（超限 / 结论解析失败 / LLM 调用失败），
-    而改写那次 model.ainvoke 的异常在旧代码里就是向上抛给 worker 的，兜底会静默改变行为。
+    此处不包 try/except：run_critic 内部已吞掉三条 fail-open（超限 / 结论解析失败 / LLM 调用失败），
+    改写那次 model.ainvoke 的异常向上抛给 worker。
     """
 
     def __init__(self, model, config: CriticConfig, system_prompt, user_message, summary_hint, emit):
@@ -439,8 +439,8 @@ class Agent:
         # 工具取注册表里的 langchain tool 对象：create_agent 需要真工具对象，middleware 才拿得到
         # request.tool；工具 schema 由工具自身的 args_schema 生成，与 to_openai_schemas 同源
         tools = [registry.get(n).fn for n in self.tools] if self.tools else []
-        # 装配决策 A：本轮 new 一个 middleware 实例（带本轮 conversation_id / user_id），并在本轮内建图 ——
-        # conversation_id 每轮不同，挂成可变共享属性会在并发两轮对话时互相踩
+        # conversation_id 每轮不同，middleware 实例与本轮图一起 new，不挂成可变共享属性
+        # （并发两轮对话时共享实例会互相踩）
         middleware = [_ToolExecMiddleware(self.name, registry, emit,
                                           conversation_id=conversation_id,
                                           tool_result_store=tool_result_store,
@@ -448,7 +448,7 @@ class Agent:
                       # 即使不淘汰（wm 为 None）也要挂：它同时负责复位「模型所见窗口」的布局
                       _WorkingMemoryMiddleware(wm)]
         if critic is not None:
-            # 必须挂在末尾：框架只把「最后一个带 after_agent 的 middleware」当作收口节点
+            # 挂在末尾：收口链按「middleware 列表末尾 → 列表开头」的顺序执行，排在末尾才最先跑
             middleware.append(_CriticMiddleware(self.model, critic, self.system_prompt,
                                                 user_message, summary, emit))
         # 图按本轮装配：conversation_id / middleware / critic 都是本轮的，
