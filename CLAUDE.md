@@ -41,7 +41,7 @@ npm run type-check   # 仅类型检查
 研发期前端 `npm run dev`、后端 `uv run python run.py` 都跑在本机，容器只跑 Supabase 与沙箱：
 
 ```sh
-docker compose -f docker/docker-compose.yml up -d --build   # 在 192.168.10.150 上执行：Supabase 全套 + sandbox
+docker compose up -d --build   # 在 192.168.10.150 的 docker/ 目录里执行：Supabase 全套 + sandbox
 ```
 
 后端连本地服务器上的沙箱要设 `SANDBOX_URL`（默认 `http://sandbox:8001` 是容器内视角，本机解析不到）。
@@ -80,7 +80,7 @@ api/routes/chat.py  →  services/agent_service.py  →  core/agent.py (ReAct �
 
 7. **数据源分层**：两个基类——`datasource/mcp_base.py` 的 `McpDataSource` 封装 MCP 的「懒加载持久 session + 超时 + 失效重建」（12306 / 机票继承）；`datasource/http_base.py` 的 `HttpDataSource` 封装 httpx 异步客户端（高德 Web / UAPIS / Tavily 继承）。`amap_web.py` 把高德返回解析成约定结构（纯函数 `parse_poi_list` / `parse_weather` 便于单测）。
 
-8. **配置**：`app/config.py` 用 pydantic-settings 从 `backend/.env` 读取（`LLM_*`、`EMBEDDING_*`、`VISION_*`、`MODELSCOPE_TOKEN`、各 `*_MCP_URL`、`UAPIS_API_KEY`、`TAVILY_API_KEY`、`AMAP_API_KEY`、`VARIFLIGHT_API_KEY`、`SUPABASE_DATABASE_URL`、`SUPABASE_TEST_DATABASE_URL`、`SUPABASE_JWT_SECRET`、`SANDBOX_URL`、`SANDBOX_TIMEOUT`、`FILE_DIR`）。`EMBEDDING_API_KEY`/`VISION_API_KEY`/`VISION_MODEL` 必须显式配（值通常与 `llm_*` 相同，但代码不做复用兜底——兜底会让「没配」和「配错了」长得一样），`EMBEDDING_DIMENSIONS` 必须与建表的 `vector(N)` 一致，换 embedding 模型时两处要一起改。容器内通过 compose 挂载 `./backend/.env` 到 `/app/.env`，密钥类参数不写进 compose。前端另有 `frontend/.env`（`VITE_SUPABASE_URL` / `VITE_SUPABASE_ANON_KEY` / `VITE_AMAP_WEB_JS_KEY`），`VITE_` 前缀的变量在 `npm run build` 时被内联进产物，所以 Docker 构建前必须先备好该文件。
+8. **配置**：`app/config.py` 用 pydantic-settings 从 `backend/.env` 读取（`LLM_*`、`EMBEDDING_*`、`VISION_*`、`MODELSCOPE_TOKEN`、各 `*_MCP_URL`、`UAPIS_API_KEY`、`TAVILY_API_KEY`、`AMAP_API_KEY`、`VARIFLIGHT_API_KEY`、`SUPABASE_DATABASE_URL`、`SUPABASE_TEST_DATABASE_URL`、`SUPABASE_JWT_SECRET`、`SANDBOX_URL`、`SANDBOX_TIMEOUT`、`FILE_DIR`）。`EMBEDDING_API_KEY`/`VISION_API_KEY`/`VISION_MODEL` 必须显式配（值通常与 `llm_*` 相同，但代码不做复用兜底——兜底会让「没配」和「配错了」长得一样），`EMBEDDING_DIMENSIONS` 必须与建表的 `vector(N)` 一致，换 embedding 模型时两处要一起改。后端进程直接读 `backend/.env`；密钥类参数不写进 compose。前端另有 `frontend/.env`（`VITE_SUPABASE_URL` / `VITE_SUPABASE_ANON_KEY` / `VITE_AMAP_WEB_JS_KEY`），`VITE_` 前缀的变量在 `npm run build` 时被内联进产物，所以 Docker 构建前必须先备好该文件。
 
 9. **子 Agent 委派（上下文隔离）**（`tools/sub_agent.py`）：顶层 agent 可用 `call_sub_agent` 工具把复杂子任务（如查交通、查景点）委派给独立上下文的子 Agent——子 Agent 历史为空、只吃 `task`，业务规则由它按需 `get_skill` 加载，跑完只回传最终答案摘要，主 agent 的上下文不被大量工具结果淹没。子 Agent 内部工具调用不上报前端（`on_event=None`），前端只显示「委派子任务」一个气泡。当前为单层委派（子 Agent 工具集不含 `call_sub_agent`，避免无限下钻）。子 Agent 分配独立 `sub_conversation_id`（uuid）隔离工具结果地址索引（spill 目录），任务结束（含异常）即清理，不与主会话/其他子 Agent 串扰。
 

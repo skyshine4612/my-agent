@@ -73,8 +73,8 @@ def render_system_prompt(skill_directory: str, tool_grounding: str,
         file_directory:  本会话可用文件清单（render_file_directory()），可空（空则显示「无」）
     """
     template = load_prompt("system")
-    # 用 str.replace 而非 str.format 替换插槽：system.md 除插槽外暂无花括号，
-    # 但未来提示词里可能出现 JSON 花括号（如 critic 的 {"ok":...}），replace 更稳，不会误解析。
+    # 用 str.replace 而非 str.format 替换插槽：提示词正文里若有 JSON 花括号（如 critic 的 {"ok":...}），
+    # format 会把它当占位符解析，replace 不会。
     return (template
             .replace("{skill_directory}", skill_directory)
             .replace("{tool_grounding}", tool_grounding)
