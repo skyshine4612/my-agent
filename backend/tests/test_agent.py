@@ -276,6 +276,73 @@ async def test_model_sees_user_message_last():
 
 
 @pytest.mark.asyncio
+async def test_status_event_precedes_first_content_block():
+    """模型开始产出内容时发一次 status（覆盖生成期的长静默），且先于同轮的 tool_call 事件与 token 事件。"""
+    llm = StreamingLLM([
+        [{"type": "content", "text": "想"},
+         {"type": "end", "tool_calls": [{"id": "c1", "function": {"name": "w", "arguments": "{}"}}]}],
+        [{"type": "content", "text": "done"}, {"type": "end", "tool_calls": None}],
+    ])
+    reg = FakeRegistry({"w": "晴"})
+    a = Agent(name="t", system_prompt="s", tools=["w"], llm=llm, model=EventScriptChatModel(llm=llm))
+    events = []
+
+    async def on_event(e):
+        events.append(e)
+
+    out, _ = await a.run_stream("go", [], reg, on_event=on_event)
+    assert out == "done"
+    # 首个事件即 status：调工具轮的思考 "想" 也要先让前端进入「整理中」，而不是先冒工具气泡
+    assert events[0] == {"type": "status", "status": "generating"}
+    kinds = [e["type"] for e in events]
+    assert kinds.index("status") < kinds.index("tool_call")
+    # token 事件（最终答案）之前必须先有 status
+    assert kinds.index("status") < kinds.index("token")
+
+
+@pytest.mark.asyncio
+async def test_never_converging_model_hits_max_iters_limit():
+    """模型每轮只回 tool_calls、从不给答案：跑满 max_iters 后返回兜底文案，不发 token，rounds 记满。"""
+    llm = StreamingLLM([
+        [{"type": "end", "tool_calls": [{"id": "c1", "function": {"name": "w", "arguments": "{}"}}]}],
+        [{"type": "end", "tool_calls": [{"id": "c2", "function": {"name": "w", "arguments": "{}"}}]}],
+        [{"type": "end", "tool_calls": [{"id": "c3", "function": {"name": "w", "arguments": "{}"}}]}],
+    ])
+    reg = FakeRegistry({"w": "晴"})
+    a = Agent(name="t", system_prompt="s", tools=["w"], llm=llm,
+              model=EventScriptChatModel(llm=llm), max_iters=3)
+    events = []
+
+    async def on_event(e):
+        events.append(e)
+
+    out, rounds = await a.run_stream("go", [], reg, on_event=on_event)
+    assert out == "抱歉，本轮查询了较多信息但未能整合成完整回答，请换个方式或精简需求后再试。"
+    assert len(rounds) == 3  # 跑满 max_iters 轮，每轮都真实执行了工具
+    assert reg.called == [("w", {})] * 3
+    assert [e for e in events if e["type"] == "token"] == []
+
+
+@pytest.mark.asyncio
+async def test_default_max_iters_is_20_rounds():
+    """默认 max_iters = 20，且真能跑满 20 轮 —— 图侧 recursion_limit = 3 * max_iters = 60。
+
+    一轮 ReAct 在限额里占 3 个任务（abefore_model 钩子 + 模型 + 工具），故上限必须是 3 * max_iters：
+    取 2 * max_iters 时实测只跑满 13 轮就触顶，比旧循环的 20 轮少 7 轮工具执行。
+    """
+    assert Agent(name="t", system_prompt="s").max_iters == 20
+    llm = StreamingLLM([
+        [{"type": "end", "tool_calls": [{"id": f"c{i}", "function": {"name": "w", "arguments": "{}"}}]}]
+        for i in range(20)])
+    reg = FakeRegistry({"w": "晴"})
+    a = Agent(name="t", system_prompt="s", tools=["w"], llm=llm, model=EventScriptChatModel(llm=llm))
+    out, rounds = await a.run_stream("go", [], reg)
+    assert len(rounds) == 20
+    assert reg.called == [("w", {})] * 20
+    assert out == "抱歉，本轮查询了较多信息但未能整合成完整回答，请换个方式或精简需求后再试。"
+
+
+@pytest.mark.asyncio
 async def test_model_sees_distilled_summary_before_kept_window():
     """淘汰轮的布局：蒸馏摘要在保留窗口之前（旧实现 `working = [摘要] + 保留单元`），用户指令仍在最后。
 

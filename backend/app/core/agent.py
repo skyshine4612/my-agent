@@ -68,7 +68,7 @@ def _needs_spill(raw, list_limit=15, dict_limit=20, str_limit=4000) -> bool:
 async def postprocess_tool_result(name, raw, tool_result_store, conversation_id, user_id):
     """工具结果后处理：结构化截断 + 超限 spill，返回喂给模型的文本。
 
-    这份文本就是模型所见语料，critic 校验与修正重写复用同一份，故截断维度与提示文案与搬移前逐字一致。
+    这份文本就是模型所见语料，critic 复用同一份，故截断维度与文案必须一字不改。
     抽成独立函数只为便于单测 —— middleware 只负责调它。
     """
     if name in NON_QUERY_TOOLS:
@@ -113,7 +113,7 @@ class _ToolExecMiddleware(AgentMiddleware):
             return await handler(request)
         tc = request.tool_call
         name = tc["name"]
-        # 框架已把 arguments 解析成 dict（旧实现是 json.loads(fn["arguments"] or "{}")）
+        # 框架已把 arguments 解析成 dict，直接取用；缺省时空 dict 即无参调用
         args = tc.get("args") or {}
         # 轮次只用于日志：state 里已产生 tool_calls 的 assistant 消息数即当前轮
         round_no = max(1, sum(1 for m in request.state["messages"]
@@ -129,14 +129,24 @@ class _ToolExecMiddleware(AgentMiddleware):
         except Exception as e:
             logger.warning("[Agent:%s] 工具 %s 执行失败：%s", self.agent_name, name, e)
             raw = f"工具执行失败：{e}"
-        text = await postprocess_tool_result(name, raw, self.tool_result_store,
-                                             self.conversation_id, self.user_id)
-        logger.info("[Agent:%s] 第 %d 轮 工具 %s 完成（id=%s），返回 %.120s",
-                    self.agent_name, round_no, name, tc["id"], text)
-        # result 字段是模型工作记忆里的截断版结果，供上层 critic 校验，保证校验语料与模型所见一致
-        await self.emit({"type": "tool_result", "agent": self.agent_name, "tool": name, "status": True,
-                         "result": text, "id": tc["id"], "label": self.registry.label(name)})
-        return ToolMessage(content=text, tool_call_id=tc["id"], name=name)
+        # 后处理与上报的异常会被框架的工具错误兜底吞成 error ToolMessage（降级不炸轮），
+        # 不补日志就完全无痕：这里记完再原样抛出，保持框架既有的降级行为与错误串
+        try:
+            text = await postprocess_tool_result(name, raw, self.tool_result_store,
+                                                 self.conversation_id, self.user_id)
+            logger.info("[Agent:%s] 第 %d 轮 工具 %s 完成（id=%s），返回 %.120s",
+                        self.agent_name, round_no, name, tc["id"], text)
+            # result 字段是模型工作记忆里的截断版结果，供上层 critic 校验，保证校验语料与模型所见一致
+            await self.emit({"type": "tool_result", "agent": self.agent_name, "tool": name,
+                             "status": True, "result": text, "id": tc["id"],
+                             "label": self.registry.label(name)})
+        except Exception:
+            logger.exception("[Agent:%s] 第 %d 轮 工具 %s（id=%s）结果后处理/上报失败，交由框架降级为错误回填",
+                             self.agent_name, round_no, name, tc["id"])
+            raise
+        # 不带 name：回填消息的 token 估算（WorkingMemory._estimate 序列化整条消息）必须只含
+        # role / tool_call_id / content 三个键，多一个键就会抬高估算、把工作记忆的淘汰边界整体前移
+        return ToolMessage(content=text, tool_call_id=tc["id"])
 
 
 class _WorkingMemoryMiddleware(AgentMiddleware):
@@ -253,8 +263,8 @@ class Agent:
         # 工作记忆（预算淘汰器）：传入 llm 与预算时启用，否则禁用（不淘汰）
         wm = WorkingMemory(self.llm, context_budget) if context_budget else None
         # 输入消息：主 system 提示词（含 long_term_hint）由 create_agent 的 system_prompt 注入在最前、
-        # 永不淘汰；历史摘要作为独立 system 消息紧随其后（同旧 fixed=[system, summary]）；
-        # 之后拼短期记忆（最近几轮对话原文，持久，不参与淘汰）与当前用户指令
+        # 永不淘汰；历史摘要作为独立 system 消息紧随其后；之后拼短期记忆（最近几轮对话原文，
+        # 持久，不参与淘汰）与当前用户指令
         inputs = []
         if summary:
             inputs.append(SystemMessage(content=summary))
@@ -284,9 +294,11 @@ class Agent:
             #  故必须边跑边收，不能等跑完再从最终 state 里找）
             async for mode, payload in graph.astream(
                     {"messages": inputs},
-                    # create_agent 每轮「模型 + 工具」各占一个超步，N 轮需 2N：第 max_iters 轮的工具
-                    # 执行完仍要再调一次模型时即触顶抛 GraphRecursionError，与旧循环跑满 max_iters 对齐
-                    config={"recursion_limit": 2 * self.max_iters},
+                    # 限额按「任务」计，一轮 ReAct 占 3 个：abefore_model 钩子 + 模型 + 工具
+                    # （实测 max_iters=3 时 limit=9 恰好跑满 3 轮模型 + 3 次工具执行，limit=8 只跑满 2 轮），
+                    # 故取 3 * max_iters —— 跑满 max_iters 轮后下一次钩子即触顶抛 GraphRecursionError，
+                    # 与旧循环「跑满 max_iters 轮仍每轮调工具」的落点一致
+                    config={"recursion_limit": 3 * self.max_iters},
                     stream_mode=["messages", "values"]):
                 if mode == "messages":
                     chunk, meta = payload
