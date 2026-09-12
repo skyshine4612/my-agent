@@ -1,6 +1,8 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+写给**在本仓库改代码的 agent**：能跑的命令、架构，以及**改了会静默出错的不变量**。
+
+收录判据：换台机器、换个环境依然成立，且光读代码看不出来。部署动作、主机地址、环境变量取值不属于这里（分别归 `docker/` 部署包与 gitignore 的 `.env`）。
 
 ## 项目概览
 
@@ -8,8 +10,6 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 - **backend/**：FastAPI 应用，实现「通用 ReAct agent → 工具调用 → critic 事实校验」链路。真实数据：高德（POI/推荐菜，Web 服务 API）、天气/节假日/翻译/热榜/菜谱/营养（UAPIS，天气最多 7 天预报）、搜索（Tavily）经 HTTP 直连；12306 火车票经 ModelScope 托管 MCP；机票直连 variflight 官方 MCP，LLM 默认接阿里云百炼 DashScope（`qwen3.7-plus`）。持久化全在自托管 Supabase 的 Postgres（`asyncpg` + RLS），身份用 Supabase Auth（GoTrue）。另有本地知识库（RAG）：攻略语料切块后用 `text-embedding-v4` 向量化入库（pgvector），`search_knowledge` 工具按余弦相似度检索。
 - **frontend/**：Vue 3 + Vite + Element Plus + Pinia 的单页应用，登录页 + 通用对话界面（会话列表 + 流式聊天 + 工具调用气泡）。
-
-架构已从「旅行专用」链路收敛为「通用 agent + 标准 skill」两段式（见下）。
 
 ## 常用命令
 
@@ -22,10 +22,10 @@ uv run pytest                                        # 跑全部测试
 uv run pytest tests/test_llm_model.py::test_get_chat_model_is_singleton   # 跑单个测试
 ```
 
-- 测试配置在 `backend/pyproject.toml`：`asyncio_mode = "auto"`（async 测试无需 `@pytest.mark.asyncio`，但现有测试仍显式加了），`testpaths = ["tests"]`。
+- 异步测试不必写 `@pytest.mark.asyncio`（`asyncio_mode = "auto"`），但现有用例仍显式加了。
 - 测试模式：不依赖真实 LLM / 网络，用假 langchain 模型注入 `service.chat_model`；数据层连真实 Postgres 测试库 `agent_test`（`SUPABASE_TEST_DATABASE_URL` 由 `tests/conftest.py` 的 `db` fixture 建池并在用例间清表），未配该变量时相关用例整体 skip。
 - 配置：复制 `backend/.env.example` → `backend/.env` 填真实 key；未配 `LLM_API_KEY` 时后端仍可启动（`get_chat_model()` 返回产出空内容的假模型），未配 `SUPABASE_DATABASE_URL` 时启动会因建池失败而报错。
-- 知识库的「抓取网址」入口依赖 Playwright 浏览器，首次需 `uv run playwright install chromium`（约 700MB，含完整 chromium + headless shell）。直连 `cdn.playwright.dev` 在国内约 27KB/s 且频繁断流，加镜像快约 600 倍：`PLAYWRIGHT_DOWNLOAD_HOST=https://cdn.npmmirror.com/binaries/playwright uv run playwright install chromium`。未装时粘贴文本 / 上传文件入口照常可用，只有抓网址会失败。
+- 知识库的「抓取网址」入口依赖 Playwright 浏览器，首次需 `uv run playwright install chromium`（约 700MB）。直连 `cdn.playwright.dev` 在国内会断流，走镜像：`PLAYWRIGHT_DOWNLOAD_HOST=https://cdn.npmmirror.com/binaries/playwright uv run playwright install chromium`。未装时粘贴文本 / 上传文件入口照常可用，只有抓网址会失败。
 
 前端（在 `frontend/` 目录下）：
 
@@ -48,11 +48,9 @@ api/routes/chat.py  →  services/agent_service.py  →  core/agent.py (ReAct �
                           + 知识库检索 + critic 校验 + LTM 提炼  → core/llm.py (模型工厂)
 ```
 
-- **`app/services/agent_service.py`**：核心编排器，进程级单例 `service`（路由层直接 `import` 复用）。`chat_stream` 依次做：会话归属校验/新建 → 落库用户消息 → LTM 召回偏好 → 组装历史 → 注入 system prompt（含可用业务清单 + 事实规范 + 今天日期）→ 驱动 `Agent.run_stream` → critic 校验 → 落库结构化 assistant 消息 → 流式输出答案 → fire-and-forget 提炼长期记忆。记忆的组装/压缩/提炼委托给 `core/memory/manager.py` 的 `MemoryManager`。
-- **`app/core/agent.py`**：`Agent.run_stream` 实现 ReAct 循环（LLM 决策 → 工具调用 → 回填结果 → 再决策，图侧额度 `RECURSION_LIMIT` 固定 60 步 —— 一轮 ReAct 占 3 步，即最多 20 轮）。同一轮多个 tool_calls 由框架的 tools 节点并行执行；工具结果用 `call_raw` 拿结构化原始结果后做结构化截断（list 前 20 / dict 前 20 键 / str `truncate_limit` 默认 4000），完整结果 spill 到文件供 `read_file`/`grep` 读回；工作记忆（本轮工具结果）的 token 预算淘汰委托给 `core/memory/working.py` 的 `WorkingMemory`。
+- **`app/core/agent.py`**：`Agent.run_stream` 实现 ReAct 循环，图侧额度 `RECURSION_LIMIT` 固定 60 步（一轮 ReAct 占 3 步，即最多 20 轮）；同一轮多个 tool_calls 由框架的 tools 节点并行执行。
 - **`app/core/registry.py`**：`ToolRegistry` 统一管理工具元信息（name/description/parameters/fn/label），转成 OpenAI function-calling schema 供 LLM 决策，并执行同步/异步工具函数。
-- **`app/core/llm.py`**：LLM 接入层，全项目唯一的 LLM 通路 —— `get_chat_model()` 单例工厂返回 langchain 模型（DashScope 走 OpenAI 兼容协议，故用 `ChatOpenAI`）；无 key 时返回 `_EmptyFakeChatModel`（产出空内容），保证服务仍可启动。`close_chat_model()` 由 lifespan 调用，关闭模型持有的 httpx 连接池。
-- **`app/core/critic.py`**：`run_critic` 事实校验专家——多轮带工具（`read_file`/`grep` 定向读完整落库结果做 grounded 校验），比对「工具结果 vs 回答」，输出 `{ok, issues}`；注入当天日期避免年份误判，过滤「correction 为空」的误报 issue，限轮数 + fail-open（失败/超限按通过处理，不阻塞主流程）。
+- **`app/core/llm.py`**：全项目唯一的 LLM 通路。`get_chat_model()` 单例工厂返回 langchain 模型（DashScope 走 OpenAI 兼容协议，故用 `ChatOpenAI`）；`close_chat_model()` 由 lifespan 调用，关闭模型持有的 httpx 连接池。
 
 ### 关键机制 / 不变量
 
@@ -70,13 +68,13 @@ api/routes/chat.py  →  services/agent_service.py  →  core/agent.py (ReAct �
 
 7. **数据源分层**：两个基类——`datasource/mcp_base.py` 的 `McpDataSource` 封装 MCP 的「懒加载持久 session + 超时 + 失效重建」（12306 / 机票继承）；`datasource/http_base.py` 的 `HttpDataSource` 封装 httpx 异步客户端（高德 Web / UAPIS / Tavily 继承）。`amap_web.py` 把高德返回解析成约定结构（纯函数 `parse_poi_list` / `parse_weather` 便于单测）。
 
-8. **配置**：`app/config.py` 用 pydantic-settings 从 `backend/.env` 读取（`LLM_*`、`EMBEDDING_*`、`VISION_*`、`MODELSCOPE_TOKEN`、各 `*_MCP_URL`、`UAPIS_API_KEY`、`TAVILY_API_KEY`、`AMAP_API_KEY`、`VARIFLIGHT_API_KEY`、`SUPABASE_DATABASE_URL`、`SUPABASE_TEST_DATABASE_URL`、`SUPABASE_JWT_SECRET`、`SANDBOX_URL`、`SANDBOX_TIMEOUT`、`FILE_DIR`）。`EMBEDDING_API_KEY`/`VISION_API_KEY`/`VISION_MODEL` 必须显式配（值通常与 `llm_*` 相同，但代码不做复用兜底——兜底会让「没配」和「配错了」长得一样），`EMBEDDING_DIMENSIONS` 必须与建表的 `vector(N)` 一致，换 embedding 模型时两处要一起改。后端进程直接读 `backend/.env`；密钥类参数不写进 compose。前端另有 `frontend/.env`（`VITE_SUPABASE_URL` / `VITE_SUPABASE_ANON_KEY` / `VITE_AMAP_WEB_JS_KEY`），`VITE_` 前缀的变量在 `npm run build` 时被内联进产物，所以 Docker 构建前必须先备好该文件。
+8. **配置**：`app/config.py` 用 pydantic-settings 从 `backend/.env` 读取（`LLM_*`、`EMBEDDING_*`、`VISION_*`、`MODELSCOPE_TOKEN`、各 `*_MCP_URL`、`UAPIS_API_KEY`、`TAVILY_API_KEY`、`AMAP_API_KEY`、`VARIFLIGHT_API_KEY`、`SUPABASE_DATABASE_URL`、`SUPABASE_TEST_DATABASE_URL`、`SUPABASE_JWT_SECRET`、`SANDBOX_URL`、`SANDBOX_TIMEOUT`、`FILE_DIR`）。`EMBEDDING_API_KEY`/`VISION_API_KEY`/`VISION_MODEL` 必须显式配（值通常与 `llm_*` 相同，但代码不做复用兜底——兜底会让「没配」和「配错了」长得一样），`EMBEDDING_DIMENSIONS` 必须与建表的 `vector(N)` 一致，换 embedding 模型时两处要一起改。后端进程直接读 `backend/.env`；密钥类参数不写进 compose。前端另有 `frontend/.env`（`VITE_SUPABASE_URL` / `VITE_SUPABASE_ANON_KEY` / `VITE_AMAP_WEB_JS_KEY`），`VITE_` 前缀的变量在 `npm run build` 时被内联进产物，故改了它们必须重新构建才生效。
 
 9. **子 Agent 委派（上下文隔离）**（`tools/sub_agent.py`）：顶层 agent 可用 `call_sub_agent` 工具把复杂子任务（如查交通、查景点）委派给独立上下文的子 Agent——子 Agent 历史为空、只吃 `task`，业务规则由它按需 `get_skill` 加载，跑完只回传最终答案摘要，主 agent 的上下文不被大量工具结果淹没。子 Agent 内部工具调用不上报前端（`on_event=None`），前端只显示「委派子任务」一个气泡。当前为单层委派（子 Agent 工具集不含 `call_sub_agent`，避免无限下钻）。子 Agent 分配独立 `sub_conversation_id`（uuid）隔离工具结果地址索引（spill 目录），任务结束（含异常）即清理，不与主会话/其他子 Agent 串扰。
 
 10. **三层记忆 + token 预算 + 三层压缩**（`core/memory/` 包）：工作记忆（本轮工具结果，内存，每次问答即丢）+ 短期记忆（`short_term_memory` 表，喂 LLM 的跨轮上下文权威源：1 条 summary 摘要 + 结构化消息序列（user / assistant 含 tool_calls / tool），跨轮持久）+ 长期记忆（`long_term_memory` 表，按 `user_id` 跨会话，每条 fact 入库时向量化）+ 会话历史（`conversation.py`，messages/conversations 仅前端展示）。记忆编排统一在 `memory/manager.py` 的 `MemoryManager`（组装/压缩/写回/提炼），四个 store 由 `AgentService` 创建后共享；四张表的连接统一走 `core/db.py`（asyncpg 连接池，lifespan 里建池/关池，业务查询走 `rls_conn` 切角色开事务）。四个 store 的 `__init__` 一律零 IO——进程级单例 `service` 在 import 时就构造 store，而连接池要到 lifespan 才建，任何构造期建表/连库都会直接炸。token 预算用 `tiktoken`（cl100k_base）真实计数，失败回退启发式（`token_utils.py`）。短期记忆超 token 预算时早期回合压成累积摘要（存表 + 落盘 `_history.txt`）；长期记忆 fire-and-forget 只提炼本轮 user 消息（per-user 锁串行），召回按本轮问题语义检索（`recall(user_id, query=...)`，向量链路失败回退 importance 排序），写入前与该用户已有 fact 做语义去重（余弦 ≥ 0.85 视为同一条，取较大 importance 提升而非新增）；工作记忆单个结果超长时 spill（结构化截断 + 文件地址索引），多结果累积超预算时成对淘汰最老 + LLM 蒸馏兜底（蒸馏失败降级为拼接截断，不炸整轮）。命名约定：工作/短期/长期记忆用 `working`/`short_term`/`long_term`，会话历史用 `conversation`，禁止 `session` 等混用。
 
-11. **工具结果地址索引（spill-to-file）**（`core/memory/tool_result.py` + `tools/file.py`）：工具结果超 `truncate_limit`（默认 4000 字符）时，完整结果写临时文件 `result_dir/<user_id>/<conversation_id>/<uuid>.txt`，窗口只放「预览 + 文件路径提示」，模型用 `read_file(path, offset, limit)`（顺序读 + 未读完进度提示）与 `grep(pattern, path)`（正则搜 + 位置/上下文片段）两个**写死的安全工具**按需读回被省略的部分。path 经路径白名单校验（拒绝 `..`/绝对路径穿越），按 `current_user_id`（`core/context.py` 的 contextvar）隔离目录。生命周期：spill 文件本轮结束即清（保留 `_history.txt`），`delete_conversation` 删该会话目录时统一清理；子 Agent 同样写文件、子任务结束即清。这是对「纯截断」的升级——被截掉的部分不再是永久丢失，而是可读回。
+11. **工具结果地址索引（spill-to-file）**（`core/memory/tool_result.py` + `tools/file.py`）：工具结果超 `truncate_limit`（默认 4000 字符）时，完整结果写临时文件 `result_dir/<user_id>/<conversation_id>/<uuid>.txt`，窗口只放「预览 + 文件路径提示」，模型用 `read_file(path, offset, limit)`（顺序读 + 未读完进度提示）与 `grep(pattern, path)`（正则搜 + 位置/上下文片段）两个**写死的安全工具**按需读回被省略的部分。path 经路径白名单校验（拒绝 `..`/绝对路径穿越），按 `current_user_id`（`core/context.py` 的 contextvar）隔离目录。生命周期：spill 文件本轮结束即清（保留 `_history.txt`），`delete_conversation` 删该会话目录时统一清理；子 Agent 同样写文件、子任务结束即清。
 
 12. **短期记忆组装 + 压缩（running summary）**（`memory/manager.py` + `short_term.py`）：一个会话的短期记忆直接存 `short_term_memory` 表（多行：1 条 `summary` + 结构化消息序列 `user / assistant(含 tool_calls) / tool`），是喂 LLM 的跨轮上下文的权威源，**不依赖 messages 表**（messages/conversations 仅前端展示）。每轮生成后 `append_turn` 把本轮按 ReAct 轮次写进表（user + 每轮 assistant(tool_calls) + tool×N 占位 + assistant 答案，tool 结果不存、content 空串）；组装时预算驱动（`llm_context_budget * history_budget_ratio`，默认 50%）：早期回合压成累积摘要（序列化 + 蒸馏 + 追加 `_history.txt`），并**物理删除**早期消息（删除即增量，无 `compressed_through` marker），最近几轮保留。摘要注入 system prompt，最近几轮结构化消息作为短期记忆注入对话，拼上下文 = system「`[摘要] {summary}\n[完整历史存到 {path}，可用 read_file 读]`」+ 最近几轮结构化消息 + 本轮工作记忆（工具结果）。这样模型跨轮能看到「查过哪些工具、什么参数」，对没查过的对象重新调工具（grounding 强制每轮重新调）；被压缩的早期回合答案落盘 `_history.txt` 可 `read_file` 读回。
 
@@ -84,7 +82,7 @@ api/routes/chat.py  →  services/agent_service.py  →  core/agent.py (ReAct �
 
 14. **日志**（`core/logging.py`）：`setup_logging()` 随 `import app.main` 触发，配「控制台 + 滚动文件 `logs/app.log`（10MB × 5 份）」。两处刻意的接线：① `uvicorn` / `uvicorn.error` 的 handler 清空并置 `propagate = True`，让未捕获的异常栈落进文件（uvicorn 默认只写自己的 stderr，文件里永远看不到）；`uvicorn.access` 不接，请求流水只留终端。② `httpx` / `httpcore` 提到 WARNING —— 一次建库要发几十条 embedding 请求，INFO 会把日志刷满。长文档向量化另按批次打进度（`embed_batched` 批次超 20 才打，长期记忆那种量级不打），避免几十秒黑屏。时序依赖：本函数在 uvicorn 配置完自己的日志之后才跑，靠的是 `app.main` 的 import 时机，改动启动方式时要留意。
 
-15. **代码执行沙箱与 skill 脚本**（`docker/sandbox/` + `core/sandbox.py` + `core/files.py` + `core/skill_scripts.py` + `tools/script.py`）：**模型不写代码**——只能从 `app/skills/*/scripts/*.py` 里挑一个已评审脚本并传参（`run_skill_script(skill, script, params)`，两个名字由启动时扫描出的 `Literal` 枚举钉死，脚本源码由后端读盘，模型的手碰不到代码本身）。执行落在独立 compose 服务 `sandbox`：只读 rootfs + tmpfs `/tmp`（`noexec,nosuid,size=512m`）、非 root、`cap_drop: ALL`、`no-new-privileges`、**`init: true`（必须开：不开则 PID 1 是 uvicorn，Python 当 PID 1 不 `wait()` 孤儿，脚本派生的子孙在脚本被杀后 reparent 到 PID 1 就成永不回收的僵尸，照样占 `pids_limit` 槽位——实测 fork 炸弹跑完攒 61 个僵尸、pids 64/64 打满，此后每次执行都 `BlockingIOError`，沙箱永久失效直到重启）**、`mem_limit 2g` + **`memswap_limit 2g`（必须显式写：不写就默认是内存的 2 倍，等于白送 2g swap，实测能撑到 2.6g 才被杀）** / `cpus 1.0` / `pids_limit 64`（内存与 CPU 拦不住 fork 炸弹，只有它拦得住）/ `nofile 256` / `fsize 50MB`、**不注入任何环境变量**（黑名单式脱敏总会漏，见 Hermes CVE-2026-9368 的教训）、双端超时（沙箱看门狗杀进程 + 后端 httpx 多等 5s 拿结构化响应）。脚本契约：stdin 读 `{"args","work_dir","out_dir"}`，文件由沙箱写进本次执行自己的 `/tmp/<uuid>/work`（**没有 `/tmp/work` 这个固定路径**），stdout 只打结论，只 import 标准库与 `docker/sandbox/pyproject.toml` 里声明过的包（标准库之外每多一个都是安全决策）。`params` 里凡是**值等于某个已知 `file_id`** 的字符串会被换成**带原扩展名的裸文件名 `<file_id>.xlsx`**（扩展名不能省：openpyxl 靠后缀判格式，叫 `<uuid>` 的文件它直接拒绝打开），其余字符串原样传递；脚本用 `join(work_dir, basename(name))` 定位——路径穿越由脚本自己的 `open` 失败兜住，不需要额外校验代码。**脚本里的参数取值别复用「显示用」的截断函数**：`inspect.py` 的 `_text` 带 `SAMPLE_CHARS=32`，而 file_id 加扩展名有 37 字符，拿它处理路径会截成一个不存在的文件名。产物写回会话文件目录拿到新 `file_id`，随 `tool_result` 事件的 `artifacts` 字段下发（`run_skill_script` 必须留在 `NON_QUERY_TOOLS` 里，否则产物清单会被结构化截断）。**加脚本要重新生成 `tests/data/tool_schemas.json`**——`Literal` 枚举变了 schema 就变，快照测试会红。
+15. **代码执行沙箱与 skill 脚本**（`docker/sandbox/` + `core/sandbox.py` + `core/files.py` + `core/skill_scripts.py` + `tools/script.py`）：**模型不写代码**——只能从 `app/skills/*/scripts/*.py` 里挑一个已评审脚本并传参（`run_skill_script(skill, script, params)`，两个名字由启动时扫描出的 `Literal` 枚举钉死，脚本源码由后端读盘，模型的手碰不到代码本身）。执行落在独立 compose 服务 `sandbox`，加固项全在 `docker/docker-compose.yml`：只读 rootfs + tmpfs `noexec`、非 root、`cap_drop: ALL`、`no-new-privileges`、内存 / `pids` / `nofile` / `fsize` 上限、**不注入任何环境变量**（黑名单式脱敏总会漏，见 Hermes CVE-2026-9368 的教训），外加双端超时（沙箱看门狗杀进程 + 后端 httpx 多等 5s 拿结构化响应）。三处**删掉不报错、只会慢慢失效**的必须记牢：**`init: true`**（不开则 PID 1 是 uvicorn，Python 当 PID 1 不 `wait()` 孤儿，脚本派生的子孙在脚本被杀后 reparent 到 PID 1 就成永不回收的僵尸，照样占 `pids_limit` 槽位——实测 fork 炸弹跑完攒 61 个僵尸、pids 64/64 打满，此后每次执行都 `BlockingIOError`，沙箱永久失效直到重启）、**`memswap_limit` 必须写成与 `mem_limit` 等值**（不写则默认是内存的 2 倍，等于白送 2g swap，实测能撑到 2.6g 才被杀）、**`pids_limit`**（内存与 CPU 拦不住 fork 炸弹，只有它拦得住）。脚本契约：stdin 读 `{"args","work_dir","out_dir"}`，文件由沙箱写进本次执行自己的 `/tmp/<uuid>/work`（**没有 `/tmp/work` 这个固定路径**），stdout 只打结论，只 import 标准库与 `docker/sandbox/pyproject.toml` 里声明过的包（标准库之外每多一个都是安全决策）。`params` 里凡是**值等于某个已知 `file_id`** 的字符串会被换成**带原扩展名的裸文件名 `<file_id>.xlsx`**（扩展名不能省：openpyxl 靠后缀判格式，叫 `<uuid>` 的文件它直接拒绝打开），其余字符串原样传递；脚本用 `join(work_dir, basename(name))` 定位——路径穿越由脚本自己的 `open` 失败兜住，不需要额外校验代码。**脚本里的参数取值别复用「显示用」的截断函数**：`inspect.py` 的 `_text` 带 `SAMPLE_CHARS=32`，而 file_id 加扩展名有 37 字符，拿它处理路径会截成一个不存在的文件名。产物写回会话文件目录拿到新 `file_id`，随 `tool_result` 事件的 `artifacts` 字段下发（`run_skill_script` 必须留在 `NON_QUERY_TOOLS` 里，否则产物清单会被结构化截断）。**加脚本要重新生成 `tests/data/tool_schemas.json`**——`Literal` 枚举变了 schema 就变，快照测试会红。
 
 16. **会话文件目录与工具结果目录是两棵树**（`core/files.py` vs `core/memory/tool_result.py`）：上传件与脚本产物放 `files/<user_id>/<conversation_id>/<file_id>/`（一文件一目录 + `original.<ext>` + `meta.json`，避开「原始文件名存哪」——存文件名要处理特殊字符，存共享索引要处理并发写），**活到会话结束**；spill 的 `results/<user_id>/<conversation_id>/` 每轮结束即清（只留 `_history.txt`）。所以会话文件绝不能落进 `results/`——下一轮 `clear_spill` 就把它删了。`delete_conversation` 两棵树一起清。上传是 multipart（`python-multipart`）；上传时带的 `conversation_id` 若不是自己的，后端另建一个并在返回值里给出，**前端必须接管这个新 id**，否则上传件与后续对话不在同一个会话目录里。下载走 `GET /api/files/{file_id}?conversation_id=…`，`file_id` 必须是合法 uuid（这是防路径穿越的唯一一道校验）；前端不能用 `<a href>` 下（带不上 Bearer 会 401），得拿 blob 再另存。
 
