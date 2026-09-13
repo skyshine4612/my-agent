@@ -84,7 +84,9 @@ docker compose up -d            # 起完整栈，Kong 网关默认 8000 端口
 
   > 重跑**不会给老库加列**（`create table if not exists` 对已存在的表不生效），加了列的版本要删表重建。
 
-- **测试库 `agent_test`**：不用手工建，`backend/tests/conftest.py` 跑 pytest 时自动建（`AUTH_STUB_SQL` 造 `auth.users` 与 `auth.uid()` 桩，`BUSINESS_SQL` 是主库那份结构）。
+- **测试库 `agent_test`**：同一个 Postgres 实例上的**另一个 database**，与 `postgres` 并列（Supabase Studio 只连 `postgres`、没有选库入口，所以那里看不到它；`\l` 或 `select datname from pg_database` 能列出来）。
+
+  **库本身要一次性手工建**（`createdb agent_test`，或用 Studio 对 `postgres` 库执行 `create database agent_test`）；`backend/tests/conftest.py` 只负责在里面建结构——session 级 fixture 连上后跑 `AUTH_STUB_SQL`（造 `auth.users` 与 `auth.uid()` 桩）与 `BUSINESS_SQL`（主库那份结构），再逐用例清表。库不存在时 pytest 会在该 fixture 直接 `InvalidCatalogNameError` 报错，不是 skip。
 
 再建两个**私有**桶 `files` 与 `knowledge`，然后跑 `deploy/storage.sql` 建 `storage.objects` 上的策略。**这一步必须等 Supabase 起过一次之后再做**——`storage` schema 与 `storage.foldername()` 由 storage-api 首次启动时自建，在那之前这个文件跑不了。
 
