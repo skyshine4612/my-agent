@@ -33,7 +33,7 @@ def make_call_sub_agent(model, registry, skill_names, context_budget, tool_resul
     async def call_sub_agent(
         task: Annotated[str, Field(description="交给子助手的完整子任务描述")],
     ) -> dict:
-        """把相互独立的子任务（如查交通、查景点、查美食）委派给独立上下文的子助手执行，子助手会自行调用工具并按业务规则处理，最终只返回结果摘要。当本轮需要多个相互独立的查询、或某个查询会返回大量数据（如几十个车次）时，应把这类子任务委派出去，避免主助手的上下文被大量工具结果淹没。"""
+        """把独立且过程长的子任务委派给独立上下文的子助手，只带回结论摘要，避免它的中间过程（多次工具调用与大量原始结果）占据主上下文。适用于互不相干、且各自都需要多轮查询才能答全的子任务；单个对象、或一次查询就能答的，直接调对应工具即可，委派只会更慢更贵。"""
         skill_directory = "\n".join(f"- {n}" for n in skill_names)
         sub_system = (
             "你是子助手，独立完成主助手委派给你的子任务，只返回最终结果，不要复述过程。\n"
