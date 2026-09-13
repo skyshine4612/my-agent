@@ -14,6 +14,7 @@ from langchain_core.tools import tool
 from pydantic import Field
 
 from app.core.agent import Agent
+from app.core.context import current_user_id
 from app.core.prompts import load_prompt, today_hint
 
 
@@ -44,6 +45,7 @@ def make_call_sub_agent(model, registry, skill_names, context_budget, tool_resul
         sub_tools = [t for t in registry.list_names() if t != "call_sub_agent"]
         # 子会话 id：独立 uuid，工具结果地址索引按子任务隔离，不混入主会话、不与其他子 Agent 冲突
         sub_conversation_id = uuid.uuid4().hex
+        user_id = current_user_id.get()
         try:
             sub = Agent(name="sub", system_prompt=sub_system, tools=sub_tools, model=model)
             # 隔离上下文：历史为空，只传 task；on_event=None 子 Agent 内部工具调用不上报前端
@@ -55,6 +57,6 @@ def make_call_sub_agent(model, registry, skill_names, context_budget, tool_resul
         finally:
             # 子任务结束（含异常）清理子会话工具结果地址索引，不留垃圾记录
             if tool_result_store is not None:
-                await tool_result_store.delete_conversation(sub_conversation_id)
+                await tool_result_store.delete_conversation(sub_conversation_id, user_id)
 
     return call_sub_agent
