@@ -636,3 +636,49 @@ async def test_critic_is_last_after_agent_middleware(monkeypatch):
                    or type(m).aafter_agent is not AgentMiddleware.aafter_agent]
     assert after_agent, "middleware 链里应有一个带 after_agent 的收口中间件"
     assert isinstance(after_agent[-1], _CriticMiddleware)
+
+
+# ---------------------------------------------------------------------------
+# 误抄检索标记的归一化：模型常把切片正文里的 【图13-2：熊猫塔】 原样抄进答案。
+# 那种标记对人没有意义，收敛成引用号 【图13-2】 才有机会被前端渲染成图。
+# ---------------------------------------------------------------------------
+
+def test_normalize_image_markers_strips_the_description():
+    assert agent_mod.normalize_image_markers("看这里。\n【图13-2：熊猫塔】\n") == "看这里。\n【图13-2】\n"
+
+
+def test_normalize_image_markers_leaves_a_bare_ref_untouched():
+    """模型自己就写对了引用号：不该被二次加工成别的东西。"""
+    assert agent_mod.normalize_image_markers("【图13-2】") == "【图13-2】"
+
+
+def test_normalize_image_markers_rewrites_every_occurrence():
+    assert agent_mod.normalize_image_markers("【图13-2：甲】和【图18-1：乙】") == "【图13-2】和【图18-1】"
+
+
+def test_normalize_image_markers_spans_a_multiline_description():
+    """描述被模型折了行也要整条收敛掉，否则正文里会留半截标记。"""
+    assert agent_mod.normalize_image_markers("【图13-2：熊猫塔\n夜景】") == "【图13-2】"
+
+
+def test_normalize_image_markers_leaves_plain_text_alone():
+    assert agent_mod.normalize_image_markers("熊猫塔高 69.8 米。") == "熊猫塔高 69.8 米。"
+
+
+@pytest.mark.asyncio
+async def test_run_stream_normalizes_leaked_image_markers():
+    """模型把切片里的长标记整条抄进答案时，返回值与下发的 token 都要是收敛后的形态 ——
+    归一化必须发生在答案定稿处，落库与下发才不会各带一份。"""
+    llm = StreamingLLM([
+        [{"type": "content", "text": "看这个。\n【图13-2：熊猫塔】\n"},
+         {"type": "end", "tool_calls": None}],
+    ])
+    a = Agent(name="t", system_prompt="s", tools=[], model=EventScriptChatModel(llm=llm))
+    events = []
+
+    async def on_event(e):
+        events.append(e)
+
+    out, _ = await a.run_stream("熊猫塔", [], FakeRegistry({}), on_event=on_event)
+    assert out == "看这个。\n【图13-2】\n"
+    assert "".join(e["content"] for e in events if e["type"] == "token") == "看这个。\n【图13-2】\n"

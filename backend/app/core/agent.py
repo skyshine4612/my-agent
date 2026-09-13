@@ -4,6 +4,7 @@
 # critic 事实校验与定向改写各落在一个中间件上，后者的环跑在收口钩子内部，对图不可见。
 import json
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Annotated, TypedDict
@@ -118,6 +119,22 @@ async def postprocess_tool_result(name, raw, tool_result_store, conversation_id,
     if note:
         return f"{text}[{note}]"
     return text
+
+
+# 切片正文里的图片标记带描述（【图13-2：熊猫塔】）：人工读得懂，模型却可能整条抄进答案
+_KB_MARKER_WITH_DESC = re.compile(r"【图(\d+-\d+)：[^】]*】")
+
+
+def normalize_image_markers(answer: str) -> str:
+    """把模型误抄进答案的检索标记 【图13-2：描述】 收敛成引用号 【图13-2】。
+
+    正文里出现**带描述**的标记一定是抄漏了格式：那种长标记对人没有意义，收敛成号才有
+    机会被前端换成图。已经写对的 【图13-2】 不含 "："，不受影响。
+
+    在 run_stream 的答案定稿收口处调用 —— ReAct 轮的答案与 critic 改写后的答案走的是
+    同一个收口，落库内容与下发的 token 因此自动一致。
+    """
+    return _KB_MARKER_WITH_DESC.sub(r"【图\1】", answer)
 
 
 def _tool_result_event(agent_name, name, label, tool_call_id, text, raw):
@@ -243,7 +260,8 @@ class _CriticMiddleware(AgentMiddleware):
                 + (
                     f"以下是本业务的规划规则与输出格式，修正后的答案必须同样遵守：\n{skill_guide}\n\n" if skill_guide else "")
                 + f"请基于以上工具结果直接输出修正后的最终答案（中文 Markdown）。"
-                  f"用户明确询问但工具没查到的关键信息，如实说明「该信息未查到」，不要编造；用户没问的字段不要罗列缺失。\n"
+                  f"用户明确询问但工具没查到的关键信息，如实说明「该信息未查到」，不要编造；用户没问的字段不要罗列缺失。"
+                  f"引用知识库图片时只能用本轮工具结果里出现过的编号（形如 【图13-2】），没把握就不要引用。\n"
                   f"修正要点：\n{json.dumps(issues, ensure_ascii=False)}"
         )
         msgs = [{"role": "system", "content": self.system_prompt}]
@@ -522,6 +540,8 @@ class Agent:
         # 判空用 None 而非空串：不调工具轮次即使 content 为空也算收敛（返回空串），
         # 只有「跑满额度仍每轮调工具」才落到下面的兜底文案
         if answer is not None:
+            # 误抄的检索标记在这一处收敛：落库内容与下发的 token 因此必然一致
+            answer = normalize_image_markers(answer)
             # 最终答案按小块上发（前端逐块渲染，保持流式感）
             for j in range(0, len(answer), 40):
                 await emit({"type": "token", "content": answer[j:j + 40]})

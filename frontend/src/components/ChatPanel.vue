@@ -2,10 +2,9 @@
 // ChatPanel.vue —— 通用对话面板：渲染 markdown 消息流 + 工具气泡 + 底部输入框
 import { ref } from 'vue'
 import { Promotion, Collection, Reading, ArrowDown, Paperclip } from '@element-plus/icons-vue'
-import { marked } from 'marked'
-import DOMPurify from 'dompurify'
 import type { ChatMessage, ToolEvent, StoredFile } from '@/types'
 import KnowledgeThumbs from '@/components/KnowledgeThumbs.vue'
+import MessageMarkdown from '@/components/MessageMarkdown.vue'
 
 // 父级传入的消息列表与流式状态，向上 emit 发送动作
 // streaming：是否在流式请求中（禁用输入）；thinking：是否在等待助手首字（显示呼吸点）
@@ -32,12 +31,8 @@ function submit() {
   draft.value = ''
 }
 
-// 把 markdown 文本渲染为安全的 HTML：先 marked 转 HTML，再 DOMPurify 清洗防 XSS
-function renderMarkdown(text: string): string {
-  // breaks: true 让单换行也渲染成 <br>：否则 LLM 输出里的单换行（如逐日安排、逐餐厅）会被吞掉挤成一行
-  const raw = marked.parse(text, { async: false, breaks: true }) as string
-  return DOMPurify.sanitize(raw)
-}
+// 一条消息的全部知识库图片：正文里的引用号在这批里查 key（与工具气泡下的缩略图同源）
+const imagesOf = (m: ChatMessage) => (m.tools ?? []).flatMap(t => t.images ?? [])
 
 // 工具气泡文案：label 是后端注册工具时给出的中文动作短语（如「查询火车票」），
 // 前端统一按执行状态拼「正在{label}… / 已{label}」，无 label 时回退英文名。
@@ -124,8 +119,10 @@ function pickFile(e: Event) {
               <!-- 知识库图片：与产物并列，但它不可下载，只做缩略图 -->
               <KnowledgeThumbs v-if="t.images?.length" :images="t.images" />
             </div>
-            <!-- markdown 正文（token 流式累积） -->
-            <div v-if="m.content" class="msg__markdown" v-html="renderMarkdown(m.content)"></div>
+            <!-- markdown 正文（token 流式累积）：知识库图片按正文里的引用号就地渲染 -->
+            <div v-if="m.content" class="msg__markdown">
+              <MessageMarkdown :content="m.content" :images="imagesOf(m)" />
+            </div>
           </div>
         </template>
 

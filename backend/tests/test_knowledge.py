@@ -233,8 +233,10 @@ async def test_search_knowledge_tool_returns_hits_and_images(kb, user_id):
     assert len(got["images"]) == 1
     assert got["images"][0]["desc"] == "西湖断桥"
     assert got["images"][0]["key"]                    # 真的带上了一个对象 key
-    # 只有 key 与 desc：图片字节留在 upload 那一步，不进 hit、更不进模型语料
-    assert set(got["images"][0]) == {"key", "desc"}
+    # key / desc / ref 三个键：图片字节留在 upload 那一步，不进 hit、更不进模型语料
+    assert set(got["images"][0]) == {"key", "desc", "ref"}
+    # 正文里的图被编了号，模型照这个号引用（号 = chunk 行 id - 块内下标）
+    assert f"【图{got['hits'][0]['id']}-1：西湖断桥】" in got["hits"][0]["content"]
 
 
 async def test_search_knowledge_tool_keeps_empty_branch(kb, user_id):
@@ -256,3 +258,80 @@ async def test_search_attaches_a_list_of_images(kb, user_id):
     hits = await store.search(user_id, "西湖")
     assert hits and isinstance(hits[0]["images"], list)
     assert hits[0]["images"][0]["desc"] == "西湖断桥"
+
+
+# ---- number_hit_images：给图编号并把编号写进正文 ----
+# 号是「chunk 行 id - 图在块内的下标(从 1 起)」。这个号是**持久**的：同一个 chunk 的
+# 同一张图永远得到同一个号，所以模型抄了历史回答里的号也不会指到另一张图上。
+# 换成「每轮从 1 开始」的临时编号，test_number_hit_images_ref_is_stable_across_calls 就会红。
+
+
+def _hit(chunk_id, content, images):
+    return {"id": chunk_id, "content": content, "images": images}
+
+
+def _numbered(hits):
+    from app.tools.knowledge import number_hit_images
+    return number_hit_images(hits)
+
+
+def test_number_hit_images_rewrites_marker_and_returns_ref():
+    hits = [_hit(13, "看这个。\n【图片：熊猫塔】\n", [{"key": "a/6.jpg", "desc": "熊猫塔"}])]
+    images = _numbered(hits)
+    assert "【图13-1：熊猫塔】" in hits[0]["content"]
+    assert images == [{"key": "a/6.jpg", "desc": "熊猫塔", "ref": "13-1"}]
+
+
+def test_number_hit_images_numbers_within_chunk_in_order():
+    hits = [_hit(7, "【图片：甲】【图片：乙】",
+                 [{"key": "a/1.jpg", "desc": "甲"}, {"key": "a/2.jpg", "desc": "乙"}])]
+    images = _numbered(hits)
+    assert hits[0]["content"] == "【图7-1：甲】【图7-2：乙】"
+    assert [i["ref"] for i in images] == ["7-1", "7-2"]
+
+
+def test_number_hit_images_pairs_identical_descs_by_position():
+    """两张图 desc 相同时，str.replace 会把两个 marker 都写成第一个图的号；
+    游标 + find 按位置配对才不会错配。"""
+    hits = [_hit(5, "【图片：同一张】【图片：同一张】",
+                 [{"key": "a/1.jpg", "desc": "同一张"}, {"key": "a/2.jpg", "desc": "同一张"}])]
+    images = _numbered(hits)
+    assert hits[0]["content"] == "【图5-1：同一张】【图5-2：同一张】"
+    assert [i["ref"] for i in images] == ["5-1", "5-2"]
+    assert [i["key"] for i in images] == ["a/1.jpg", "a/2.jpg"]
+
+
+def test_number_hit_images_skips_marker_that_is_gone():
+    """占位符被字符硬切切开时，images 列有条目而正文没有 marker：跳过，不瞎挂。"""
+    hits = [_hit(3, "正文里没有标记", [{"key": "a/1.jpg", "desc": "孤儿"}])]
+    images = _numbered(hits)
+    assert hits[0]["content"] == "正文里没有标记"
+    assert images == [{"key": "a/1.jpg", "desc": "孤儿"}]      # 仍在清单里，只是没有号
+
+
+def test_number_hit_images_leaves_upload_failure_unreferenced():
+    """上传失败的图没有 key：ref 只发给真能取到的图，免得模型去引用一张渲染不出来的图。"""
+    hits = [_hit(4, "【图片：传丢的图】", [{"key": None, "desc": "传丢的图"}])]
+    images = _numbered(hits)
+    assert images[0]["key"] is None
+    assert "ref" not in images[0]
+
+
+def test_number_hit_images_dedups_across_hits():
+    hits = [_hit(13, "【图片：熊猫塔】", [{"key": "a/6.jpg", "desc": "熊猫塔"}]),
+            _hit(18, "【图片：熊猫塔】", [{"key": "a/6.jpg", "desc": "熊猫塔"}])]
+    assert len(_numbered(hits)) == 1
+
+
+def test_number_hit_images_ref_is_stable_across_calls():
+    """号只由 chunk id 与块内位置决定，不依赖调用次数或任何全局计数器。"""
+    def build():
+        return [_hit(13, "【图片：熊猫塔】", [{"key": "a/6.jpg", "desc": "熊猫塔"}])]
+    assert _numbered(build())[0]["ref"] == _numbered(build())[0]["ref"] == "13-1"
+
+
+def test_number_hit_images_scopes_refs_per_chunk():
+    """不同 chunk 各自从 1 起，靠 chunk id 前缀区分，不会撞。"""
+    hits = [_hit(13, "【图片：甲】", [{"key": "a/1.jpg", "desc": "甲"}]),
+            _hit(17, "【图片：乙】", [{"key": "b/2.jpg", "desc": "乙"}])]
+    assert [i["ref"] for i in _numbered(hits)] == ["13-1", "17-1"]

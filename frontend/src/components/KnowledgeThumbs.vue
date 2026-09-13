@@ -18,12 +18,15 @@ watch(keys, (next, prev) => {
     for (const k of next) if (!shown.value.includes(k)) { shown.value.push(k); hold(k) }
 }, {immediate: true})
 
-const previewList = computed(() => shown.value.map(k => urls.value[k]).filter(Boolean))
+// 只渲染真的取到图的那些：hold 失败（文档已删 / 未登录 / 图被替换）时 urls[k] 是空的，
+// 而 el-image 的 error 插槽只在**加载失败**时触发 —— src 为空时它不会报错，只留一个空框
+const visible = computed(() => shown.value.filter(k => urls.value[k]))
+const previewList = computed(() => visible.value.map(k => urls.value[k]))
 </script>
 
 <template>
-  <div v-if="shown.length" class="thumbs">
-    <el-image v-for="(k, i) in shown" :key="k" :src="urls[k]"
+  <div v-if="visible.length" class="thumbs">
+    <el-image v-for="(k, i) in visible" :key="k" :src="urls[k]"
               :preview-src-list="previewList" :initial-index="i"
               :style="{width: `${size}px`, height: `${size}px`}"
               fit="cover" class="thumbs__item">

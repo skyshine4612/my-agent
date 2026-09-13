@@ -7,10 +7,13 @@ export interface StoredFile {
     size: number
 }
 
-// 知识库图片：key 是 Storage 对象 key（上传失败时为 null），desc 是多模态模型的描述
+// 知识库图片：key 是 Storage 对象 key（上传失败时为 null），desc 是多模态模型的描述，
+// ref 是正文里的引用号（chunk 行 id - 块内下标，如 "13-2"）—— 上传失败、或正文里没有
+// 对应标记的图没有 ref，也就永远不会被正文引用到
 export interface KnowledgeImage {
     key: string | null
     desc: string
+    ref?: string
 }
 
 // 工具事件：SSE 流中 tool_call / tool_result 的渲染单元
