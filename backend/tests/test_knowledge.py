@@ -7,7 +7,7 @@ import hashlib
 import pytest
 
 from app.core.db import rls_conn
-from app.core.knowledge import KnowledgeStore
+from app.core.knowledge import SIMILARITY_FLOOR, KnowledgeStore, filter_relevant
 from app.core.storage import BUCKET_KNOWLEDGE
 from tests.fake_storage import make_client
 
@@ -68,16 +68,37 @@ async def test_ingest_empty_text_writes_nothing(kb, user_id):
 
 
 async def test_search_ranks_by_similarity(kb, user_id):
-    """检索按余弦相似度降序（问西湖，西湖那块排第一），且 top_k 限制返回条数。"""
+    """检索按余弦相似度降序，且 top_k 限制返回条数。"""
     store, _ = kb(**_PER_PARA)
-    await store.ingest(user_id, "西湖值得去。\n\n火锅值得吃。\n\n长城值得爬。", title="攻略")
+    await store.ingest(user_id, "西湖值得去。\n\n西湖冬天最美。\n\n火锅值得吃。", title="攻略")
 
     hits = await store.search(user_id, "西湖怎么玩", top_k=3)
-    assert len(hits) == 3
-    assert "西湖" in hits[0]["content"]
-    assert hits[0]["similarity"] > hits[1]["similarity"]
-    # top_k 生效：库里有 3 条，要 1 条就只给 1 条
+    # 命中两块西湖；火锅那块与问题无关（假 embedder 下相似度 0），被相关性下限挡掉
+    assert len(hits) == 2
+    assert all("西湖" in h["content"] for h in hits)
+    # top_k 生效：库里有 2 块西湖，要 1 条就只给 1 条
     assert len(await store.search(user_id, "西湖", top_k=1)) == 1
+
+
+async def test_search_returns_nothing_when_nothing_is_relevant(kb, user_id):
+    """库里只有无关内容时返回空——这是 search_knowledge 回「知识库暂无相关内容」的唯一触发点。
+
+    没有这道门槛的话，match_documents 是纯 top-k、不问相关性，库里只要有数据就一定返回：
+    问苏州、库里全是成都，也会把成都的片段当「最相关」交给模型（见 SIMILARITY_FLOOR）。
+    """
+    store, _ = kb(**_PER_PARA)
+    await store.ingest(user_id, "火锅值得吃。", title="攻略")
+
+    assert await store.search(user_id, "西湖怎么玩", top_k=3) == []
+
+
+def test_filter_relevant_pins_the_floor():
+    """相关性下限的纯函数契约：低于门槛丢掉、缺 similarity 的按无关丢掉，不起库。"""
+    hits = [{"content": "相关", "similarity": 0.7},
+            {"content": "擦边", "similarity": SIMILARITY_FLOOR},
+            {"content": "无关", "similarity": 0.3},
+            {"content": "缺字段"}]
+    assert [h["content"] for h in filter_relevant(hits)] == ["相关", "擦边"]
 
 
 async def test_search_empty_library(kb, user_id):

@@ -16,6 +16,25 @@ from app.core.vision import ALLOWED_MIME
 
 logger = logging.getLogger(__name__)
 
+# 检索相关性下限：相似度低于它的片段不算命中。
+# 为什么必须有：match_documents 是纯 top-k（order by 距离 limit N）、没有任何门槛，
+# 所以**库里只要有一行就一定会返回 match_count 条**——问苏州、库里全是成都，也照样把
+# 成都的片段当「最相关」回来；而 grounding 又告诉模型知识库优先级高于其他查询工具，
+# 于是这些无关片段被当成权威资料写进答案，模型还会反复重搜找不存在的目标（实测 9 次）。
+# 实测取值：相关查询 ≥0.66（成都熊猫基地问句），无关查询 ≤0.40（苏州问句），取中间 0.5。
+# 语料只有一篇文档时测的，语料变大后这个数要重新看。
+SIMILARITY_FLOOR = 0.5
+
+
+def filter_relevant(hits: list[dict], floor: float = SIMILARITY_FLOOR) -> list[dict]:
+    """丢掉相似度低于下限的命中。
+
+    纯函数，便于不起库单测。distance 排序与 similarity 单调对应，所以对 top-k 结果
+    过滤等价于对全集过滤后再取前 k——不会漏掉「排在前面的无关、排在后面的相关」这种情形。
+    缺 similarity 字段的条目按 0 处理（当无关丢掉），不让它因为缺字段蒙混过关。
+    """
+    return [h for h in hits if (h.get("similarity") or 0) >= floor]
+
 
 def _source_key(source_url: str) -> str:
     """source_url 的短哈希，图片目录的第一段。
@@ -168,6 +187,10 @@ class KnowledgeStore:
     async def search(self, user_id, query, top_k=3) -> list[dict]:
         """语义检索 top-k，返回 [{id, title, content, source_url, similarity, images}]。
 
+        过了相关性下限（见 SIMILARITY_FLOOR）才返回，所以**可能少于 top_k 条、也可能是空的**
+        —— 空的时候 search_knowledge 会回「知识库暂无相关内容」，这正是 grounding 里那条
+        「没有就改用专用工具」的触发点。
+
         **不动 match_documents**：命中后再补一条 images 查询即可，同一个事务里拿到同一份快照。
         改函数要 drop 再建，而且 hits 形状一变，模型语料与 critic 语料会跟着一起变 ——
         那不该混进一次存储改造。
@@ -178,7 +201,8 @@ class KnowledgeStore:
                 "select id, title, content, source_url, similarity "
                 "from match_documents($1::vector, $2)",
                 to_vector_literal(vec), top_k)
-            hits = [dict(r) for r in rows]
+            # 先过相关性下限再取图：低于门槛的片段不算命中，后面也就不用为它查图
+            hits = filter_relevant([dict(r) for r in rows])
             imgs = await conn.fetch(
                 "select id, images from documents where id = any($1::bigint[])",
                 [h["id"] for h in hits])
