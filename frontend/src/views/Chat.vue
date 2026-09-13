@@ -76,8 +76,13 @@ async function send(text: string) {
   // 懒创建：首条 token 或首个工具事件到达时才生成助手消息，避免空轮次留下空白气泡
   const ensureAssistant = (): ChatMessage => {
     if (!current) {
-      current = { id: nextId(), role: 'assistant', content: '', tools: [] }
-      messages.value.push(current)
+      messages.value.push({ id: nextId(), role: 'assistant', content: '', tools: [] })
+      // 必须取回数组里的**响应式代理**，不能留着刚 push 进去的那个裸对象。
+      // 后面所有累积（content += / tools.push / status / result / phase）都改它，
+      // 而改裸对象不经过 Vue 的 set 代理、不触发重渲染——数据是对的，界面不刷新；
+      // 只有别处有真响应式变动（如点开气泡、phase 变化）时才顺带把攒下的改动刷出来。
+      // 表现就是「SSE 像有延迟、子任务内容要点一下才出现」。
+      current = messages.value[messages.value.length - 1]!
     }
     return current
   }
@@ -92,8 +97,15 @@ async function send(text: string) {
           refreshConversations()
           break
         case 'status':
-          // 工具调用结束后的各阶段（整理/核对/修正）：映射成文案展示，避免 critic 等阶段长静默
-          phase.value = PHASE_LABELS[ev.status] ?? ''
+          // 工具调用结束后的各阶段（整理/核对/修正）：映射成文案展示，避免 critic 等阶段长静默。
+          // 带 parent 的是子 Agent 的阶段，写到对应委派节点上而不是全局——否则并行子任务的状态
+          // 会互相覆盖着闪，且看起来像主答案在核对事实
+          if (ev.parent) {
+            const node = current?.tools?.find(t => t.id === ev.parent)
+            if (node) node.phase = PHASE_LABELS[ev.status] ?? ''
+          } else {
+            phase.value = PHASE_LABELS[ev.status] ?? ''
+          }
           break
         case 'token':
           // 逐字增量：追加到助手消息 content；答案开始输出，结束「整理中」状态
@@ -103,24 +115,29 @@ async function send(text: string) {
           break
         case 'tool_call':
           // 工具调用：追加一个气泡（带 id，供 tool_result 精确配对），稍后回填摘要；工具进度替代「整理中」呼吸点
-          ensureAssistant().tools!.push({ tool: ev.tool, label: ev.label, args: ev.args, id: ev.id })
+          ensureAssistant().tools!.push({ tool: ev.tool, label: ev.label, args: ev.args, id: ev.id,
+                                          agent: ev.agent, parent: ev.parent })
           assistantOutput.value = true
           phase.value = ''
           break
         case 'tool_result': {
           // 回填结果：优先按 id 精确匹配（同名工具并发也不串），id 缺失时回退按工具名。
+          // 回退分支额外要求 agent 相同：主 Agent 和子 Agent 可能调同名工具，只比名字会串配。
           // （不调用 ensureAssistant，避免无匹配时新建 content/tools 全空的气泡）
           if (!current) break
           const list = current.tools!
           for (let i = list.length - 1; i >= 0; i--) {
             const t = list[i]!
             if (t.status) continue
-            const matched = ev.id ? t.id === ev.id : t.tool === ev.tool
+            const matched = ev.id ? t.id === ev.id : (t.tool === ev.tool && t.agent === ev.agent)
             if (matched) {
               t.status = ev.status
               t.result = ev.result
               t.artifacts = ev.artifacts   // 脚本产物：渲染成下载卡片
               t.images = ev.images         // 知识库图片：渲染成缩略图
+              // 委派节点收工：清掉子任务的阶段文案，改由状态点（转绿）表示完成，
+              // 否则节点上会挂着一句过期的「核对事实」
+              if (t.phase) t.phase = ''
               assistantOutput.value = true
               break
             }
@@ -269,8 +286,15 @@ function parseAssistantContent(content: string): { content: string; tools?: Tool
     const o = JSON.parse(content)
     if (o && typeof o === 'object' && typeof o.content === 'string') {
       // 过滤历史脏数据：tools 里可能混入 null / 非对象 / tool 非字符串的条目，
-      // 保留形状合法的元素，避免渲染「调用 undefined」气泡
-      return { content: o.content, tools: Array.isArray(o.tools) ? o.tools.filter((t: any) => t && typeof t.tool === 'string') : undefined }
+      // 保留形状合法的元素，避免渲染「调用 undefined」气泡。
+      // 归一化两处：① 落库时后端把 id 存成 tool_call_id，不归一的话子任务的 parent 就配不上
+      // 委派节点、层级展示在刷新后失效；② phase 是流式瞬态，刷新后不该还挂着「核对事实」
+      const tools = Array.isArray(o.tools)
+        ? o.tools
+            .filter((t: any) => t && typeof t.tool === 'string')
+            .map((t: any) => ({ ...t, id: t.id ?? t.tool_call_id, phase: undefined }))
+        : undefined
+      return { content: o.content, tools }
     }
   } catch {
     /* 非 JSON 文本，忽略 */

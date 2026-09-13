@@ -26,6 +26,17 @@ export interface ToolEvent {
     status?: boolean
     result?: string
     id?: string
+    // 产出这个调用的是哪个 Agent：主 Agent 为 'assistant'，委派出去的子 Agent 为 'sub'。
+    // 子 Agent 的工具调用与主 Agent 走同一条 SSE，靠这个字段区分层级
+    agent?: string
+    // 归属键：子 Agent 的事件带上发起它的那次 call_sub_agent 的 id，前端据此把子任务的
+    // 工具气泡与阶段状态挂到对应的委派节点下（并行委派时靠它区分是哪个子任务）
+    parent?: string
+    // 委派节点的当前阶段（整理中/核对事实/修正答案）：随子 Agent 的 status 事件更新，
+    // 是流式瞬态，刷新后从历史还原时不恢复
+    phase?: string
+    // 后端落库时把 id 存成 tool_call_id（供组装 role=tool 消息配对），还原历史时由前端归一成 id
+    tool_call_id?: string
     // 脚本产物：沙箱里生成、后端写回会话文件目录的文件，渲染成下载卡片
     artifacts?: StoredFile[]
     // 知识库图片：与 artifacts 并列的侧信道，渲染成缩略图（不可下载）

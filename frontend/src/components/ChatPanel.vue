@@ -39,11 +39,26 @@ const imagesOf = (m: ChatMessage) => (m.tools ?? []).flatMap(t => t.images ?? []
 // （后端每次 save 产新 file_id），无需去重
 const artifactsOf = (m: ChatMessage) => (m.tools ?? []).flatMap(t => t.artifacts ?? [])
 
+// 委派标题：模型给的短标题，截断兜底（schema 里要求 8 字以内，但不保证它守约）
+const TITLE_MAX = 12
+const titleOf = (t: ToolEvent) => String(t.args?.title ?? '').slice(0, TITLE_MAX)
+
+// 工具气泡的稳定 key：优先用 tool_call_id（刷新后由 Chat.vue 归一成 id），没有则退回下标。
+// 展开态与嵌套都靠它配对，用下标的话子任务插进来会串
+const keyOf = (m: ChatMessage, t: ToolEvent, i: number) => `${m.id}-${t.id ?? i}`
+
+// 某次委派派出去的子 Agent 的工具调用：按 parent 归位，所以三个并行子任务各自成组，
+// 不受事件到达顺序影响
+const childrenOf = (m: ChatMessage, t: ToolEvent) =>
+  (m.tools ?? []).filter(c => c.parent != null && c.parent === t.id)
+
 // 工具气泡文案：label 是后端注册工具时给出的中文动作短语（如「查询火车票」），
 // 前端统一按执行状态拼「正在{label}… / 已{label}」，无 label 时回退英文名。
+// 委派气泡额外带上 title——并行委派时只靠「委派子任务」四个字分不清哪个是哪个
 function toolLabel(t: ToolEvent, done: boolean): string {
-  const name = t.label || t.tool
-  return done ? `已${name}` : `正在${name}…`
+  const title = t.tool === 'call_sub_agent' ? titleOf(t) : ''
+  const name = (t.label || t.tool) + (title ? ` · ${title}` : '')
+  return done ? `已${name}` : `${name}…`
 }
 
 // 展开的工具气泡 key 集合（`消息id-工具索引`），点击气泡切换展开/收起 result
@@ -52,6 +67,35 @@ function toggleTool(key: string) {
   const next = new Set(expanded.value)
   next.has(key) ? next.delete(key) : next.add(key)
   expanded.value = next
+}
+
+// 委派气泡与普通工具气泡的默认态相反，所以两个集合分开记：
+// - 委派节点（call_sub_agent）是「容器」，下面挂着一整块子任务进度，**默认展开**——
+//   默认收起的话运行期间就只剩一个光秃秃的气泡，看不到子 Agent 在干什么。
+// - 普通工具是「叶子」，**默认收起**（点一下才看结果），否则每个工具结果都铺开。
+const collapsed = ref<Set<string>>(new Set())
+function toggleCollapse(key: string) {
+  const next = new Set(collapsed.value)
+  next.has(key) ? next.delete(key) : next.add(key)
+  collapsed.value = next
+}
+
+// 委派气泡与普通工具气泡的点击含义不同：前者收放整块，后者显隐自身结果
+const isDelegation = (t: ToolEvent) => t.tool === 'call_sub_agent'
+
+// 有没有可展开的东西：没有就别给手型光标、点了也别切状态，否则「能点但没反应」
+const canToggle = (t: ToolEvent) => isDelegation(t) || !!(t.result || t.images?.length)
+
+function toggleNode(m: ChatMessage, t: ToolEvent, i: number) {
+  if (!canToggle(t)) return
+  const key = keyOf(m, t, i)
+  isDelegation(t) ? toggleCollapse(key) : toggleTool(key)
+}
+
+// 节点当前是否展开（决定展开区显示与箭头朝向）
+function isOpen(m: ChatMessage, t: ToolEvent, i: number): boolean {
+  const key = keyOf(m, t, i)
+  return isDelegation(t) ? !collapsed.value.has(key) : expanded.value.has(key)
 }
 
 // 文件大小展示：附件条与产物卡片共用
@@ -102,20 +146,45 @@ function pickFile(e: Event) {
             <div class="msg__label">助手</div>
             <!-- 工具进度：显示在答案之前，一行简洁中文文案 + 状态点（执行中闪烁 / 完成变绿）；
                  完成态可点击展开查看完整（截断版）结果 result -->
-            <div v-for="(t, i) in m.tools ?? []" :key="i" class="tool-wrap">
-              <div class="tool" @click="toggleTool(`${m.id}-${i}`)">
-                <span class="tool__status" :class="t.status ? 'tool__status--done' : 'tool__status--run'"></span>
-                <span class="tool__name">{{ toolLabel(t, !!t.status) }}</span>
-                <span v-if="t.status && t.result" class="tool__caret" :class="{ 'tool__caret--open': expanded.has(`${m.id}-${i}`) }">
-                  <el-icon><ArrowDown /></el-icon>
-                </span>
+            <template v-for="(t, i) in m.tools ?? []" :key="keyOf(m, t, i)">
+              <!-- 主 Agent 自己的工具气泡；带 parent 的是子 Agent 的条目，放到对应委派节点下渲染 -->
+              <div v-if="!t.parent" class="tool-wrap">
+                <div class="tool" :class="{ 'tool--static': !canToggle(t) }" @click="toggleNode(m, t, i)">
+                  <span class="tool__status" :class="t.status ? 'tool__status--done' : 'tool__status--run'"></span>
+                  <span class="tool__name">{{ toolLabel(t, !!t.status) }}</span>
+                  <span v-if="t.phase" class="tool__phase">{{ t.phase }}</span>
+                  <!-- 委派节点永远显示箭头（总有一整块子任务进度可收）；普通工具要有结果才显 -->
+                  <span v-if="isOpen(m, t, i) || t.result || t.images?.length" class="tool__caret"
+                        :class="{ 'tool__caret--open': isOpen(m, t, i) }">
+                    <el-icon><ArrowDown /></el-icon>
+                  </span>
+                </div>
+                <!-- 展开区：委派节点默认展开（子任务进度常驻可见，点一下整块收起）；普通工具默认收起 -->
+                <template v-if="isOpen(m, t, i)">
+                  <div v-if="t.result" class="tool__result">
+                    <pre>{{ t.result }}</pre>
+                  </div>
+                  <!-- 知识库图片：检索到的图，不可下载、只做缩略图。与完整结果共用气泡的展开态——
+                       一次检索可能回十几张，常显会把对话刷成图墙；正文里引用的那几张由
+                       MessageMarkdown 就地渲染，才是给用户看的 -->
+                  <KnowledgeThumbs v-if="t.images?.length" :images="t.images" />
+                  <!-- 委派出去的子 Agent：它自己的 ReAct 进度（工具调用 + 阶段状态）缩进挂在这一层 -->
+                  <div v-for="(c, j) in childrenOf(m, t)" :key="keyOf(m, c, j)" class="tool-wrap tool-wrap--sub">
+                    <div class="tool" :class="{ 'tool--static': !canToggle(c) }" @click="toggleTool(keyOf(m, c, j))">
+                      <span class="tool__status" :class="c.status ? 'tool__status--done' : 'tool__status--run'"></span>
+                      <span class="tool__name">{{ toolLabel(c, !!c.status) }}</span>
+                      <span v-if="c.status && (c.result || c.images?.length)" class="tool__caret" :class="{ 'tool__caret--open': expanded.has(keyOf(m, c, j)) }">
+                        <el-icon><ArrowDown /></el-icon>
+                      </span>
+                    </div>
+                    <div v-if="expanded.has(keyOf(m, c, j)) && c.result" class="tool__result">
+                      <pre>{{ c.result }}</pre>
+                    </div>
+                    <KnowledgeThumbs v-if="expanded.has(keyOf(m, c, j)) && c.images?.length" :images="c.images" />
+                  </div>
+                </template>
               </div>
-              <div v-if="expanded.has(`${m.id}-${i}`) && t.result" class="tool__result">
-                <pre>{{ t.result }}</pre>
-              </div>
-              <!-- 知识库图片：检索到的图，不可下载、只做缩略图，属于「过程」故留在工具气泡下 -->
-              <KnowledgeThumbs v-if="t.images?.length" :images="t.images" />
-            </div>
+            </template>
             <!-- markdown 正文（token 流式累积）：知识库图片按正文里的引用号就地渲染 -->
             <div v-if="m.content" class="msg__markdown">
               <MessageMarkdown :content="m.content" :images="imagesOf(m)" />
@@ -358,9 +427,12 @@ function pickFile(e: Event) {
   border: 1px solid var(--border);
   padding: 6px 10px;
 }
-/* 工具进度：一行简洁文案 + 状态点（执行中闪烁 / 完成变绿），完成态可点击展开 result */
+/* 工具进度：一行简洁文案 + 状态点（执行中闪烁 / 完成变绿），完成态可点击展开 result。
+   用 width 而不是 max-width：外层 .msg--assistant 是 align-items:flex-start 的纵向 flex，
+   子项宽度默认由内容决定（fit-content）——写成 max-width 时气泡会贴着文案宽度，展开后
+   被 result 的长文本撑开，折叠/展开之间宽度跳变几百像素。定宽后宽度与内容无关。 */
 .tool-wrap {
-  max-width: 82%;
+  width: 82%;
   margin-top: 8px;
 }
 .tool {
@@ -373,8 +445,11 @@ function pickFile(e: Event) {
   background: var(--surface);
   cursor: pointer;
 }
+/* 还没有可展开的内容（如工具执行中、无结果无图）：不给手型光标，点了也不会切状态 */
+.tool--static {
+  cursor: default;
+}
 .tool__caret {
-  margin-left: auto;
   color: var(--text-secondary);
   flex-shrink: 0;
   display: flex;
@@ -418,6 +493,32 @@ function pickFile(e: Event) {
   font-weight: 600;
   color: var(--text);
   white-space: nowrap;
+  /* 名称右侧吸收全部空白，把后面的阶段文案与展开箭头一起推到最右（两者都有时也能并排） */
+  margin-right: auto;
+  /* 气泡现在是定宽，标签（动作 + 委派标题）过长时会溢出；min-width:0 是 flex 里能缩到
+     内容宽度以下的前提，否则 overflow 不生效、省略号出不来 */
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* 子 Agent 的工具调用：缩进一级 + 左侧竖线，表达「它跑在委派出去的那个子任务里」。
+   width 必须回 auto：父级已经是定宽，若这里再取父级的 82%，每深一层就被缩掉一次
+   （实测父子宽度比 0.86），子任务反而比父节点还窄。auto 就是填满父级内容盒。 */
+.tool-wrap--sub {
+  width: auto;
+  margin-left: 20px;
+  border-left: 2px solid var(--border);
+  padding-left: 8px;
+}
+.tool-wrap--sub .tool {
+  padding: 4px 10px;
+}
+/* 委派节点的阶段文案（整理中/核对事实/修正答案）：贴在节点右侧 */
+.tool__phase {
+  font-size: 12px;
+  color: var(--text-secondary);
+  flex-shrink: 0;
+  margin-right: 8px;
 }
 .msg__phase {
   display: flex;
