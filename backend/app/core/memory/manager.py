@@ -43,9 +43,8 @@ def _record_from_msg(m):
     """把 OpenAI 消息转成短期记忆表记录（写回用），_expand_record 的逆操作（tool 占位不落表）。"""
     if m["role"] == "assistant" and m.get("tool_calls"):
         return {"role": "assistant",
-                "content": json.dumps({"tool_calls": m["tool_calls"]}, ensure_ascii=False),
-                "tool_call_id": None}
-    return {"role": m["role"], "content": m.get("content") or "", "tool_call_id": None}
+                "content": json.dumps({"tool_calls": m["tool_calls"]}, ensure_ascii=False)}
+    return {"role": m["role"], "content": m.get("content") or ""}
 
 
 def _serialize_for_summary(msgs):
@@ -109,14 +108,13 @@ class MemoryManager:
         rounds 是 ReAct 每轮的 tool_calls 列表（[[tc, ...], ...]），按轮次各存一条 assistant(tool_calls)；
         tool 结果与 tool 占位消息都不落表，喂 LLM 时由 _expand_record 动态生成空串占位配对。
         """
-        records = [{"role": "user", "content": user_message, "tool_call_id": None}]
+        records = [{"role": "user", "content": user_message}]
         for calls in (rounds or []):
             if not calls:
                 continue
             records.append({"role": "assistant",
-                            "content": json.dumps({"tool_calls": calls}, ensure_ascii=False),
-                            "tool_call_id": None})
-        records.append({"role": "assistant", "content": answer, "tool_call_id": None})
+                            "content": json.dumps({"tool_calls": calls}, ensure_ascii=False)})
+        records.append({"role": "assistant", "content": answer})
         await self.short_term_memory.append_records(user_id, conv_id, records)
 
     async def assemble_history(self, user_id, conv_id):
@@ -161,7 +159,7 @@ class MemoryManager:
             # 写回：summary + 剩余消息（物理删除早期回合，删除即增量，无需 marker）
             write_records = []
             if summary:
-                write_records.append({"role": "summary", "content": summary, "tool_call_id": None})
+                write_records.append({"role": "summary", "content": summary})
             write_records.extend(_record_from_msg(m) for m in recent if m["role"] != "tool")
             await self.short_term_memory.replace_records(user_id, conv_id, write_records)
         return recent, summary

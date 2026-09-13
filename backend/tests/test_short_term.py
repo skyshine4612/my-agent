@@ -74,20 +74,20 @@ async def test_cascade_delete_on_conversation(user_id, new_conversation):
 
 
 @pytest.mark.asyncio
-async def test_append_records_with_tool(user_id, new_conversation):
-    """append_records 追加消息（不清空旧记录），tool 消息带 tool_call_id。"""
+async def test_append_records_keeps_order_and_content(user_id, new_conversation):
+    """append_records 追加消息，按写入顺序取回（role 与 content 原样保留）。"""
     s = ShortTermMemory()
     cid = await new_conversation()
     await s.append_records(user_id, cid, [
-        {"role": "user", "content": "问", "tool_call_id": None},
-        {"role": "assistant", "content": '{"tool_calls":[]}', "tool_call_id": None},
-        {"role": "tool", "content": "结果", "tool_call_id": "c1"},
-        {"role": "assistant", "content": "答", "tool_call_id": None},
+        {"role": "user", "content": "问"},
+        {"role": "assistant", "content": '{"tool_calls":[]}'},
+        {"role": "tool", "content": "结果"},
+        {"role": "assistant", "content": "答"},
     ])
     got = await s.get_records(user_id, cid)
     assert [r["role"] for r in got] == ["user", "assistant", "tool", "assistant"]
-    assert got[2]["tool_call_id"] == "c1"
     assert got[2]["content"] == "结果"
+    assert got[3]["content"] == "答"
 
 
 class _CapturingLLM:

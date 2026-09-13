@@ -40,7 +40,6 @@ create table if not exists short_term_memory(
     conversation_id text not null references conversations(id) on delete cascade,
     role            text,
     content         text,
-    tool_call_id    text,
     created_at      timestamptz default now()
 );
 create index if not exists stm_conv_idx on short_term_memory(conversation_id, id);
