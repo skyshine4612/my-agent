@@ -274,11 +274,6 @@ def _make_svc(tmp_path, monkeypatch, chat_model=None):
     monkeypatch.setattr(UapisDataSource, "get_weather", fake_weather)
     svc = AgentService()
     svc.chat_model = chat_model if chat_model is not None else _verdict_model(ok=True)
-
-    async def noop(user_id, conv_id):
-        pass
-
-    svc._extract_facts = noop
     return svc
 
 
