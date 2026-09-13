@@ -1,7 +1,7 @@
 <script setup lang="ts">
 // ChatPanel.vue —— 通用对话面板：渲染 markdown 消息流 + 工具气泡 + 底部输入框
 import { ref } from 'vue'
-import { Promotion, Collection, Reading, ArrowDown, Paperclip } from '@element-plus/icons-vue'
+import { Promotion, Collection, Reading, ArrowDown, Paperclip, Document } from '@element-plus/icons-vue'
 import type { ChatMessage, ToolEvent, StoredFile } from '@/types'
 import KnowledgeThumbs from '@/components/KnowledgeThumbs.vue'
 import MessageMarkdown from '@/components/MessageMarkdown.vue'
@@ -33,6 +33,11 @@ function submit() {
 
 // 一条消息的全部知识库图片：正文里的引用号在这批里查 key（与工具气泡下的缩略图同源）
 const imagesOf = (m: ChatMessage) => (m.tools ?? []).flatMap(t => t.images ?? [])
+
+// 一条消息的全部脚本产物（artifacts 字段）：从各工具上摊平，渲染到正文之后的「生成的文件」区块。
+// 它是交付物不是过程，不挂在工具气泡里；一个产物只挂在执行它的那个 tool 上
+// （后端每次 save 产新 file_id），无需去重
+const artifactsOf = (m: ChatMessage) => (m.tools ?? []).flatMap(t => t.artifacts ?? [])
 
 // 工具气泡文案：label 是后端注册工具时给出的中文动作短语（如「查询火车票」），
 // 前端统一按执行状态拼「正在{label}… / 已{label}」，无 label 时回退英文名。
@@ -92,7 +97,7 @@ function pickFile(e: Event) {
             </div>
           </div>
 
-          <!-- 助手消息：工具进度（上）+ markdown 正文（下），按时间顺序「先查询、后回答」 -->
+          <!-- 助手消息：工具进度（上）+ markdown 正文（中）+ 产物（下），按「先查询、后回答、最后交付」排列 -->
           <div v-else class="msg msg--assistant">
             <div class="msg__label">助手</div>
             <!-- 工具进度：显示在答案之前，一行简洁中文文案 + 状态点（执行中闪烁 / 完成变绿）；
@@ -108,20 +113,23 @@ function pickFile(e: Event) {
               <div v-if="expanded.has(`${m.id}-${i}`) && t.result" class="tool__result">
                 <pre>{{ t.result }}</pre>
               </div>
-              <!-- 脚本产物：直接给下载入口（产物是文件，不能让用户自己去读一段文本） -->
-              <div v-if="t.artifacts?.length" class="artifact">
-                <div v-for="a in t.artifacts" :key="a.file_id" class="artifact__item" @click="emit('download', a)">
-                  <span class="artifact__name">{{ a.name }}</span>
-                  <span class="artifact__size">{{ formatSize(a.size) }}</span>
-                  <span class="artifact__action">下载</span>
-                </div>
-              </div>
-              <!-- 知识库图片：与产物并列，但它不可下载，只做缩略图 -->
+              <!-- 知识库图片：检索到的图，不可下载、只做缩略图，属于「过程」故留在工具气泡下 -->
               <KnowledgeThumbs v-if="t.images?.length" :images="t.images" />
             </div>
             <!-- markdown 正文（token 流式累积）：知识库图片按正文里的引用号就地渲染 -->
             <div v-if="m.content" class="msg__markdown">
               <MessageMarkdown :content="m.content" :images="imagesOf(m)" />
+            </div>
+            <!-- 生成的文件：独立交付物区块，挂在正文之后。文件一生成就渲染，不等本轮 done ——
+                 工具执行完文件就在了，而正文之后还要过 critic 校验，没道理让用户干等 -->
+            <div v-if="artifactsOf(m).length" class="artifacts">
+              <div class="artifacts__title">生成的文件</div>
+              <div v-for="a in artifactsOf(m)" :key="a.file_id" class="artifact" @click="emit('download', a)">
+                <el-icon class="artifact__icon"><Document /></el-icon>
+                <span class="artifact__name">{{ a.name }}</span>
+                <span class="artifact__size">{{ formatSize(a.size) }}</span>
+                <span class="artifact__action">下载</span>
+              </div>
             </div>
           </div>
         </template>
@@ -476,14 +484,18 @@ function pickFile(e: Event) {
   gap: 12px;
   align-items: flex-end;
 }
-/* 产物下载卡片：挂在工具气泡下方 */
-.artifact {
-  margin: 4px 0 0 12px;
+/* 生成的文件：独立交付物区块，挂在正文之后（不跟着工具气泡走） */
+.artifacts {
+  margin-top: 12px;
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: 6px;
 }
-.artifact__item {
+.artifacts__title {
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+.artifact {
   display: flex;
   align-items: center;
   gap: 8px;
@@ -494,8 +506,11 @@ function pickFile(e: Event) {
   font-size: 13px;
   cursor: pointer;
 }
-.artifact__item:hover {
+.artifact:hover {
   border-color: var(--accent);
+}
+.artifact__icon {
+  color: var(--text-secondary);
 }
 .artifact__name {
   flex: 1;
