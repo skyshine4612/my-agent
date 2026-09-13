@@ -20,8 +20,7 @@ def _collect_file_refs(node, known, referenced) -> None:
     """递归找出 params 里引用了会话文件的字符串，把名字记进 referenced。
 
     **不改写值**：模型在清单里看到的名字就是沙箱 work_dir 里的名字，命中与否字符串都一样。
-    这消掉了旧设计「命中就把 file_id 拼成 <uuid>.xlsx」的误伤面——`out_name: "已脱敏.xlsx"`
-    恰好等于上一轮产物的名字，旧逻辑会把它拼成 `已脱敏.xlsx.xlsx`。
+    所以 `out_name: "客户名单_脱敏.xlsx"` 照原样进沙箱，不会被拼成 `客户名单_脱敏.xlsx.xlsx`。
 
     文件由沙箱写进本次执行自己的 work_dir（每次执行一个 uuid 目录），路径经 stdin 交给脚本，
     所以这里只给裸文件名，由脚本 join(work_dir, name) 定位——工具侧不该猜沙箱的目录布局。

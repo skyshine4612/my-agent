@@ -108,9 +108,9 @@ async def test_file_id_shape_is_not_resolved(env):
 
 
 async def test_name_equal_to_an_artifact_is_not_rewritten(env):
-    """值恰好等于某个产物名时不再被改装。
+    """值恰好等于某个产物名时原样传进沙箱。
 
-    旧设计「命中就把 file_id 拼上扩展名」会把 out_name="已脱敏.xlsx" 改成 "已脱敏.xlsx.xlsx"。
+    `out_name="已脱敏.xlsx"` 进去还是 `已脱敏.xlsx`，不会被拼成 `已脱敏.xlsx.xlsx`。
     """
     store, scripts, uid, cid = env
     await store.save(uid, cid, "已脱敏.xlsx", b"x", source="script:excel/desensitize")

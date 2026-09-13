@@ -136,6 +136,16 @@ def _safe_name(name):
     return name if name.lower().endswith(".xlsx") else f"{name}.xlsx"
 
 
+def _default_out_name(source_name):
+    """默认产物名：原文件名加 `_脱敏` 后缀。
+
+    一次会话里处理多个表时，产物名各跟着自己的来源走才不会撞在一起。扩展名统一是
+    .xlsx，原件的扩展名不参与，只取主名。
+    """
+    base = os.path.splitext(os.path.basename(_text(source_name)))[0]
+    return f"{base}_脱敏.xlsx"
+
+
 def main():
     payload = json.load(sys.stdin)
     args, work_dir, out_dir = payload["args"], payload["work_dir"], payload["out_dir"]
@@ -170,7 +180,7 @@ def main():
         for pos, value in enumerate(row):
             ws.cell(row=new_row_no, column=pos + 1).value = value
 
-    out_name = _safe_name(args.get("out_name") or "已脱敏.xlsx")
+    out_name = _safe_name(args.get("out_name") or _default_out_name(path))
     wb.save(os.path.join(out_dir, out_name))
     print(json.dumps({
         "sheet": sheet_name,

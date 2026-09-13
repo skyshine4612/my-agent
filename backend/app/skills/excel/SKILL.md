@@ -33,7 +33,7 @@ description: 处理 Excel（.xlsx）文件：先看表结构，再按列做字�
    }
    ```
 
-   产物默认叫「已脱敏.xlsx」，可用 `out_name` 改；原件不会被改动。
+   产物默认叫「<原文件名>_脱敏.xlsx」，可用 `out_name` 改；原件不会被改动。
 
 ## rule 可选值
 

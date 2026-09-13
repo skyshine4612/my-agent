@@ -112,6 +112,21 @@ def test_resolve_lists_available_files_when_missing(tmp_path):
             load(script)._resolve({}, str(tmp_path))
 
 
+def test_default_out_name_follows_the_original_name():
+    """产物名跟着原文件名走：一次会话里处理多个表时，产物名不会撞在一起。"""
+    d = load("desensitize")
+    assert d._default_out_name("测试数据.xlsx") == "测试数据_脱敏.xlsx"
+    # 传进来的可能带目录（_resolve 的结果），命名只看文件名
+    assert d._default_out_name("/tmp/w/客户名单.xlsx") == "客户名单_脱敏.xlsx"
+
+
+def test_default_out_name_keeps_a_long_chinese_name():
+    """长中文名原样保留：这是文件名，不是要截断展示的样本值。"""
+    name = "2026年第三季度华东区销售明细汇总表（含税、已审核版）.xlsx"
+    assert load("desensitize")._default_out_name(name) == \
+        "2026年第三季度华东区销售明细汇总表（含税、已审核版）_脱敏.xlsx"
+
+
 def test_summarize_sheet_reads_columns_and_samples():
     i = load("inspect")
     rows = [["姓名", "联系电话"], ["张三", "13812341234"], ["李四", "13900001111"]]
