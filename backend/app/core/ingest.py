@@ -15,7 +15,8 @@ logger = logging.getLogger(__name__)
 # 图片占位符：正文里留住图的位置，描述生成后原地回填
 _IMAGE_MARK = r"\x00IMG\d+\x00"
 
-# 提取用 trafilatura 的默认配置，**刻意不覆盖 MIN_EXTRACTED_SIZE**：主提取结果短于该值时，
+# 提取用 trafilatura 的默认配置（只关 include_comments，见该参数处的注释），
+# **刻意不覆盖 MIN_EXTRACTED_SIZE**：主提取结果短于该值时，
 # 它会拿 baseline() 的扁平 <p> 纯文本整个替换掉结果 —— 正文捞得更多，标题与图片却一起没了。
 # 曾把它调到 800 想让「主提取只抓到几百字导航就当成功」的页面进兜底链，实测三组页面
 # （导航淹没正文、导航页、正文 400 字的图集页）里 800 档一次都没多捞到正文，只把带图的
@@ -78,7 +79,8 @@ def _normalize(text: str) -> str:
 def extract_with_images(html: str, base_url: str = "") -> tuple[str, list[str]]:
     """HTML → (带图片占位的正文, 按出现顺序的图片 URL 列表)。
 
-    正文由 trafilatura 按默认配置提取（为什么不改配置见文件头），本函数只把它输出的
+    正文由 trafilatura 提取，**只关掉 include_comments 一项**（理由见该参数处的注释；
+    其余仍走默认配置，为什么不调 MIN_EXTRACTED_SIZE 见文件头），本函数只把它输出的
     markdown 转成建库管道要的形状。base_url 传页面地址：trafilatura 靠它启用站点特定规则。
     """
     md = trafilatura.extract(
@@ -88,8 +90,9 @@ def extract_with_images(html: str, base_url: str = "") -> tuple[str, list[str]]:
         include_tables=True,
         include_images=True,
         include_links=True,
-        # 攻略页的「用户问答」落在评论区容器里，对检索有价值，不按噪音丢弃
-        include_comments=True,
+        # 丢评论区：trafilatura 默认收，但攻略站的评论区主要是「5分 超棒 举报点赞」这类点评，
+        # 没有检索价值，还会稀释正文块。
+        include_comments=False,
     ) or ""
     text, images = markdown_to_text(md, base_url)
     return _normalize(text), images
