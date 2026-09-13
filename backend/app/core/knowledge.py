@@ -10,7 +10,7 @@ import uuid
 from app.core.chunking import chunk_units
 from app.core.db import rls_conn
 from app.core.embedding import embed_batched, get_embedding, to_vector_literal
-from app.core.ingest import assign_images, scrub_marks
+from app.core.ingest import assign_images, image_mark, scrub_marks
 from app.core.storage import BUCKET_KNOWLEDGE
 from app.core.vision import ALLOWED_MIME
 
@@ -102,7 +102,7 @@ class KnowledgeStore:
         contents = []
         for chunk, imgs in zip(chunks, buckets):
             for img in imgs:
-                chunk = chunk.replace(f"\x00IMG{img['n']}\x00", f"【图片：{img['desc']}】")
+                chunk = chunk.replace(image_mark(img["n"]), f"【图片：{img['desc']}】")
             contents.append(scrub_marks(chunk))
 
         name = title or source_url or "未命名"

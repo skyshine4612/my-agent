@@ -12,8 +12,22 @@ from app.core.vision import describe_images
 
 logger = logging.getLogger(__name__)
 
-# 图片占位符：正文里留住图的位置，描述生成后原地回填
-_IMAGE_MARK = r"\x00IMG\d+\x00"
+# 图片占位符：正文里留住图的位置，描述生成后原地回填。
+# **必须只占一个字符**——字符硬切的最小粒度就是字符，1 个字符内部没有可下刀的缝隙，
+# 切点只能落在它左边或右边。曾用 `\x00IMG{n}\x00`（6 字符、内部 5 个缝隙）：实测扫 200 个
+# 落点有 1 个正好骑在切点上，那一块只含前半截，`replace` 找不到完整串就跳过，图片描述
+# 无声消失且不报错。单字符把这件事从「低概率」变成「结构性不可能」。
+_PUA_START = 0xE000
+_MARK_RE = re.compile(f"[{chr(_PUA_START)}-{chr(_PUA_START + 0x18FF)}]")
+
+
+def image_mark(n: int) -> str:
+    """第 n 张图的占位符：一个私用区字符（U+E000 起，共 6400 个）。
+
+    私用区在正常网页正文里不会出现，拿它当标记不会与正文撞车。
+    """
+    return chr(_PUA_START + n)
+
 
 # 提取用 trafilatura 的默认配置（只关 include_comments，见该参数处的注释），
 # **刻意不覆盖 MIN_EXTRACTED_SIZE**：主提取结果短于该值时，
@@ -63,7 +77,7 @@ def markdown_to_text(md: str, base_url: str = "") -> tuple[str, list[str]]:
         url = _image_url(m.group(1), base_url)
         if not _keep_image(url):
             continue
-        parts.append(f"\x00IMG{len(images)}\x00")
+        parts.append(image_mark(len(images)))
         images.append(url)
     parts.append(md[last:])
     text = _MD_LINK.sub(r"\1", "".join(parts))
@@ -104,12 +118,12 @@ def extract_text(html: str, base_url: str = "") -> str:
     段落边界与 chunk_text 的切分粒度对齐，抓下来的正文可以直接进切块管道。
     """
     text, _ = extract_with_images(html, base_url)
-    return re.sub(_IMAGE_MARK, "", text)
+    return _MARK_RE.sub("", text)
 
 
 def _mark_offsets(text: str) -> dict[int, int]:
     """占位符序号 → 它在正文里的起始偏移。"""
-    return {int(m.group()[4:-1]): m.start() for m in re.finditer(_IMAGE_MARK, text)}
+    return {ord(m.group()) - _PUA_START: m.start() for m in _MARK_RE.finditer(text)}
 
 
 def _chunk_of(spans: list[tuple[int, int]], offset: int) -> int | None:
@@ -125,10 +139,9 @@ def _chunk_of(spans: list[tuple[int, int]], offset: int) -> int | None:
 def assign_images(text: str, images: list[dict], spans: list[tuple[int, int]]) -> list[list[dict]]:
     """把图片按「起始偏移落在哪一块」挂到唯一一块，返回与 spans 等长的列表。
 
-    为什么不用「占位符穿过 chunk_text、切完逐块扫」：`chunk_text` 的字符硬切分支
-    （piece = sent[i:i + chunk_size]）会把 8 字符的 \\x00IMG3\\x00 从中间切开，前半截留在
-    上一块、匹配不上完整占位符，\\x00 就原样进了 documents.content —— asyncpg 直接抛
-    「a str must not contain null bytes」，丢的不是一张图而是整篇，且表现为「偶发抓取失败」。
+    为什么不用「占位符穿过 chunk_text、切完逐块扫」：硬切级带 overlap，重叠区里的占位符
+    会同时出现在相邻两块里，逐块扫就把它挂两遍、图片描述在正文里重复一遍。偏移法天然
+    只挂一块（跨边界归第一块）。
 
     找不到对应占位符的图（describe_images 内部 urls[:MAX_IMAGES] 会让 IMG10+ 无人回填）
     直接跳过，不瞎挂。
@@ -146,11 +159,13 @@ def assign_images(text: str, images: list[dict], spans: list[tuple[int, int]]) -
 
 
 def scrub_marks(chunk: str) -> str:
-    """入库前兜底清掉占位符与 \\x00 残留。**不可省略**：
+    """入库前兜底清掉没被回填的占位符。**不可省略**：
 
-    除了 IMG10+，硬切分支切开的半截占位符也靠它兜住 —— 留下一个 \\x00 就是整篇 502。
+    模型描述有 MAX_IMAGES 上限，排在后面的图没人回填，占位符会原样留在正文里。
+    \\x00 也一并挡掉：正常网页文本不该有它，但 asyncpg 会抛「a str must not contain
+    null bytes」——丢的不是一张图，是整篇。
     """
-    return re.sub(_IMAGE_MARK, "", chunk).replace("\x00", "")
+    return _MARK_RE.sub("", chunk).replace("\x00", "")
 
 
 def _fetch_html_sync(url: str) -> tuple[str, str]:
@@ -180,15 +195,16 @@ def _fetch_html_sync(url: str) -> tuple[str, str]:
             browser.close()
 
 
-async def _describe_images_indexed(urls: list[str], referer: str = "") -> list[dict]:
+async def _describe_images_indexed(urls: list[str], referer: str = "",
+                                   context: str = "") -> list[dict]:
     """描述图片并附上它在正文里的占位符序号。
 
     原始序号用 enumerate 保住：describe_images 内部会 urls[:MAX_IMAGES]，返回列表比 urls 短，
-    但前 N 张的序号仍与占位符 \\x00IMG{i}\\x00 一一对应。
+    但前 N 张的序号仍与占位符 image_mark(i) 一一对应。context 是页面标题，转给模型做判定。
     """
     if not urls:
         return []
-    results = await describe_images(urls, referer=referer)
+    results = await describe_images(urls, referer=referer, context=context)
     return [{"n": i, "desc": r["desc"], "data": r["data"], "mime": r["mime"]}
             for i, r in enumerate(results) if r["desc"]]
 
@@ -207,7 +223,7 @@ async def fetch_url_text(url: str) -> tuple[str, str, list[dict]]:
     started = time.monotonic()
     title, html = await asyncio.to_thread(_fetch_html_sync, url)
     text, urls = extract_with_images(html, url)
-    images = await _describe_images_indexed(urls, referer=url)
+    images = await _describe_images_indexed(urls, referer=url, context=title)
     logger.info("[知识库] 抓取完成 url=%s 正文 %d 字，图片候选 %d 张，拿到描述 %d 张，耗时 %.1fs",
                 url, len(text), len(urls), len(images), time.monotonic() - started)
     return title, text, images

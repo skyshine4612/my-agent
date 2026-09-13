@@ -1,15 +1,67 @@
 # tests/test_vision.py
 # 图片转文字的降级路径测试：不依赖网络与真实模型，下载/调用失败都必须退化成空条目而不是抛。
+from types import SimpleNamespace
+
 from app.core.vision import MAX_IMAGES, describe_images
 
 # 失败/无信息时的统一样子：描述为空、字节为 None、mime 为空
 EMPTY = {"desc": "", "data": None, "mime": ""}
 
 
+class _RecordingCompletions:
+    """假 completions：记下收到的请求参数，返回一个最小可用的响应对象。"""
+
+    def __init__(self):
+        self.kwargs = None
+
+    async def create(self, **kwargs):
+        self.kwargs = kwargs
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="西湖断桥"))])
+
+
+async def test_describe_pins_temperature_to_zero():
+    """判定必须确定：实测同一份图片字节连调 3 次，「无有效信息」的结论会摇摆。
+
+    那不是模型能力问题，是采样——同一张栖息架上的小熊猫图三次里有一次判成装饰图，而判成
+    装饰图会连字节一起丢（不进正文、不进桶），于是「同一页面抓两次图片不一样」。这个参数
+    删掉不报错、只是慢慢失效，所以拿测试钉住。
+    """
+    from app.core.vision import OpenAICompatVision
+
+    vision = OpenAICompatVision(base_url="http://example.invalid", api_key="k", model="m")
+    recorder = _RecordingCompletions()
+    vision.client = SimpleNamespace(chat=SimpleNamespace(completions=recorder))
+
+    assert await vision.describe(b"ximage", "image/jpeg") == "西湖断桥"
+    assert recorder.kwargs["temperature"] == 0
+
+
+async def test_describe_passes_page_title_into_the_prompt():
+    """页面标题是判定的关键依据：实测同一份图片字节，不带标题时熊猫照片 5 次里会摇摆
+    （丢留丢丢丢），带上标题后 5 次全稳定保留 —— 「这张图对页面主题有没有用」只有知道
+    页面讲什么才判得出来。"""
+    from app.core.vision import OpenAICompatVision
+
+    vision = OpenAICompatVision(base_url="http://example.invalid", api_key="k", model="m")
+    recorder = _RecordingCompletions()
+    vision.client = SimpleNamespace(chat=SimpleNamespace(completions=recorder))
+
+    await vision.describe(b"ximage", "image/jpeg", context="成都大熊猫繁育研究基地游玩攻略")
+    text = recorder.kwargs["messages"][0]["content"][0]["text"]
+    assert "成都大熊猫繁育研究基地游玩攻略" in text
+    assert "{title}" not in text
+
+
+def test_vision_prompt_lives_in_prompts_dir():
+    """提示词不写在代码里：改文案不该动 Python（system / grounding / critic 都这么放）。"""
+    from app.core.prompts import load_prompt
+    assert "{title}" in load_prompt("vision")
+
+
 class _FakeVision:
     """假多模态客户端：永远返回固定描述（真实识别能力由端到端验证覆盖）。"""
 
-    async def describe(self, image, mime="image/jpeg"):
+    async def describe(self, image, mime="image/jpeg", context=""):
         return "西湖断桥的雪景"
 
 
@@ -40,7 +92,7 @@ async def test_describe_images_returns_bytes_and_mime(monkeypatch):
     monkeypatch.setattr(V, "_download", fake_download)
 
     class FakeVision:
-        async def describe(self, image, mime):
+        async def describe(self, image, mime, context=""):
             return "西湖断桥"
 
     got = await V.describe_images(["http://a/1.png"], vision=FakeVision())
@@ -57,7 +109,7 @@ async def test_describe_images_drops_useless_image_entirely(monkeypatch):
     monkeypatch.setattr(V, "_download", fake_download)
 
     class FakeVision:
-        async def describe(self, image, mime):
+        async def describe(self, image, mime, context=""):
             return "无有效信息"
 
     got = await V.describe_images(["http://a/1.jpg"], vision=FakeVision())

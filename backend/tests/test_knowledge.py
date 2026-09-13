@@ -7,6 +7,7 @@ import hashlib
 import pytest
 
 from app.core.db import rls_conn
+from app.core.ingest import image_mark
 from app.core.knowledge import SIMILARITY_FLOOR, KnowledgeStore, filter_relevant
 from app.core.storage import BUCKET_KNOWLEDGE
 from tests.fake_storage import make_client
@@ -24,10 +25,10 @@ def _img(n=0, desc="西湖断桥"):
 
 
 def _text(head: str) -> str:
-    """带 IMG0 占位符的正文。图片靠占位符的**偏移**才能挂上块，
+    """带第 0 张图占位符的正文。图片靠占位符的**偏移**才能挂上块，
     所以凡是要验「图进了桶」或「旧目录被回收」的用例，正文里必须有它 ——
     没有占位符时 assign_images 一张都挂不上，断言会变成对空集的空转。"""
-    return f"\x00IMG0\x00{head}" + "甲。" * 300
+    return f"{image_mark(0)}{head}" + "甲。" * 300
 
 
 @pytest.fixture
@@ -133,7 +134,7 @@ async def test_delete_by_source_removes_all_chunks(kb, user_id):
 
 async def test_ingest_uploads_images_and_links_them_to_a_chunk(kb, user_id):
     store, fake = kb()
-    text = "甲。\x00IMG0\x00\n\n" + "乙。" * 400
+    text = f"甲。{image_mark(0)}\n\n" + "乙。" * 400
     await store.ingest(user_id, text, title="杭州", source_url="http://a/1",
                        images=[_img()])
     bucket, key = next(iter(fake.objects))
@@ -147,15 +148,15 @@ async def test_ingest_uploads_images_and_links_them_to_a_chunk(kb, user_id):
     assert rows[0]["images"] == [{"key": key, "desc": "西湖断桥"}]
     assert "【图片：西湖断桥】" in rows[0]["content"]
     # 占位符与 \x00 一个都不许留
+    assert all(image_mark(0) not in r["content"] for r in rows)
     assert all("\x00" not in r["content"] for r in rows)
-    assert all("IMG" not in r["content"] for r in rows)
 
 
 async def test_ingest_without_source_url_skips_images(kb, user_id):
     """source_url 可空：图片目录的第一段就是它的哈希，没有它就没有归属，
     硬编一个反而留下永远回收不了的对象。"""
     store, fake = kb()
-    await store.ingest(user_id, "甲。\x00IMG0\x00", title="t", images=[_img()])
+    await store.ingest(user_id, f"甲。{image_mark(0)}", title="t", images=[_img()])
     assert fake.objects == {}
     async with rls_conn(user_id) as conn:
         rows = await conn.fetch("select content, images from documents")
@@ -170,7 +171,7 @@ async def test_ingest_image_upload_failure_only_loses_the_image(kb, user_id, mon
         raise RuntimeError("storage down")
 
     monkeypatch.setattr(store.storage, "put", boom)
-    n = await store.ingest(user_id, "甲。\x00IMG0\x00", title="t",
+    n = await store.ingest(user_id, f"甲。{image_mark(0)}", title="t",
                            source_url="http://a/1", images=[_img()])
     assert n == 1
     async with rls_conn(user_id) as conn:

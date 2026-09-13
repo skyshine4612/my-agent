@@ -4,18 +4,54 @@
 from app.core.ingest import extract_text, extract_with_images, markdown_to_text
 
 
+def _marks(count: int = 1) -> str:
+    """count 张图的占位符串。由实现产出，测试不硬编码它长什么样。"""
+    md = "".join(f"![图](https://a.com/{i}.jpg)" for i in range(count))
+    return markdown_to_text(md)[0]
+
+
+def test_placeholder_is_a_single_character():
+    """占位符只有一个字符——硬切的最小粒度是字符，1 个字符内部没有可下刀的缝隙。"""
+    assert len(_marks(1)) == 1
+    assert len(_marks(8)) == 8
+
+
+def test_hard_cut_never_splits_a_placeholder():
+    """扫遍所有落点：单字符占位符不可能被硬切切开，图必能回填到它归属的那一块。
+
+    这是「图片描述无声消失」的护栏。旧实现用 8 字符占位符，硬切有 7 个缝隙可能下刀；
+    切开后 `chunk.replace` 找不到完整串就跳过，正文里那张图的描述就没了，且不报错。
+    1 个字符内部没有缝隙——结构性为 0，不是概率变低（2 字符实测也是 0 次，但那是样本
+    没压到，不是切不开）。
+    """
+    from app.core.chunking import chunk_spans, chunk_text
+    from app.core.ingest import assign_images
+
+    mark = _marks(1)
+    misses = []
+    for prefix_len in range(0, 1400, 7):
+        # 图文同段 + 无标点 + 超长：逼出字符硬切那一级，且让占位符正好骑在切点上
+        body = "字" * prefix_len + "\n" + mark + "\n" + "尾" * 900
+        chunks = chunk_text(body, 600, 100)
+        got = assign_images(body, [{"n": 0, "desc": "西湖"}], chunk_spans(body, 600, 100))
+        i = next((i for i, g in enumerate(got) if g), None)
+        if i is None or mark not in chunks[i]:
+            misses.append(prefix_len)
+    assert misses == []
+
+
 def test_markdown_image_becomes_placeholder():
     """图片换成占位符，让描述回填在文中真实位置而不是全堆到文末。"""
     text, images = markdown_to_text("前文\n\n![配图](https://cdn.example.com/a.jpg)\n\n后文")
     assert images == ["https://cdn.example.com/a.jpg"]
-    assert text == "前文\n\n\x00IMG0\x00\n\n后文"
+    assert text == f"前文\n\n{_marks()}\n\n后文"
 
 
 def test_multiple_images_get_sequential_placeholders():
     """占位符序号即图片下标，顺序不能错位。"""
     text, images = markdown_to_text("![一](https://a.com/1.jpg)![二](https://a.com/2.jpg)")
     assert images == ["https://a.com/1.jpg", "https://a.com/2.jpg"]
-    assert text == "\x00IMG0\x00\x00IMG1\x00"
+    assert text == _marks(2)
 
 
 def test_drops_svg_and_unreachable_images():
@@ -74,7 +110,7 @@ def test_extract_with_images_returns_both():
     html = f'<html><body><article>{body}<img src="https://cdn.example.com/a.jpg"></article></body></html>'
     text, images = extract_with_images(html, "https://example.com/guide/hz")
     assert images == ["https://cdn.example.com/a.jpg"]
-    assert "\x00IMG0\x00" in text
+    assert _marks(1) in text
 
 
 def test_short_article_keeps_headings_and_images():
@@ -103,23 +139,18 @@ def test_short_article_keeps_headings_and_images():
     text, images = extract_with_images(html, "https://example.com/guide/hz")
     assert images == ["https://cdn.example.com/1.jpg", "https://cdn.example.com/2.jpg"]
     assert "# 西湖三日游攻略" in text
-    assert "\x00IMG0\x00" in text
+    assert _marks(1) in text
 
 
-def test_scrub_marks_never_leaves_null_bytes():
-    """要守的不变量只有一条：**输出里没有 \\x00**。
+def test_scrub_marks_removes_leftover_placeholders_and_null_bytes():
+    """清掉没被回填的占位符（模型描述有 MAX_IMAGES 上限，排在后面的图没人回填）。
 
-    它会让 asyncpg 抛「a str must not contain null bytes」——丢的不是一张图，是整篇。
-
-    半截占位符的残留字母（`前\\x00IM` 里的 `IM`、`G3\\x00后` 里的 `G3`）刻意不清理：
-    想同时吃掉前后两种残尾就得写一条会误伤正文的正则，而它们在按字符计的语料里可以忽略。
+    要守的不变量：**输出里没有 null 字节** —— asyncpg 抛「a str must not contain
+    null bytes」，丢的不是一张图，是整篇。
     """
     from app.core.ingest import scrub_marks
-    assert scrub_marks("前\x00IMG3\x00后") == "前后"      # 完整占位符整体消失
-    assert scrub_marks("前\x00IM") == "前IM"              # 硬切留下的半截：\x00 走，字母留
-    assert scrub_marks("G3\x00后") == "G3后"
-    for s in ("前\x00IMG3\x00后", "前\x00IM", "G3\x00后", "\x00", "IMG3\x00"):
-        assert "\x00" not in scrub_marks(s)
+    assert scrub_marks(f"前{_marks(1)}后") == "前后"      # 完整占位符整体消失
+    assert scrub_marks("前\x00后") == "前后"             # 任何来源的 null 字节也挡掉
 
 
 def test_assign_images_puts_image_in_the_chunk_holding_its_offset():
@@ -127,7 +158,7 @@ def test_assign_images_puts_image_in_the_chunk_holding_its_offset():
     from app.core.chunking import chunk_spans
     from app.core.ingest import assign_images
 
-    text = "甲。\x00IMG0\x00\n\n乙。丙。丁。戊。己。庚。辛。壬。癸。"
+    text = f"甲。{_marks(1)}\n\n乙。丙。丁。戊。己。庚。辛。壬。癸。"
     spans = chunk_spans(text, 12, 2)
     assert len(spans) >= 2
     got = assign_images(text, [{"n": 0, "desc": "西湖"}], spans)
@@ -139,20 +170,6 @@ def test_assign_images_puts_image_in_the_chunk_holding_its_offset():
 def test_assign_images_skips_images_without_a_mark():
     """describe_images 会 urls[:MAX_IMAGES]，IMG10+ 的图没有对应的占位符 —— 不能瞎挂。"""
     from app.core.ingest import assign_images
-    text = "甲。\x00IMG0\x00乙。"
+    text = f"甲。{_marks(1)}乙。"
     got = assign_images(text, [{"n": 0, "desc": "a"}, {"n": 9, "desc": "b"}], [(0, len(text))])
     assert got == [[{"n": 0, "desc": "a"}]]
-
-
-def test_offset_method_survives_a_hard_cut_placeholder():
-    """硬切把占位符切成两半时，\\x00 绝不进块文本 —— 这条是整篇 502 的护栏。"""
-    from app.core.chunking import chunk_spans, chunk_text
-    from app.core.ingest import assign_images, scrub_marks
-
-    text = "甲" * 8 + "\x00IMG0\x00" + "乙" * 8
-    spans = chunk_spans(text, 10, 2)
-    got = assign_images(text, [{"n": 0, "desc": "西湖"}], spans)
-    # 图归到含它起始位置的那一块（跨边界归第一块）
-    assert [i for i, g in enumerate(got) if g] == [0]
-    for chunk in chunk_text(text, 10, 2):
-        assert "\x00" not in scrub_marks(chunk)
