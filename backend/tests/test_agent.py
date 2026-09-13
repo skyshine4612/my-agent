@@ -346,12 +346,10 @@ async def test_parallel_tool_calls_keep_order_and_ids():
 
 
 @pytest.mark.asyncio
-async def test_model_sees_user_message_last():
-    """模型所见窗口的布局：本轮用户指令在最末尾。
+async def test_model_sees_messages_in_state_order():
+    """无摘要时模型所见 = state 原序：用户指令停在注入位置，其后的工具交互跟在后面。
 
-    用户指令压在最后是刻意设计（保持最新、不被淘汰）；state 只追加，故这条顺序由
-    _WorkingMemoryMiddleware.awrap_model_call 在「模型所见」这一层复位 —— 它直接决定模型
-    实际读到的 prompt，丢了等于静默改了提示词。
+    中间件只在有摘要时往里补一段，其余消息一律不动 —— 这条顺序直接决定模型读到的 prompt。
     """
     llm = StreamingLLM([
         [{"type": "end", "tool_calls": [{"id": "c1", "function": {"name": "w", "arguments": "{}"}}]}],
@@ -361,9 +359,9 @@ async def test_model_sees_user_message_last():
     a = Agent(name="t", system_prompt="s", tools=["w"], model=EventScriptChatModel(llm=llm))
     out, _ = await a.run_stream("go", [], reg)
     assert out == "done"
-    # 第二轮模型调用所见：system → assistant(tool_calls) → tool → user，用户指令压在最后
-    assert [m["role"] for m in llm.calls[1]] == ["system", "assistant", "tool", "user"]
-    assert llm.calls[1][-1]["content"] == "go"
+    # 第二轮模型调用所见：system → user → assistant(tool_calls) → tool
+    assert [m["role"] for m in llm.calls[1]] == ["system", "user", "assistant", "tool"]
+    assert llm.calls[1][1]["content"] == "go"
 
 
 @pytest.mark.asyncio
@@ -420,10 +418,10 @@ def test_recursion_limit_is_pinned_at_60():
 
 @pytest.mark.asyncio
 async def test_model_sees_distilled_summary_before_kept_window():
-    """淘汰轮的布局：蒸馏摘要在保留窗口之前，用户指令仍在最后。
+    """淘汰轮的模型所见：摘要插在用户指令之后、保留窗口之前。
 
-    摘要位置不是纯显示问题：窗口布局变了，_units() 的切分跟着变，之后每轮的淘汰对象与
-    working_evicted_units / working_distill_calls 就会跟着变。
+    摘要喂给 fit 时置于窗口最前（见 abefore_model），那才是影响 _units() 切分的位置 ——
+    它变了，之后每轮的淘汰对象与 working_evicted_units / working_distill_calls 就会跟着变。
     """
     llm = StreamingLLM([
         [{"type": "end", "tool_calls": [{"id": "c1", "function": {"name": "big", "arguments": "{}"}}]}],
@@ -438,9 +436,9 @@ async def test_model_sees_distilled_summary_before_kept_window():
     out, _ = await a.run_stream("go", [], reg, context_budget=600)
     assert out == "done"
     last = llm.calls[3]  # 答案轮的模型所见（calls[2] 是淘汰单元的蒸馏调用）
-    assert [m["role"] for m in last] == ["system", "system", "assistant", "tool", "user"]
-    assert last[1]["content"] == "[早期交互摘要] 早期摘要"  # 摘要在保留窗口之前
-    assert last[-1]["content"] == "go"  # 用户指令在最后
+    assert [m["role"] for m in last] == ["system", "user", "system", "assistant", "tool"]
+    assert last[1]["content"] == "go"  # 用户指令保持原位
+    assert last[2]["content"] == "[早期交互摘要] 早期摘要"  # 摘要插在它之后、保留窗口之前
 
 
 # ---------------------------------------------------------------------------

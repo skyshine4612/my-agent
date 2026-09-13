@@ -278,12 +278,24 @@ class _CriticMiddleware(AgentMiddleware):
 
 
 class _ToolExecMiddleware(AgentMiddleware):
-    """工具执行中间件：完全短路框架的工具执行路径，自己执行工具并回填 tool 消息 + 本轮事实。
+    """工具执行中间件：图里「执行单个工具」这一步的实际执行者。
 
-    为什么完全不调 handler：handler 就是真实执行路径（ToolNode → tool.ainvoke），
-    「先 handler 再自己执行」会让工具被执行两次 —— 对 train_ticket_query 这类外部配额工具是双倍消耗。
-    代价是绕过 ToolNode 的注入参数/内层错误处理/响应格式化，故这里自行复刻：
-    错误回填（异常转文本回喂 LLM，而非炸掉整轮）与 ToolMessage 自建。
+    create_agent 的工具节点删不掉、只能在外面包一层，awrap_tool_call 就是那层包。本类不做，下面这些
+    就没有别的落点：上报 tool_call / tool_result 事件（前端工具气泡的唯一来源）、结构化截断 + 超限
+    结果 spill 落盘、工具异常脱敏后转文本回喂模型（不炸整轮）、把本轮事实写进 state 的自定义键
+    （tool_results / hard_results / rounds，critic 校验与短期记忆落库都读它们）。框架默认路径只回填
+    ToolMessage，上述一件都不做。
+
+    handler 与自己是二选一，不是前后两步：handler 就是框架自带的执行实现（ToolNode → tool.ainvoke）。
+    调它再自己跑一遍 = 每个工具执行两次（train_ticket_query 这类外部配额接口双倍消耗）；只调它则
+    上面那些全丢。
+
+    自己执行另有一处必要：registry.call_raw 不 str()，上游才能按类型结构化截断（list 前 20 条 /
+    dict 前 20 键）；ToolNode 会把结果 normalize 成消息内容，结构信息就没了。
+
+    并行调度与 tool 消息顺序仍归框架：同一轮多个 tool_calls 每个各过一遍本钩子，本类只管其中一个。
+    代价是 ToolNode 原先代劳的事得自己补：异常接住转成文本回喂、ToolMessage 自建；它另外做的参数
+    注入本项目用不上，没复刻。
     """
 
     def __init__(self, agent_name, registry, emit, conversation_id=None,
@@ -365,13 +377,13 @@ class _ToolExecMiddleware(AgentMiddleware):
 
 class _WorkingMemoryMiddleware(AgentMiddleware):
     """工作记忆中间件：每轮模型调用前按 token 预算淘汰最老的工具交互（超预算时 LLM 蒸馏成摘要兜底），
-    并把「模型所见窗口」复位成「固定头 → 淘汰摘要 → 保留窗口 → 本轮用户指令」。
+    并把蒸馏摘要补进模型所见。
 
     淘汰只裁剪「本轮可变窗口」——最后一条 user 消息之后的消息，即本轮的工具交互；
     固定头（system prompt / 历史摘要）与短期记忆（历史原文）不参与淘汰。
 
-    布局复位只在「模型所见」这一层做，不动 state：state 只追加（用户指令停在原位、摘要只能追加到
-    末尾），若为了凑顺序去改 state，rounds / 落库 / 淘汰单元切分都会跟着漂。
+    摘要由本 middleware 持有、只在「模型所见」这一层补，state 不动。它不能进 state：进了就落在
+    窗口里、被 fit 当成淘汰单元，而 state 只追加、也摆不到「被淘汰那批交互原来的位置」。
     """
 
     def __init__(self, wm=None):
@@ -409,17 +421,15 @@ class _WorkingMemoryMiddleware(AgentMiddleware):
         return {"messages": [RemoveMessage(id=m.id) for m in evicted]}
 
     async def awrap_model_call(self, request, handler):
-        # 模型所见 = 框架的 system prompt（request.system_message）+ request.messages，这里只重排后者
-        messages = list(request.messages)
-        humans = [i for i, m in enumerate(messages) if isinstance(m, HumanMessage)]
-        if not humans:
+        # 模型所见 = 框架的 system prompt（request.system_message）+ request.messages；这里只补摘要
+        if self.summary is None:
             return await handler(request)
-        last_user = humans[-1]
-        # 模型所见布局：固定头与历史 → 淘汰摘要 → 保留窗口 → 本轮用户指令（末尾）
-        ordered = (messages[:last_user]
-                   + ([SystemMessage(content=self.summary)] if self.summary else [])
-                   + messages[last_user + 1:]
-                   + [messages[last_user]])
+        messages = list(request.messages)
+        # 摘要插在最后一条 user 之后：它替代的是被淘汰的那批交互，位置跟着窗口走，其余消息保持原序
+        start = max((i for i, m in enumerate(messages) if isinstance(m, HumanMessage)), default=-1)
+        ordered = (messages[:start + 1]
+                   + [SystemMessage(content=self.summary)]
+                   + messages[start + 1:])
         return await handler(request.override(messages=ordered))
 
 
@@ -491,7 +501,7 @@ class Agent:
                                           conversation_id=conversation_id,
                                           tool_result_store=tool_result_store,
                                           user_id=current_user_id.get()),
-                      # 即使不淘汰（wm 为 None）也要挂：它同时负责复位「模型所见窗口」的布局
+                      # wm 为 None 时没有淘汰也没有摘要，本中间件是空操作
                       _WorkingMemoryMiddleware(wm)]
         if critic is not None:
             # 挂在末尾：收口链按「middleware 列表末尾 → 列表开头」的顺序执行，排在末尾才最先跑
