@@ -46,8 +46,10 @@ class _TurnState:
 class AgentService:
     """多业务通用 service：装配会话历史 + 短期/长期记忆 + LLM + 数据源，驱动「通用 agent → 工具 → critic 校验」链路。
 
-    单层架构 + 标准 skill 两段式：顶层 agent 直接调用各业务工具（不再委派子 agent）；
-    system prompt 只注入「可用业务清单」（name+description），业务规则正文由 get_skill 工具按需加载。
+    单层架构 + 标准 skill 两段式：顶层 agent 直接调用各业务工具；system prompt 只注入
+    「可用业务清单」（name+description），业务规则正文由 get_skill 工具按需加载。
+    「单层」指委派只有一层——顶层 agent 可用 call_sub_agent 把整块独立工作交给子 Agent，
+    子 Agent 的工具集不含 call_sub_agent 自己，不会继续下钻。
     """
 
     def __init__(self):
@@ -104,10 +106,15 @@ class AgentService:
         register_knowledge_tools(registry, self.knowledge)
         # run_skill_script：在沙箱里跑仓库里已评审的脚本（需要沙箱客户端 + 文件存储 + 脚本索引）
         register_script_tools(registry, self.sandbox, self.file_store, self.skill_scripts)
-        # 注册 call_sub_agent（子 Agent 委派，需要模型 + skill 清单 + 工具结果地址索引，只能在 service 层注册）
+        # 注册 call_sub_agent（子 Agent 委派，需要模型 + skill 清单 + 工具结果地址索引，只能在 service 层注册）。
+        # critic 必须一并传：委派出去的硬数据（车次/航班/天气/节假日）由子 Agent 自己校验——
+        # 主 Agent 这轮调的是 call_sub_agent，不在 HARD_DATA_TOOLS 里，它的 critic 不会触发
         sub_agent_tool = make_call_sub_agent(self.chat_model, registry, [s["name"] for s in self.skills],
                                              settings.llm_context_budget,
-                                             self.tool_result_store)
+                                             self.tool_result_store,
+                                             critic=CriticConfig(read_file_tool=self.critic_tools[0],
+                                                                 grep_tool=self.critic_tools[1],
+                                                                 skills=self.skills))
         registry.register_tool(sub_agent_tool, "委派子任务")
         return registry
 
@@ -287,13 +294,20 @@ class AgentService:
                     return
                 etype = ev["type"]
                 if etype == "status":
-                    yield {"type": "status", "status": ev["status"]}
+                    # parent 透传：主 Agent 的状态是全局的（parent 为空），子 Agent 的状态要挂到
+                    # 对应的委派节点上，前端靠它把「哪个子任务在核对事实」显示在正确的层级
+                    yield {"type": "status", "status": ev["status"], "parent": ev.get("parent")}
                 elif etype == "tool_call":
-                    # 入队待配对（带 tool_call_id），label 一并入队随 tools 持久化供前端还原中文名
+                    # 入队待配对（带 tool_call_id），label 一并入队随 tools 持久化供前端还原中文名。
+                    # agent/parent 同理入队：子 Agent 的工具调用与主 Agent 走同一条流，落库时带上它们，
+                    # 刷新后从历史还原时才知道该挂在哪个「委派子任务」节点下
                     label = ev.get("label", ev["tool"])
-                    pending_calls.append({"tool": ev["tool"], "args": ev["args"], "id": ev["id"], "label": label})
-                    # id/label 一并下发给前端：同名工具并发时前端也能按 id 精确配对 summary，不串
-                    yield {"type": "tool_call", "tool": ev["tool"], "args": ev["args"], "id": ev["id"], "label": label}
+                    pending_calls.append({"tool": ev["tool"], "args": ev["args"], "id": ev["id"],
+                                          "label": label, "agent": ev.get("agent"),
+                                          "parent": ev.get("parent")})
+                    # id/label/agent/parent 一并下发给前端：同名工具并发时前端也能按 id 精确配对 summary，不串
+                    yield {"type": "tool_call", "tool": ev["tool"], "args": ev["args"], "id": ev["id"],
+                           "label": label, "agent": ev.get("agent"), "parent": ev.get("parent")}
                 elif etype == "tool_result":
                     name = ev["tool"]
                     # 按 tool_call_id 精确配对：并行执行时工具按「完成先后」返回，tool_result 顺序与 tool_call
@@ -313,11 +327,14 @@ class AgentService:
                         # id 转成 tool_call_id 保留：供 assemble_history 跨轮还原 role=tool 消息时配对
                         entry["tool_call_id"] = entry.pop("id")
                         state.tools.append(entry)
-                    if name in HARD_DATA_TOOLS:
-                        # 硬数据工具记模型所见语料（ev["result"]），保证 critic 与模型生成答案时语料一致
+                    if name in HARD_DATA_TOOLS and ev.get("agent") == agent.name:
+                        # 硬数据工具记模型所见语料（ev["result"]），保证 critic 与模型生成答案时语料一致。
+                        # 只记主 Agent 自己的调用：子 Agent 的硬数据由它自己的 critic 校验，
+                        # 混进来会污染「本轮主 Agent 调过哪些硬数据工具」这个语义（也是下游 status 的判据）
                         state.hard_results.append(ev.get("result", ""))
                     sse = {"type": "tool_result", "tool": name, "status": ev.get("status", True),
-                           "result": ev.get("result", ""), "id": ev["id"], "label": ev.get("label", name)}
+                           "result": ev.get("result", ""), "id": ev["id"], "label": ev.get("label", name),
+                           "agent": ev.get("agent"), "parent": ev.get("parent")}
                     if ev.get("artifacts"):
                         sse["artifacts"] = ev["artifacts"]
                     if ev.get("images"):

@@ -19,6 +19,7 @@ from langchain_core.tools import tool
 import app.core.agent as agent_mod
 from app.config import settings
 from app.core.agent import RECURSION_LIMIT, Agent, CriticConfig, _CriticMiddleware
+from app.core.context import current_tool_call_id
 
 
 def _lc_tool_call(tc):
@@ -104,9 +105,12 @@ class FakeRegistry:
         self.r = r
         self.raises = raises or {}  # name → 要抛的异常，驱动工具失败的异常出口
         self.called = []
+        self.seen_call_ids = []  # 每次执行时读到的 current_tool_call_id
 
     async def call_raw(self, name, args):
         self.called.append((name, args))
+        # 工具只能从 contextvar 拿到本次调用的身份：call_sub_agent 靠它把子任务挂到发起它的委派下
+        self.seen_call_ids.append(current_tool_call_id.get())
         if name in self.raises:
             raise self.raises[name]
         return self.r[name]
@@ -138,6 +142,28 @@ class ConcurrentRegistry:
         await asyncio.sleep(self.delays.get(name, 0.05))
         self.active -= 1
         return self.results[name]
+
+    def get(self, name):
+        return _StubTool(name)
+
+    def label(self, name):
+        return name
+
+
+class CallIdRecordingRegistry:
+    """并行调两个工具、各自 sleep 制造交错窗口，记录每次执行时读到的 tool_call_id。
+
+    读操作放在 sleep **之后**：若 context 不隔离，后进入的那个会把自己的 id 写进
+    前一个的执行帧，先进入的读到的就是别人的身份——委派层级会静默挂错节点。
+    """
+
+    def __init__(self):
+        self.seen = {}
+
+    async def call_raw(self, name, args):
+        await asyncio.sleep(0.02)
+        self.seen[name] = current_tool_call_id.get()
+        return name
 
     def get(self, name):
         return _StubTool(name)
@@ -190,6 +216,48 @@ async def test_run_stream_tool_call_and_accumulated_text():
     assert reg.called == [("w", {"c": "成都"})]
     assert any(e["type"] == "tool_call" and e["tool"] == "w" and e["args"] == {"c": "成都"} for e in events)
     assert any(e["type"] == "tool_result" and e["tool"] == "w" and e["status"] is True and e["result"] == "晴" for e in events)
+
+
+@pytest.mark.asyncio
+async def test_tool_execution_exposes_its_own_call_id():
+    """工具执行期间 current_tool_call_id 必须是本次调用的 id，执行完复位。
+
+    这是「委派层级」的地基：call_sub_agent 拿它当子任务的归属键，前端才分得清并行子任务谁是谁。
+    复位同样要验——不复位的话下一个工具会读到上一个的身份，子任务会挂错节点。
+    """
+    llm = StreamingLLM([
+        [{"type": "end", "tool_calls": [{"id": "call_x", "function": {"name": "w", "arguments": "{}"}}]}],
+        [{"type": "content", "text": "晴"}, {"type": "end", "tool_calls": None}],
+    ])
+    reg = FakeRegistry({"w": "晴"})
+    a = Agent(name="t", system_prompt="s", tools=["w"], model=EventScriptChatModel(llm=llm))
+
+    await a.run_stream("go", [], reg)
+
+    assert reg.seen_call_ids == ["call_x"]
+    assert current_tool_call_id.get() == "", "工具执行完必须复位，否则下一个工具会读到上一个的身份"
+
+
+@pytest.mark.asyncio
+async def test_parallel_tools_see_their_own_call_id():
+    """同一轮并行的多个工具，各自读到自己的 tool_call_id，不互相覆盖。
+
+    框架用 asyncio.gather 执行同一轮的多个 tool_call（每个协程被包成独立 Task、各有独立
+    context 副本），本用例把这个前提钉死：一旦哪天执行模型变了，并行委派会把子任务挂错节点。
+    """
+    llm = StreamingLLM([
+        [{"type": "end", "tool_calls": [
+            {"id": "call_a", "function": {"name": "wa", "arguments": "{}"}},
+            {"id": "call_b", "function": {"name": "wb", "arguments": "{}"}},
+        ]}],
+        [{"type": "content", "text": "好"}, {"type": "end", "tool_calls": None}],
+    ])
+    reg = CallIdRecordingRegistry()
+    a = Agent(name="t", system_prompt="s", tools=["wa", "wb"], model=EventScriptChatModel(llm=llm))
+
+    await a.run_stream("go", [], reg)
+
+    assert reg.seen == {"wa": "call_a", "wb": "call_b"}
 
 
 @pytest.mark.asyncio

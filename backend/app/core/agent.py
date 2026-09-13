@@ -19,18 +19,20 @@ from langgraph.graph.message import add_messages
 from langgraph.types import Command
 
 from app.config import settings
-from app.core.context import current_user_id
+from app.core.context import current_emit, current_tool_call_id, current_user_id
 from app.core.critic import run_critic
 from app.core.memory.working import WorkingMemory
 
 logger = logging.getLogger(__name__)
 
-# 非查询结果工具：返回「读回片段/规则正文/委派摘要/脚本结论与产物清单/文件清单」而非「查询结果」。
+# 非查询结果工具：返回「读回片段/规则正文/脚本结论与产物清单/文件清单」而非「查询结果」。
 # 它们的返回原样回填窗口（不结构化截断），也不触发地址索引（不写文件）——
 # 否则 read_file 读回的片段又被截断/写文件，会形成 read→截断/spill→read 的循环；
 # run_skill_script 则会把产物清单截掉、把「可下载」变成「读一段文本」；
 # list_uploaded_files 被截断就等于只报了前几个文件，后面的一律「查不到」。
-NON_QUERY_TOOLS = {"read_file", "grep", "get_skill", "call_sub_agent", "run_skill_script",
+# 共同点是「有界且需要完整」；call_sub_agent 不在此列——它回的是 LLM 生成的无界散文摘要，
+# 长度由子 Agent 的心情决定，不截断就等于任由一个子任务把父 Agent 的窗口撑满。
+NON_QUERY_TOOLS = {"read_file", "grep", "get_skill", "run_skill_script",
                    "list_uploaded_files"}
 
 # 硬数据工具集合：这些工具返回的是「事实性」数据（车次/航班/天气/节假日），最容易被 LLM 编造或扭曲，
@@ -105,7 +107,7 @@ async def postprocess_tool_result(name, raw, tool_result_store, conversation_id,
     抽成独立函数只为便于单测 —— middleware 只负责调它。
     """
     if name in NON_QUERY_TOOLS:
-        # 非查询结果工具（read_file/grep/get_skill/call_sub_agent）：返回内容原样回填，
+        # 非查询结果工具（read_file/grep/get_skill）：返回内容原样回填，
         # 不做结构化截断（读回片段/规则正文本身就是有界且需要完整的），也不触发地址索引
         return str(raw)
     text, note = _struct_truncate_to_str(raw, 20, 20, settings.truncate_limit)
@@ -321,7 +323,10 @@ class _ToolExecMiddleware(AgentMiddleware):
         await self.emit({"type": "tool_call", "agent": self.agent_name, "tool": name, "args": args,
                          "id": tc["id"], "label": self.registry.label(name)})
         # 通过 registry 真正执行工具，拿到结构化原始结果（call_raw 不做 str() 转换）；
-        # 失败时把错误回传给 LLM 而非让整轮崩溃（MCP 限流/网络抖动会抛异常）
+        # 失败时把错误回传给 LLM 而非让整轮崩溃（MCP 限流/网络抖动会抛异常）。
+        # 执行期间暴露本 call 的 id：call_sub_agent 拿它当子任务的归属键（子 Agent 的事件带上它，
+        # 前端才知道该挂到哪次委派下）。并行工具各在自己的 Task 里跑，context 副本互不污染。
+        id_token = current_tool_call_id.set(tc["id"])
         try:
             raw = await self.registry.call_raw(name, args)
         except Exception as e:
@@ -329,6 +334,8 @@ class _ToolExecMiddleware(AgentMiddleware):
             err = _redact_secrets(str(e))
             logger.warning("[Agent:%s] 工具 %s 执行失败：%s", self.agent_name, name, err)
             raw = f"工具执行失败：{err}"
+        finally:
+            current_tool_call_id.reset(id_token)
         # 后处理与上报的异常会被框架的工具错误兜底吞成 error ToolMessage（降级不炸轮），
         # 不补日志就完全无痕：这里记完再原样抛出，保持框架既有的降级行为与错误串
         try:
@@ -461,6 +468,9 @@ class Agent:
             if on_event is not None:
                 await on_event(event)
 
+        # call_sub_agent 由 service 启动时装配一次、拿不到每轮的 on_event，经 contextvar 透传，
+        # 让子 Agent 的工具调用沿同一条 SSE 通道上报（事件自带 agent 字段，前端据此分组）
+        current_emit.set(on_event)
         logger.info("[Agent:%s] 开始执行（流式），输入：%.60s", self.name, user_message)
         # 工作记忆（预算淘汰器）：传入 model 与预算时启用，否则禁用（不淘汰）
         wm = WorkingMemory(self.model, context_budget) if context_budget else None

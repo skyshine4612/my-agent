@@ -315,6 +315,11 @@ async def test_tool_result_pairs_by_call_id_same_name_parallel(user_id):
     tool_results = [e for e in events if e["type"] == "tool_result"]
     assert {e["id"] for e in tool_calls} == {"call_a", "call_b"}
     assert {e["id"] for e in tool_results} == {"call_a", "call_b"}
+    # agent 一并透传：子 Agent 的工具调用与主 Agent 走同一条流，前端靠它区分层级
+    # （这里只有主 Agent 在调，故恒为 assistant；子 Agent 侧由 test_sub_agent 钉住）
+    assert {e.get("agent") for e in tool_calls} == {"assistant"}
+    assert {e.get("agent") for e in tool_results} == {"assistant"}
+    assert {t.get("agent") for t in tools} == {"assistant"}
 
 
 class ImageToolLLM:
