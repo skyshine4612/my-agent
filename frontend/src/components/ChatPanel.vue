@@ -61,7 +61,9 @@ function toolLabel(t: ToolEvent, done: boolean): string {
   return done ? `已${name}` : `${name}…`
 }
 
-// 展开的工具气泡 key 集合（`消息id-工具索引`），点击气泡切换展开/收起 result
+// 展开的工具气泡 key 集合（`消息id-工具索引`）：**默认收起**，点一下才展开。
+// 委派气泡与普通工具气泡共用这一个集合——两边默认态一致（都收起），只是收的东西不同：
+// 委派收的是它那段回答（子任务的工具进度挂在回答之下，不参与折叠），普通工具收的是自己的 result。
 const expanded = ref<Set<string>>(new Set())
 function toggleTool(key: string) {
   const next = new Set(expanded.value)
@@ -69,33 +71,18 @@ function toggleTool(key: string) {
   expanded.value = next
 }
 
-// 委派气泡与普通工具气泡的默认态相反，所以两个集合分开记：
-// - 委派节点（call_sub_agent）是「容器」，下面挂着一整块子任务进度，**默认展开**——
-//   默认收起的话运行期间就只剩一个光秃秃的气泡，看不到子 Agent 在干什么。
-// - 普通工具是「叶子」，**默认收起**（点一下才看结果），否则每个工具结果都铺开。
-const collapsed = ref<Set<string>>(new Set())
-function toggleCollapse(key: string) {
-  const next = new Set(collapsed.value)
-  next.has(key) ? next.delete(key) : next.add(key)
-  collapsed.value = next
-}
-
-// 委派气泡与普通工具气泡的点击含义不同：前者收放整块，后者显隐自身结果
-const isDelegation = (t: ToolEvent) => t.tool === 'call_sub_agent'
-
-// 有没有可展开的东西：没有就别给手型光标、点了也别切状态，否则「能点但没反应」
-const canToggle = (t: ToolEvent) => isDelegation(t) || !!(t.result || t.images?.length)
+// 有没有可展开的东西：没有就别给手型光标、点了也别切状态，否则「能点但没反应」。
+// 委派节点不无条件可点 —— 它的折叠区只装回答，回答还没到就没什么可收的
+const canToggle = (t: ToolEvent) => !!(t.result || t.images?.length)
 
 function toggleNode(m: ChatMessage, t: ToolEvent, i: number) {
   if (!canToggle(t)) return
-  const key = keyOf(m, t, i)
-  isDelegation(t) ? toggleCollapse(key) : toggleTool(key)
+  toggleTool(keyOf(m, t, i))
 }
 
 // 节点当前是否展开（决定展开区显示与箭头朝向）
 function isOpen(m: ChatMessage, t: ToolEvent, i: number): boolean {
-  const key = keyOf(m, t, i)
-  return isDelegation(t) ? !collapsed.value.has(key) : expanded.value.has(key)
+  return expanded.value.has(keyOf(m, t, i))
 }
 
 // 文件大小展示：附件条与产物卡片共用
@@ -153,13 +140,14 @@ function pickFile(e: Event) {
                   <span class="tool__status" :class="t.status ? 'tool__status--done' : 'tool__status--run'"></span>
                   <span class="tool__name">{{ toolLabel(t, !!t.status) }}</span>
                   <span v-if="t.phase" class="tool__phase">{{ t.phase }}</span>
-                  <!-- 委派节点永远显示箭头（总有一整块子任务进度可收）；普通工具要有结果才显 -->
-                  <span v-if="isOpen(m, t, i) || t.result || t.images?.length" class="tool__caret"
+                  <!-- 有东西可收才显示箭头（canToggle 为假时连手型都不给） -->
+                  <span v-if="canToggle(t)" class="tool__caret"
                         :class="{ 'tool__caret--open': isOpen(m, t, i) }">
                     <el-icon><ArrowDown /></el-icon>
                   </span>
                 </div>
-                <!-- 展开区：委派节点默认展开（子任务进度常驻可见，点一下整块收起）；普通工具默认收起 -->
+                <!-- 委派气泡的折叠区：只收它自己的结果（子任务返回的那段回答）与配图。
+                     紧跟在委派气泡下面——回答是这次委派的结论，点气泡收放的也只有它 -->
                 <template v-if="isOpen(m, t, i)">
                   <div v-if="t.result" class="tool__result">
                     <pre>{{ t.result }}</pre>
@@ -168,21 +156,22 @@ function pickFile(e: Event) {
                        一次检索可能回十几张，常显会把对话刷成图墙；正文里引用的那几张由
                        MessageMarkdown 就地渲染，才是给用户看的 -->
                   <KnowledgeThumbs v-if="t.images?.length" :images="t.images" />
-                  <!-- 委派出去的子 Agent：它自己的 ReAct 进度（工具调用 + 阶段状态）缩进挂在这一层 -->
-                  <div v-for="(c, j) in childrenOf(m, t)" :key="keyOf(m, c, j)" class="tool-wrap tool-wrap--sub">
-                    <div class="tool" :class="{ 'tool--static': !canToggle(c) }" @click="toggleTool(keyOf(m, c, j))">
-                      <span class="tool__status" :class="c.status ? 'tool__status--done' : 'tool__status--run'"></span>
-                      <span class="tool__name">{{ toolLabel(c, !!c.status) }}</span>
-                      <span v-if="c.status && (c.result || c.images?.length)" class="tool__caret" :class="{ 'tool__caret--open': expanded.has(keyOf(m, c, j)) }">
-                        <el-icon><ArrowDown /></el-icon>
-                      </span>
-                    </div>
-                    <div v-if="expanded.has(keyOf(m, c, j)) && c.result" class="tool__result">
-                      <pre>{{ c.result }}</pre>
-                    </div>
-                    <KnowledgeThumbs v-if="expanded.has(keyOf(m, c, j)) && c.images?.length" :images="c.images" />
-                  </div>
                 </template>
+                <!-- 委派出去的子 Agent：它自己的 ReAct 进度（工具调用 + 阶段状态）缩进挂在回答之下。
+                     这一段**不参与委派气泡的折叠**：折叠收的只是上面那段回答，进度要一直看得见 -->
+                <div v-for="(c, j) in childrenOf(m, t)" :key="keyOf(m, c, j)" class="tool-wrap tool-wrap--sub">
+                  <div class="tool" :class="{ 'tool--static': !canToggle(c) }" @click="toggleTool(keyOf(m, c, j))">
+                    <span class="tool__status" :class="c.status ? 'tool__status--done' : 'tool__status--run'"></span>
+                    <span class="tool__name">{{ toolLabel(c, !!c.status) }}</span>
+                    <span v-if="c.status && (c.result || c.images?.length)" class="tool__caret" :class="{ 'tool__caret--open': expanded.has(keyOf(m, c, j)) }">
+                      <el-icon><ArrowDown /></el-icon>
+                    </span>
+                  </div>
+                  <div v-if="expanded.has(keyOf(m, c, j)) && c.result" class="tool__result">
+                    <pre>{{ c.result }}</pre>
+                  </div>
+                  <KnowledgeThumbs v-if="expanded.has(keyOf(m, c, j)) && c.images?.length" :images="c.images" />
+                </div>
               </div>
             </template>
             <!-- markdown 正文（token 流式累积）：知识库图片按正文里的引用号就地渲染 -->
