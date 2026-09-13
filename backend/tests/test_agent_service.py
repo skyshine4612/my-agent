@@ -106,6 +106,8 @@ async def test_chat_stream_flow(user_id):
     assert "conversation_id" in types
     assert "token" in types
     assert types[-1] == "done"
+    # 最终答案按小块下发：拼接后必须还原成完整答案（分块在这一层做，run_stream 只把答案作为返回值交出）
+    assert "".join(e["content"] for e in events if e["type"] == "token") == "你好，成都"
 
     conv_id = next(e["conversation_id"] for e in events if e["type"] == "conversation_id")
     history = await svc.conversation_store.get_history(user_id, conv_id)

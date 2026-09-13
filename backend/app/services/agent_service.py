@@ -280,15 +280,13 @@ class AgentService:
                 await queue.put(None)
 
         async def consume():
-            # 消费队列：把 token/tool_call/tool_result 转成 SSE，同时累积状态供持久化使用
+            # 消费队列：把 status/tool_call/tool_result 转成 SSE，同时累积状态供持久化使用
             while True:
                 ev = await queue.get()
                 if ev is None:
                     return
                 etype = ev["type"]
-                if etype == "token":
-                    pass  # 答案不立即输出：等 critic 校验通过后统一流式输出，避免「第一段编造答案」先流出
-                elif etype == "status":
+                if etype == "status":
                     yield {"type": "status", "status": ev["status"]}
                 elif etype == "tool_call":
                     # 入队待配对（带 tool_call_id），label 一并入队随 tools 持久化供前端还原中文名

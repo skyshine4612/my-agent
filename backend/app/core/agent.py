@@ -440,7 +440,7 @@ class Agent:
             - ReAct 循环由 create_agent 编译出的一张图承载：模型节点做决策，工具节点被 _ToolExecMiddleware 完全短路；
             - 图在模型不再调工具处收口，_CriticMiddleware 在收口钩子里做事实校验与定向改写（环不占图额度）；
             - 调工具轮次的 content 是内部思考（thought），不上发前端；
-            - 仅最终答案（不调工具的轮次，含 critic 改写后的答案）经 on_event 发为 token 事件；
+            - 最终答案（不调工具的轮次，含 critic 改写后的答案）作为返回值交给调用方；
             - 同一轮多个 tool_calls 由框架并行执行，tool 消息按原始顺序回填；
             - 工具结果回填前做结构化截断（list 前20 / dict 前20键 / str truncate_limit），
               tool_result 事件的 result 字段是模型工作记忆里的截断版结果，供 critic 校验，
@@ -453,7 +453,7 @@ class Agent:
         summary：          历史对话摘要，非空时作为独立 system 消息紧跟主 system prompt 之后。
         critic：           CriticConfig，非空时挂上 critic 收口中间件（事实校验与定向改写）；为 None 时只跑 ReAct。
 
-        on_event：可选异步回调，接收流式事件（token / tool_call / tool_result / status）；为 None 时静默。
+        on_event：可选异步回调，接收流式事件（tool_call / tool_result / status）；为 None 时静默。
         """
 
         async def emit(event):
@@ -542,9 +542,6 @@ class Agent:
         if answer is not None:
             # 误抄的检索标记在这一处收敛：落库内容与下发的 token 因此必然一致
             answer = normalize_image_markers(answer)
-            # 最终答案按小块上发（前端逐块渲染，保持流式感）
-            for j in range(0, len(answer), 40):
-                await emit({"type": "token", "content": answer[j:j + 40]})
             logger.info("[Agent:%s] 本轮完成，返回最终答案（%d 字）", self.name, len(answer))
             return answer, rounds
         # 未收敛时兜底返回：给一句非空提示，避免最终输出空串

@@ -159,26 +159,19 @@ def _StubTool(name):
 
 
 @pytest.mark.asyncio
-async def test_run_stream_tokens_in_order():
-    """验证 run_stream 最终答案：content 累积后按小块经 on_event 发出，最终返回完整答案。"""
+async def test_run_stream_returns_accumulated_answer():
+    """验证 run_stream 无工具轮：多个 content 块累积成完整答案并作为返回值交出。"""
     llm = StreamingLLM([
         [{"type": "content", "text": "成"}, {"type": "content", "text": "都晴"}, {"type": "end", "tool_calls": None}],
     ])
     a = Agent(name="t", system_prompt="s", tools=[], model=EventScriptChatModel(llm=llm))
-    events = []
-
-    async def on_event(e):
-        events.append(e)
-
-    out, _ = await a.run_stream("查天气", [], FakeRegistry({}), on_event=on_event)
+    out, _ = await a.run_stream("查天气", [], FakeRegistry({}))
     assert out == "成都晴"
-    # 最终答案按小块上发（合并后等于完整答案）
-    assert "".join(e["content"] for e in events if e["type"] == "token") == "成都晴"
 
 
 @pytest.mark.asyncio
 async def test_run_stream_tool_call_and_accumulated_text():
-    """验证 run_stream 工具调用：思考（调工具轮）不上发不计入回答，只有最终答案上发并返回。"""
+    """验证 run_stream 工具调用：思考（调工具轮）不计入回答，返回的只有最终答案。"""
     llm = StreamingLLM([
         [{"type": "content", "text": "查"},
          {"type": "end", "tool_calls": [{"id": "1", "function": {"name": "w", "arguments": "{\"c\":\"成都\"}"}}]}],
@@ -194,7 +187,6 @@ async def test_run_stream_tool_call_and_accumulated_text():
     out, _ = await a.run_stream("查天气", [], reg, on_event=on_event)
     # 回答只含最终答案，思考 "查" 不计入
     assert out == "成都晴"
-    assert "查" not in "".join(e["content"] for e in events if e["type"] == "token")
     assert reg.called == [("w", {"c": "成都"})]
     assert any(e["type"] == "tool_call" and e["tool"] == "w" and e["args"] == {"c": "成都"} for e in events)
     assert any(e["type"] == "tool_result" and e["tool"] == "w" and e["status"] is True and e["result"] == "晴" for e in events)
@@ -308,7 +300,7 @@ async def test_model_sees_user_message_last():
 
 @pytest.mark.asyncio
 async def test_status_event_precedes_first_content_block():
-    """模型开始产出内容时发一次 status（覆盖生成期的长静默），且先于同轮的 tool_call 事件与 token 事件。"""
+    """模型开始产出内容时发一次 status（覆盖生成期的长静默），且先于同轮的 tool_call 事件。"""
     llm = StreamingLLM([
         [{"type": "content", "text": "想"},
          {"type": "end", "tool_calls": [{"id": "c1", "function": {"name": "w", "arguments": "{}"}}]}],
@@ -327,13 +319,11 @@ async def test_status_event_precedes_first_content_block():
     assert events[0] == {"type": "status", "status": "generating"}
     kinds = [e["type"] for e in events]
     assert kinds.index("status") < kinds.index("tool_call")
-    # token 事件（最终答案）之前必须先有 status
-    assert kinds.index("status") < kinds.index("token")
 
 
 @pytest.mark.asyncio
 async def test_never_converging_model_hits_recursion_limit():
-    """模型每轮只回 tool_calls、从不给答案：跑满 60 步后返回兜底文案，不发 token、rounds 记满。
+    """模型每轮只回 tool_calls、从不给答案：跑满 60 步后返回兜底文案、rounds 记满。
 
     额度固定 60 步，一轮 ReAct 占 3 步（before_model 钩子 + 模型 + 工具），故恰好放行 20 轮；
     第 21 次模型调用不会发生。
@@ -353,7 +343,6 @@ async def test_never_converging_model_hits_recursion_limit():
     assert len(rounds) == 20  # 跑满 20 轮，每轮都真实执行了工具
     assert reg.called == [("w", {})] * 20
     assert llm.i == 20
-    assert [e for e in events if e["type"] == "token"] == []
 
 
 def test_recursion_limit_is_pinned_at_60():
@@ -449,7 +438,6 @@ async def test_critic_loop_converges(monkeypatch):
     assert [e for e in events if e.get("status") == "correcting"] == [{"type": "status", "status": "correcting"}]
     assert reg.called == [(_HARD_TOOL, {})]  # 改写不重新调工具
     assert out == "成都明天晴"  # 下发的是改写版
-    assert "".join(e["content"] for e in events if e["type"] == "token") == "成都明天晴"
 
 
 @pytest.mark.asyncio
@@ -500,7 +488,7 @@ async def test_critic_does_not_leak_rounds(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_critic_turn_still_hits_recursion_limit(monkeypatch):
-    """永不收敛 + 带 critic：额度与无 critic 时相同，仍恰跑满 20 轮，返回兜底文案、零 token。
+    """永不收敛 + 带 critic：额度与无 critic 时相同，仍恰跑满 20 轮，返回兜底文案。
 
     第 21 轮模型决策不会发生（额度在第 21 轮的 before_model 钩子处触顶），故 reg 只被调 20 次、
     rounds 只有 20 条。
@@ -519,14 +507,13 @@ async def test_critic_turn_still_hits_recursion_limit(monkeypatch):
     assert out == _FALLBACK
     assert len(rounds) == 20
     assert reg.called == [(_HARD_TOOL, {})] * 20
-    assert [e for e in events if e["type"] == "token"] == []
 
 
 @pytest.mark.asyncio
 async def test_recursion_limit_used_up_by_tool_rounds_skips_critic(monkeypatch):
     """20 轮工具 + 一次答案轮 + 带 critic：落兜底文案，且 critic 一次都没被调用。
 
-    20 轮工具占掉第 1-60 步，答案轮的模型调用与收口钩子都排在更后面，故整轮零校验、零 token、
+    20 轮工具占掉第 1-60 步，答案轮的模型调用与收口钩子都排在更后面，故整轮零校验、
     连答案轮的模型调用都没发生（llm.i 停在 20）。额度放宽到 62 时这一档就收敛出答案，本用例转红。
     """
     assert RECURSION_LIMIT == 60  # 第 61 步是 before_model 钩子步，只放宽到 61 时行为不可分，故常量单独钉死
@@ -667,18 +654,12 @@ def test_normalize_image_markers_leaves_plain_text_alone():
 
 @pytest.mark.asyncio
 async def test_run_stream_normalizes_leaked_image_markers():
-    """模型把切片里的长标记整条抄进答案时，返回值与下发的 token 都要是收敛后的形态 ——
+    """模型把切片里的长标记整条抄进答案时，返回值要是收敛后的形态 ——
     归一化必须发生在答案定稿处，落库与下发才不会各带一份。"""
     llm = StreamingLLM([
         [{"type": "content", "text": "看这个。\n【图13-2：熊猫塔】\n"},
          {"type": "end", "tool_calls": None}],
     ])
     a = Agent(name="t", system_prompt="s", tools=[], model=EventScriptChatModel(llm=llm))
-    events = []
-
-    async def on_event(e):
-        events.append(e)
-
-    out, _ = await a.run_stream("熊猫塔", [], FakeRegistry({}), on_event=on_event)
+    out, _ = await a.run_stream("熊猫塔", [], FakeRegistry({}))
     assert out == "看这个。\n【图13-2】\n"
-    assert "".join(e["content"] for e in events if e["type"] == "token") == "看这个。\n【图13-2】\n"
