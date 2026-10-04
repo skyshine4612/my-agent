@@ -1,10 +1,10 @@
-<script setup lang="ts">
-// App.vue —— 应用根组件：只承载路由出口，全局基础样式与配色在此注入
-</script>
-
 <template>
   <router-view />
 </template>
+
+<script setup lang="ts">
+// App.vue —— 应用根组件：只承载路由出口，全局基础样式与配色在此注入
+</script>
 
 <style>
 /* 全局基础样式：暖白底、无默认边距，让对话内容成为界面主角 */

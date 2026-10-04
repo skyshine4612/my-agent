@@ -1,109 +1,3 @@
-<script setup lang="ts">
-// ChatPanel.vue —— 通用对话面板：渲染 markdown 消息流 + 工具气泡 + 底部输入框
-import { ref } from 'vue'
-import { Promotion, Collection, Reading, ArrowDown, Paperclip, Document } from '@element-plus/icons-vue'
-import type { ChatMessage, ToolEvent, StoredFile } from '@/types'
-import KnowledgeThumbs from '@/components/KnowledgeThumbs.vue'
-import MessageMarkdown from '@/components/MessageMarkdown.vue'
-
-// 父级传入的消息列表与流式状态，向上 emit 发送动作
-// streaming：是否在流式请求中（禁用输入）；thinking：是否在等待助手首字（显示呼吸点）
-// phase：工具调用完成后的阶段文案（整理答案/核对事实/修正答案），空串表示不在这些阶段
-// attached：已上传但还没发消息的文件（显示成输入区上方的附件条）
-// uploading：上传中，禁用上传按钮避免连点产生多个没人用的文件
-const props = defineProps<{
-  messages: ChatMessage[]; streaming: boolean; thinking: boolean; phase: string
-  attached: StoredFile[]; uploading: boolean
-}>()
-const emit = defineEmits<{
-  send: [text: string]; upload: [file: File]; download: [file: StoredFile]
-  'open-memory': []; 'open-knowledge': []
-}>()
-
-// 输入框草稿
-const draft = ref('')
-
-// 提交输入框内容：非空则发出 send，并清空草稿
-function submit() {
-  const t = draft.value.trim()
-  if (!t) return
-  emit('send', t)
-  draft.value = ''
-}
-
-// 一条消息的全部知识库图片：正文里的引用号在这批里查 key（与工具气泡下的缩略图同源）
-const imagesOf = (m: ChatMessage) => (m.tools ?? []).flatMap(t => t.images ?? [])
-
-// 一条消息的全部脚本产物（artifacts 字段）：从各工具上摊平，渲染到正文之后的「生成的文件」区块。
-// 它是交付物不是过程，不挂在工具气泡里；一个产物只挂在执行它的那个 tool 上
-// （后端每次 save 产新 file_id），无需去重
-const artifactsOf = (m: ChatMessage) => (m.tools ?? []).flatMap(t => t.artifacts ?? [])
-
-// 委派标题：模型给的短标题，截断兜底（schema 里要求 8 字以内，但不保证它守约）
-const TITLE_MAX = 12
-const titleOf = (t: ToolEvent) => String(t.args?.title ?? '').slice(0, TITLE_MAX)
-
-// 工具气泡的稳定 key：优先用 tool_call_id（刷新后由 Chat.vue 归一成 id），没有则退回下标。
-// 展开态与嵌套都靠它配对，用下标的话子任务插进来会串
-const keyOf = (m: ChatMessage, t: ToolEvent, i: number) => `${m.id}-${t.id ?? i}`
-
-// 某次委派派出去的子 Agent 的工具调用：按 parent 归位，所以三个并行子任务各自成组，
-// 不受事件到达顺序影响
-const childrenOf = (m: ChatMessage, t: ToolEvent) =>
-  (m.tools ?? []).filter(c => c.parent != null && c.parent === t.id)
-
-// 工具气泡文案：label 是后端注册工具时给出的中文动作短语（如「查询火车票」），
-// 前端统一按执行状态拼「正在{label}… / 已{label}」，无 label 时回退英文名。
-// 委派气泡额外带上 title——并行委派时只靠「委派子任务」四个字分不清哪个是哪个
-function toolLabel(t: ToolEvent, done: boolean): string {
-  const title = t.tool === 'call_sub_agent' ? titleOf(t) : ''
-  const name = (t.label || t.tool) + (title ? ` · ${title}` : '')
-  return done ? `已${name}` : `${name}…`
-}
-
-// 展开的工具气泡 key 集合（`消息id-工具索引`）：**默认收起**，点一下才展开。
-// 委派气泡与普通工具气泡共用这一个集合——两边默认态一致（都收起），只是收的东西不同：
-// 委派收的是它那段回答（子任务的工具进度挂在回答之下，不参与折叠），普通工具收的是自己的 result。
-const expanded = ref<Set<string>>(new Set())
-function toggleTool(key: string) {
-  const next = new Set(expanded.value)
-  next.has(key) ? next.delete(key) : next.add(key)
-  expanded.value = next
-}
-
-// 有没有可展开的东西：没有就别给手型光标、点了也别切状态，否则「能点但没反应」。
-// 委派节点不无条件可点 —— 它的折叠区只装回答，回答还没到就没什么可收的
-const canToggle = (t: ToolEvent) => !!(t.result || t.images?.length)
-
-function toggleNode(m: ChatMessage, t: ToolEvent, i: number) {
-  if (!canToggle(t)) return
-  toggleTool(keyOf(m, t, i))
-}
-
-// 节点当前是否展开（决定展开区显示与箭头朝向）
-function isOpen(m: ChatMessage, t: ToolEvent, i: number): boolean {
-  return expanded.value.has(keyOf(m, t, i))
-}
-
-// 文件大小展示：附件条与产物卡片共用
-function formatSize(n: number): string {
-  if (n < 1024) return `${n} B`
-  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`
-  return `${(n / 1024 / 1024).toFixed(1)} MB`
-}
-
-// 隐藏的文件选择框：交给下面的回形针按钮触发
-const fileInput = ref<HTMLInputElement | null>(null)
-
-// 选完文件清空 value：同一个文件再选一次也要能触发 change
-function pickFile(e: Event) {
-  const input = e.target as HTMLInputElement
-  const f = input.files?.[0]
-  input.value = ''
-  if (f) emit('upload', f)
-}
-</script>
-
 <template>
   <div class="chat-panel">
     <!-- 可滚动消息区 -->
@@ -260,6 +154,112 @@ function pickFile(e: Event) {
     </div>
   </div>
 </template>
+
+<script setup lang="ts">
+// ChatPanel.vue —— 通用对话面板：渲染 markdown 消息流 + 工具气泡 + 底部输入框
+import { ref } from 'vue'
+import { Promotion, Collection, Reading, ArrowDown, Paperclip, Document } from '@element-plus/icons-vue'
+import type { ChatMessage, ToolEvent, StoredFile } from '@/types'
+import KnowledgeThumbs from '@/components/KnowledgeThumbs.vue'
+import MessageMarkdown from '@/components/MessageMarkdown.vue'
+
+// 父级传入的消息列表与流式状态，向上 emit 发送动作
+// streaming：是否在流式请求中（禁用输入）；thinking：是否在等待助手首字（显示呼吸点）
+// phase：工具调用完成后的阶段文案（整理答案/核对事实/修正答案），空串表示不在这些阶段
+// attached：已上传但还没发消息的文件（显示成输入区上方的附件条）
+// uploading：上传中，禁用上传按钮避免连点产生多个没人用的文件
+const props = defineProps<{
+  messages: ChatMessage[]; streaming: boolean; thinking: boolean; phase: string
+  attached: StoredFile[]; uploading: boolean
+}>()
+const emit = defineEmits<{
+  send: [text: string]; upload: [file: File]; download: [file: StoredFile]
+  'open-memory': []; 'open-knowledge': []
+}>()
+
+// 输入框草稿
+const draft = ref('')
+
+// 提交输入框内容：非空则发出 send，并清空草稿
+function submit() {
+  const t = draft.value.trim()
+  if (!t) return
+  emit('send', t)
+  draft.value = ''
+}
+
+// 一条消息的全部知识库图片：正文里的引用号在这批里查 key（与工具气泡下的缩略图同源）
+const imagesOf = (m: ChatMessage) => (m.tools ?? []).flatMap(t => t.images ?? [])
+
+// 一条消息的全部脚本产物（artifacts 字段）：从各工具上摊平，渲染到正文之后的「生成的文件」区块。
+// 它是交付物不是过程，不挂在工具气泡里；一个产物只挂在执行它的那个 tool 上
+// （后端每次 save 产新 file_id），无需去重
+const artifactsOf = (m: ChatMessage) => (m.tools ?? []).flatMap(t => t.artifacts ?? [])
+
+// 委派标题：模型给的短标题，截断兜底（schema 里要求 8 字以内，但不保证它守约）
+const TITLE_MAX = 12
+const titleOf = (t: ToolEvent) => String(t.args?.title ?? '').slice(0, TITLE_MAX)
+
+// 工具气泡的稳定 key：优先用 tool_call_id（刷新后由 Chat.vue 归一成 id），没有则退回下标。
+// 展开态与嵌套都靠它配对，用下标的话子任务插进来会串
+const keyOf = (m: ChatMessage, t: ToolEvent, i: number) => `${m.id}-${t.id ?? i}`
+
+// 某次委派派出去的子 Agent 的工具调用：按 parent 归位，所以三个并行子任务各自成组，
+// 不受事件到达顺序影响
+const childrenOf = (m: ChatMessage, t: ToolEvent) =>
+  (m.tools ?? []).filter(c => c.parent != null && c.parent === t.id)
+
+// 工具气泡文案：label 是后端注册工具时给出的中文动作短语（如「查询火车票」），
+// 前端统一按执行状态拼「正在{label}… / 已{label}」，无 label 时回退英文名。
+// 委派气泡额外带上 title——并行委派时只靠「委派子任务」四个字分不清哪个是哪个
+function toolLabel(t: ToolEvent, done: boolean): string {
+  const title = t.tool === 'call_sub_agent' ? titleOf(t) : ''
+  const name = (t.label || t.tool) + (title ? ` · ${title}` : '')
+  return done ? `已${name}` : `${name}…`
+}
+
+// 展开的工具气泡 key 集合（`消息id-工具索引`）：**默认收起**，点一下才展开。
+// 委派气泡与普通工具气泡共用这一个集合——两边默认态一致（都收起），只是收的东西不同：
+// 委派收的是它那段回答（子任务的工具进度挂在回答之下，不参与折叠），普通工具收的是自己的 result。
+const expanded = ref<Set<string>>(new Set())
+function toggleTool(key: string) {
+  const next = new Set(expanded.value)
+  next.has(key) ? next.delete(key) : next.add(key)
+  expanded.value = next
+}
+
+// 有没有可展开的东西：没有就别给手型光标、点了也别切状态，否则「能点但没反应」。
+// 委派节点不无条件可点 —— 它的折叠区只装回答，回答还没到就没什么可收的
+const canToggle = (t: ToolEvent) => !!(t.result || t.images?.length)
+
+function toggleNode(m: ChatMessage, t: ToolEvent, i: number) {
+  if (!canToggle(t)) return
+  toggleTool(keyOf(m, t, i))
+}
+
+// 节点当前是否展开（决定展开区显示与箭头朝向）
+function isOpen(m: ChatMessage, t: ToolEvent, i: number): boolean {
+  return expanded.value.has(keyOf(m, t, i))
+}
+
+// 文件大小展示：附件条与产物卡片共用
+function formatSize(n: number): string {
+  if (n < 1024) return `${n} B`
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`
+  return `${(n / 1024 / 1024).toFixed(1)} MB`
+}
+
+// 隐藏的文件选择框：交给下面的回形针按钮触发
+const fileInput = ref<HTMLInputElement | null>(null)
+
+// 选完文件清空 value：同一个文件再选一次也要能触发 change
+function pickFile(e: Event) {
+  const input = e.target as HTMLInputElement
+  const f = input.files?.[0]
+  input.value = ''
+  if (f) emit('upload', f)
+}
+</script>
 
 <style scoped>
 .chat-panel {

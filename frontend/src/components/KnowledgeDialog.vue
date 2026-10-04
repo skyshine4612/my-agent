@@ -1,4 +1,54 @@
 <!-- components/KnowledgeDialog.vue —— 知识库弹窗：添加资料（粘贴/文件/网址）+ 已入库列表 -->
+<template>
+  <el-dialog v-model="visible" title="知识库" width="680px">
+    <el-tabs v-model="tab">
+      <el-tab-pane label="添加资料" name="add">
+        <el-radio-group v-model="mode" class="kb-mode">
+          <el-radio-button value="text">粘贴文本</el-radio-button>
+          <el-radio-button value="file">上传文件</el-radio-button>
+          <el-radio-button value="url">抓取网址</el-radio-button>
+        </el-radio-group>
+
+        <template v-if="mode === 'text'">
+          <el-input v-model="title" class="kb-field" placeholder="标题（可选，不填取正文开头）" maxlength="60" />
+          <el-input v-model="content" type="textarea" :rows="8" placeholder="粘贴攻略正文…"/>
+        </template>
+
+        <template v-else-if="mode === 'file'">
+          <el-upload :auto-upload="false" :show-file-list="false" accept=".txt,.md,.markdown" :on-change="onFileChange">
+            <el-button>选择文件</el-button>
+          </el-upload>
+          <p v-if="fileName" class="kb-tip">已读取：{{ fileName }}（{{ content.length }} 字）</p>
+          <p v-else class="kb-tip">支持 .txt / .md，内容在浏览器里读成文本后入库</p>
+        </template>
+
+        <template v-else>
+          <el-input v-model="url" placeholder="https://…（攻略页地址）"/>
+          <p class="kb-tip">用无头浏览器打开并跑完 JS 再取正文，需要几秒到十几秒；页面里的插图会转成文字描述一起入库</p>
+        </template>
+
+        <div class="kb-actions">
+          <el-button type="primary" :loading="saving" :disabled="!canSubmit" @click="submit">入库</el-button>
+        </div>
+      </el-tab-pane>
+
+      <el-tab-pane :label="`已入库（${docs.length}）`" name="list">
+        <p v-if="!docs.length" class="kb-empty">知识库还是空的，先添加一些攻略资料</p>
+        <div v-else class="kb-docs">
+          <div v-for="d in docs" :key="d.source_url || d.title" class="kb-doc">
+            <div class="kb-doc__main">
+              <span class="kb-doc__title">{{ d.title }}</span>
+              <span class="kb-doc__meta">{{ d.chunks }} 个片段</span>
+            </div>
+            <KnowledgeThumbs :images="thumbs(d)" :size="40" />
+            <el-button link type="danger" @click="remove(d)">删除</el-button>
+          </div>
+        </div>
+      </el-tab-pane>
+    </el-tabs>
+  </el-dialog>
+</template>
+
 <script setup lang="ts">
 import {computed, ref, watch} from 'vue'
 import {ElMessage, ElMessageBox, type UploadFile} from 'element-plus'
@@ -83,56 +133,6 @@ async function remove(doc: DocItem) {
   }
 }
 </script>
-
-<template>
-  <el-dialog v-model="visible" title="知识库" width="680px">
-    <el-tabs v-model="tab">
-      <el-tab-pane label="添加资料" name="add">
-        <el-radio-group v-model="mode" class="kb-mode">
-          <el-radio-button value="text">粘贴文本</el-radio-button>
-          <el-radio-button value="file">上传文件</el-radio-button>
-          <el-radio-button value="url">抓取网址</el-radio-button>
-        </el-radio-group>
-
-        <template v-if="mode === 'text'">
-          <el-input v-model="title" class="kb-field" placeholder="标题（可选，不填取正文开头）" maxlength="60" />
-          <el-input v-model="content" type="textarea" :rows="8" placeholder="粘贴攻略正文…"/>
-        </template>
-
-        <template v-else-if="mode === 'file'">
-          <el-upload :auto-upload="false" :show-file-list="false" accept=".txt,.md,.markdown" :on-change="onFileChange">
-            <el-button>选择文件</el-button>
-          </el-upload>
-          <p v-if="fileName" class="kb-tip">已读取：{{ fileName }}（{{ content.length }} 字）</p>
-          <p v-else class="kb-tip">支持 .txt / .md，内容在浏览器里读成文本后入库</p>
-        </template>
-
-        <template v-else>
-          <el-input v-model="url" placeholder="https://…（攻略页地址）"/>
-          <p class="kb-tip">用无头浏览器打开并跑完 JS 再取正文，需要几秒到十几秒；页面里的插图会转成文字描述一起入库</p>
-        </template>
-
-        <div class="kb-actions">
-          <el-button type="primary" :loading="saving" :disabled="!canSubmit" @click="submit">入库</el-button>
-        </div>
-      </el-tab-pane>
-
-      <el-tab-pane :label="`已入库（${docs.length}）`" name="list">
-        <p v-if="!docs.length" class="kb-empty">知识库还是空的，先添加一些攻略资料</p>
-        <div v-else class="kb-docs">
-          <div v-for="d in docs" :key="d.source_url || d.title" class="kb-doc">
-            <div class="kb-doc__main">
-              <span class="kb-doc__title">{{ d.title }}</span>
-              <span class="kb-doc__meta">{{ d.chunks }} 个片段</span>
-            </div>
-            <KnowledgeThumbs :images="thumbs(d)" :size="40" />
-            <el-button link type="danger" @click="remove(d)">删除</el-button>
-          </div>
-        </div>
-      </el-tab-pane>
-    </el-tabs>
-  </el-dialog>
-</template>
 
 <style scoped>
 .kb-mode {

@@ -1,4 +1,16 @@
 <!-- components/MessageMarkdown.vue —— 回答正文：markdown 段 + 知识库图片块（图文混排） -->
+<template>
+  <template v-for="b in blocks" :key="b.key">
+    <div v-if="b.kind === 'html'" v-html="b.html"></div>
+    <el-image v-else-if="imgSrc(b)" :src="imgSrc(b)"
+              :preview-src-list="previewList" :initial-index="previewList.indexOf(imgSrc(b))"
+              fit="contain" class="kb-inline">
+      <!-- 文档已删的图会 404：error 槽吞掉，别裂图刷屏 -->
+      <template #error><div class="kb-inline__fail">图已失效</div></template>
+    </el-image>
+  </template>
+</template>
+
 <script setup lang="ts">
 import { computed, watch } from 'vue'
 import { useImageUrls } from '@/services/imageUrls'
@@ -36,18 +48,6 @@ function imgSrc(b: Block): string {
 
 const previewList = computed(() => blocks.value.map(imgSrc).filter(Boolean))
 </script>
-
-<template>
-  <template v-for="b in blocks" :key="b.key">
-    <div v-if="b.kind === 'html'" v-html="b.html"></div>
-    <el-image v-else-if="imgSrc(b)" :src="imgSrc(b)"
-              :preview-src-list="previewList" :initial-index="previewList.indexOf(imgSrc(b))"
-              fit="contain" class="kb-inline">
-      <!-- 文档已删的图会 404：error 槽吞掉，别裂图刷屏 -->
-      <template #error><div class="kb-inline__fail">图已失效</div></template>
-    </el-image>
-  </template>
-</template>
 
 <style scoped>
 .kb-inline {

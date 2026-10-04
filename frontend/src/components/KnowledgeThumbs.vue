@@ -1,4 +1,16 @@
 <!-- components/KnowledgeThumbs.vue —— 知识库图片缩略图：点击放大，已删的图静默 -->
+<template>
+  <div v-if="visible.length" class="thumbs">
+    <el-image v-for="(k, i) in visible" :key="k" :src="urls[k]"
+              :preview-src-list="previewList" :initial-index="i"
+              :style="{width: `${size}px`, height: `${size}px`}"
+              fit="cover" class="thumbs__item">
+      <!-- 已删文档的图会 404：error 槽吞掉，别裂图刷屏 -->
+      <template #error><div class="thumbs__fail">图已失效</div></template>
+    </el-image>
+  </div>
+</template>
+
 <script setup lang="ts">
 import {computed, ref, watch} from 'vue'
 import {useImageUrls} from '@/services/imageUrls'
@@ -23,18 +35,6 @@ watch(keys, (next, prev) => {
 const visible = computed(() => shown.value.filter(k => urls.value[k]))
 const previewList = computed(() => visible.value.map(k => urls.value[k]))
 </script>
-
-<template>
-  <div v-if="visible.length" class="thumbs">
-    <el-image v-for="(k, i) in visible" :key="k" :src="urls[k]"
-              :preview-src-list="previewList" :initial-index="i"
-              :style="{width: `${size}px`, height: `${size}px`}"
-              fit="cover" class="thumbs__item">
-      <!-- 已删文档的图会 404：error 槽吞掉，别裂图刷屏 -->
-      <template #error><div class="thumbs__fail">图已失效</div></template>
-    </el-image>
-  </div>
-</template>
 
 <style scoped>
 .thumbs {

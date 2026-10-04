@@ -1,4 +1,37 @@
 <!-- views/Login.vue —— 登录 / 注册页：直连 Supabase GoTrue 换取 JWT -->
+<template>
+    <div class="login">
+        <form class="login__card" @submit.prevent="submit">
+            <h1 class="login__brand">日常助手</h1>
+            <p class="login__hint">{{ isSignUp ? '创建一个账号' : '登录后继续你的对话' }}</p>
+
+            <label class="login__field">
+                <span class="login__label">用户名</span>
+                <input v-model="username" class="login__input" type="text" autocomplete="username"
+                       placeholder="字母、数字、_ 或 -" minlength="3" maxlength="32"
+                       pattern="[A-Za-z0-9_-]+" required>
+            </label>
+            <label class="login__field">
+                <span class="login__label">密码</span>
+                <input v-model="password" class="login__input" type="password"
+                       :autocomplete="isSignUp ? 'new-password' : 'current-password'"
+                       placeholder="至少 6 位" minlength="6" required>
+            </label>
+
+            <p v-if="error" class="login__error">{{ error }}</p>
+            <p v-if="notice" class="login__notice">{{ notice }}</p>
+
+            <button class="login__submit" type="submit" :disabled="busy">
+                {{ busy ? '处理中…' : (isSignUp ? '注册' : '登录') }}
+            </button>
+
+            <button class="login__switch" type="button" @click="isSignUp = !isSignUp; error = ''">
+                {{ isSignUp ? '已有账号，去登录' : '没有账号？注册一个' }}
+            </button>
+        </form>
+    </div>
+</template>
+
 <script setup lang="ts">
 import {ref} from 'vue'
 import {useRouter} from 'vue-router'
@@ -38,39 +71,6 @@ async function submit() {
     }
 }
 </script>
-
-<template>
-    <div class="login">
-        <form class="login__card" @submit.prevent="submit">
-            <h1 class="login__brand">日常助手</h1>
-            <p class="login__hint">{{ isSignUp ? '创建一个账号' : '登录后继续你的对话' }}</p>
-
-            <label class="login__field">
-                <span class="login__label">用户名</span>
-                <input v-model="username" class="login__input" type="text" autocomplete="username"
-                       placeholder="字母、数字、_ 或 -" minlength="3" maxlength="32"
-                       pattern="[A-Za-z0-9_-]+" required>
-            </label>
-            <label class="login__field">
-                <span class="login__label">密码</span>
-                <input v-model="password" class="login__input" type="password"
-                       :autocomplete="isSignUp ? 'new-password' : 'current-password'"
-                       placeholder="至少 6 位" minlength="6" required>
-            </label>
-
-            <p v-if="error" class="login__error">{{ error }}</p>
-            <p v-if="notice" class="login__notice">{{ notice }}</p>
-
-            <button class="login__submit" type="submit" :disabled="busy">
-                {{ busy ? '处理中…' : (isSignUp ? '注册' : '登录') }}
-            </button>
-
-            <button class="login__switch" type="button" @click="isSignUp = !isSignUp; error = ''">
-                {{ isSignUp ? '已有账号，去登录' : '没有账号？注册一个' }}
-            </button>
-        </form>
-    </div>
-</template>
 
 <style scoped>
 .login {

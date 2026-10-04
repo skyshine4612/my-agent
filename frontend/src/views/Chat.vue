@@ -1,3 +1,72 @@
+<template>
+  <div class="chat">
+    <!-- 左侧窄会话列表 -->
+    <aside class="chat__side">
+      <div class="brand">
+        <span class="brand__dot"></span>
+        <span class="brand__name">日常助手</span>
+      </div>
+      <el-button class="chat__new" text :icon="Plus" @click="newChat">新对话</el-button>
+
+      <nav class="conv-list">
+        <div
+          v-for="c in convStore.conversations"
+          :key="c.id"
+          class="conv"
+          :class="{ 'conv--active': c.id === convStore.currentId }"
+          @click="selectConversation(c.id)"
+        >
+          <span class="conv__title">{{ c.title || '新会话' }}</span>
+          <span class="conv__date">{{ shortDate(c.created_at) }}</span>
+          <button class="conv__del" title="删除会话" @click.stop="deleteConv(c.id)">×</button>
+        </div>
+        <p v-if="!convStore.conversations.length" class="conv__empty">暂无会话</p>
+      </nav>
+
+      <div class="side-user">
+        <span class="side-user__mail" :title="auth.displayName">{{ auth.displayName }}</span>
+        <button class="side-user__out" @click="logout">退出</button>
+      </div>
+    </aside>
+
+    <!-- 中间对话区：核心，占主导 -->
+    <section class="chat__main">
+      <ChatPanel :messages="messages" :streaming="streaming" :thinking="thinking" :phase="phase"
+                 :attached="attached" :uploading="uploading"
+                 @send="send" @upload="handleUpload" @download="downloadArtifact"
+                 @open-memory="openMemory" @open-knowledge="knowledgeVisible = true" />
+    </section>
+
+    <!-- 记忆弹窗：长期（全局偏好）/短期（当前会话 running summary）tab 切换 -->
+    <el-dialog v-model="memoryVisible" title="记忆" width="640px">
+      <el-tabs v-model="activeMemoryTab">
+        <el-tab-pane label="长期记忆" name="long">
+          <p v-if="!longTerm.length" class="memory-empty">暂无长期记忆（跨会话偏好）</p>
+          <div v-else class="memory-fact-list">
+            <div v-for="(f, i) in longTerm" :key="i" class="memory-fact">
+              <span class="memory-fact__text">{{ f.fact }}</span>
+              <el-tag size="small" type="info">重要度 {{ (f.importance * 100).toFixed(0) }}%</el-tag>
+            </div>
+          </div>
+        </el-tab-pane>
+        <el-tab-pane label="短期记忆" name="short">
+          <p v-if="!convStore.currentId" class="memory-empty">请先开始一个会话，短期记忆跟随当前会话</p>
+          <div v-else-if="shortTerm.length" class="memory-records">
+            <div v-for="(r, i) in shortTerm" :key="i" class="memory-record" :class="`memory-record--${r.role}`">
+              <span class="memory-record__role">{{ memoryView(r).label }}</span>
+              <span class="memory-record__content">{{ memoryView(r).content }}</span>
+            </div>
+          </div>
+          <p v-else class="memory-empty">当前会话还没有短期记忆（running summary）</p>
+        </el-tab-pane>
+      </el-tabs>
+    </el-dialog>
+
+    <!-- 知识库弹窗：与「记忆」并列，管理检索用的攻略语料 -->
+    <KnowledgeDialog v-model="knowledgeVisible" />
+  </div>
+</template>
+
 <script setup lang="ts">
 // Chat.vue —— 通用对话主界面：左侧窄会话列表 + 中间对话区
 // 负责 SSE 事件分发（conversation_id/token/tool_call/tool_result/done）与会话管理
@@ -373,75 +442,6 @@ onMounted(async () => {
   }
 })
 </script>
-
-<template>
-  <div class="chat">
-    <!-- 左侧窄会话列表 -->
-    <aside class="chat__side">
-      <div class="brand">
-        <span class="brand__dot"></span>
-        <span class="brand__name">日常助手</span>
-      </div>
-      <el-button class="chat__new" text :icon="Plus" @click="newChat">新对话</el-button>
-
-      <nav class="conv-list">
-        <div
-          v-for="c in convStore.conversations"
-          :key="c.id"
-          class="conv"
-          :class="{ 'conv--active': c.id === convStore.currentId }"
-          @click="selectConversation(c.id)"
-        >
-          <span class="conv__title">{{ c.title || '新会话' }}</span>
-          <span class="conv__date">{{ shortDate(c.created_at) }}</span>
-          <button class="conv__del" title="删除会话" @click.stop="deleteConv(c.id)">×</button>
-        </div>
-        <p v-if="!convStore.conversations.length" class="conv__empty">暂无会话</p>
-      </nav>
-
-      <div class="side-user">
-        <span class="side-user__mail" :title="auth.displayName">{{ auth.displayName }}</span>
-        <button class="side-user__out" @click="logout">退出</button>
-      </div>
-    </aside>
-
-    <!-- 中间对话区：核心，占主导 -->
-    <section class="chat__main">
-      <ChatPanel :messages="messages" :streaming="streaming" :thinking="thinking" :phase="phase"
-                 :attached="attached" :uploading="uploading"
-                 @send="send" @upload="handleUpload" @download="downloadArtifact"
-                 @open-memory="openMemory" @open-knowledge="knowledgeVisible = true" />
-    </section>
-
-    <!-- 记忆弹窗：长期（全局偏好）/短期（当前会话 running summary）tab 切换 -->
-    <el-dialog v-model="memoryVisible" title="记忆" width="640px">
-      <el-tabs v-model="activeMemoryTab">
-        <el-tab-pane label="长期记忆" name="long">
-          <p v-if="!longTerm.length" class="memory-empty">暂无长期记忆（跨会话偏好）</p>
-          <div v-else class="memory-fact-list">
-            <div v-for="(f, i) in longTerm" :key="i" class="memory-fact">
-              <span class="memory-fact__text">{{ f.fact }}</span>
-              <el-tag size="small" type="info">重要度 {{ (f.importance * 100).toFixed(0) }}%</el-tag>
-            </div>
-          </div>
-        </el-tab-pane>
-        <el-tab-pane label="短期记忆" name="short">
-          <p v-if="!convStore.currentId" class="memory-empty">请先开始一个会话，短期记忆跟随当前会话</p>
-          <div v-else-if="shortTerm.length" class="memory-records">
-            <div v-for="(r, i) in shortTerm" :key="i" class="memory-record" :class="`memory-record--${r.role}`">
-              <span class="memory-record__role">{{ memoryView(r).label }}</span>
-              <span class="memory-record__content">{{ memoryView(r).content }}</span>
-            </div>
-          </div>
-          <p v-else class="memory-empty">当前会话还没有短期记忆（running summary）</p>
-        </el-tab-pane>
-      </el-tabs>
-    </el-dialog>
-
-    <!-- 知识库弹窗：与「记忆」并列，管理检索用的攻略语料 -->
-    <KnowledgeDialog v-model="knowledgeVisible" />
-  </div>
-</template>
 
 <style scoped>
 .chat {
