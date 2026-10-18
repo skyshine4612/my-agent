@@ -25,7 +25,7 @@ class Settings(BaseSettings):
     embedding_model: str = "text-embedding-v4"
     # Embedding 向量维度：必须与建表时的 vector(N) 一致，换模型时两处要一起改
     embedding_dimensions: int = 1024
-    # 多模态模型名（把攻略页插图转成文字描述用，如 qwen3.7-plus）
+    # 多模态模型名（把攻略页插图转成文字描述用）
     vision_model: str = ""
     # 多模态 API Key（同上，值通常与 llm_api_key 相同，但必须显式配在 .env）
     vision_api_key: str = ""
@@ -54,7 +54,7 @@ class Settings(BaseSettings):
     # SUPABASE_PUBLIC_URL（http://localhost:8000），两者不是一回事。
     supabase_url: str = ""
     # 工作记忆 token 预算上限：每次 LLM 调用前估算上下文，超预算淘汰最老交互 + LLM 摘要兜底
-    # 应 ≤ 模型上下文上限（qwen3.7-plus 为 1M）并预留输出余量（128K）；取 128K 平衡成本与长上下文能力
+    # 应 ≤ 模型上下文上限（如1M）并预留输出余量（128K）；取 128K 平衡成本与长上下文能力
     llm_context_budget: int = 128000
     # 工具结果字符串截断阈值：超过该字符数时，完整结果写临时文件，
     # 窗口只放预览 + 文件路径提示，模型用 read_file/grep 按需读回被截掉的部分
