@@ -193,7 +193,7 @@ grant usage, select on sequence
     to authenticated;
 ```
 
-> **主库实际的表级 ACL 比这里宽**：自托管 Supabase 的初始化脚本把 `public` schema 下全部表的全量权限授给了 `anon` / `authenticated` / `service_role`（`arwdDxtm`，含 update 与 truncate）。上面这段 grant 是幂等子集，**只增不减**，不会撤销已有授权。所以**表级权限不是防线，RLS 才是**：`documents` 有 update 权限却没有 update 策略，更新照样被拒；`anon` 有全部权限，但六条策略都只对 `authenticated` 生效——实测它读这六张表全返 0 行（表里不是空的）。
+> **主库实际的表级 ACL 比这里宽**：自托管 Supabase 的初始化脚本把 `public` schema 下全部表的全量权限授给了 `anon` / `authenticated` / `service_role`（`arwdDxtm`，含 update 与 truncate）。上面这段 grant 是幂等子集，**只增不减**，不会撤销已有授权。所以**表级权限不是防线，RLS 才是**：`documents` 有 update 权限却没有 update 策略，更新照样被拒；`anon` 有全部权限，但六条策略都只对 `authenticated` 生效——以 `anon` 身份读这六张表返回 0 行（表里不是空的）。
 
 ## 检索函数
 
@@ -223,14 +223,14 @@ grant usage, select on sequence
 
 > **两个 URL 不是一回事**：后端用 `SUPABASE_URL` 走**内网网关**（后端进程与 Supabase 同网）；浏览器侧另有一个 `SUPABASE_PUBLIC_URL`（在 Supabase 自己的 `docker/.env` 里），前端拿它配 `VITE_SUPABASE_URL` 直连 GoTrue 登录。后端若误填公网地址，storage 链路会跟着出口网络一起抖。
 
-> **用户注销后 `files` 行随 `on delete cascade` 消失，`storage.objects` 里会留孤儿对象**：storage 与 public 是两个 schema、两套表，外键跨不过去。清理孤儿需要一个持 `service_role` 的定时任务（后端自签的 JWT 只能删 `auth.uid()` 名下的对象，而用户已经不在了）。当前没有这样的任务，孤儿随用户注销产生。
+> **用户注销后 `files` 行随 `on delete cascade` 消失，`storage.objects` 里会留孤儿对象**：storage 与 public 是两个 schema、两套表，外键跨不过去；后端自签的 JWT 只能删 `auth.uid()` 名下的对象，用户注销后没有身份能清到这些对象。目前没有清理任务，孤儿随用户注销产生。
 
 | 桶 | 用途 | key 约定 | 隔离 |
 |---|---|---|---|
 | `files` | 会话文件（上传件 + 脚本产物） | `<user_id>/<conversation_id>/<file_id>/original.<ext>` | 按用户，key 首段必须是 `auth.uid()` |
 | `knowledge` | 知识库图片 | `<source_key>/<ingest_id>/<序号>.<ext>` | 全局共享（与 `documents` 表定位一致） |
 
-两个桶都 `public: false`，桶级 `file_size_limit` **留空**（单件上限由后端 `MAX_UPLOAD_SIZE` 把关；Studio 的输入框单位是 MB，按字节填会乘 1048576）。
+两个桶都 `public: false`，桶级 `file_size_limit` **留空**；单件上限由后端 `MAX_UPLOAD_SIZE` 把关。
 
 | 策略 | 判定 |
 |---|---|
@@ -241,16 +241,16 @@ grant usage, select on sequence
 
 **后端访问方式是「每次调用内现签的短时 HS256 JWT」**（`app/core/storage.py`）：RLS 判定发生在 storage-api 进程里，不是后端进程里，后端说不了话（`rls_conn` 能直说是因为后端自己就是那个 PG 连接的主人），storage-api 能取到的 `auth.uid()` 唯一来源就是请求头里的签名。所以**启用非对称密钥会同时打断后端本地验签与 storage 链路**。
 
-**storage-api v1.74.0 的实测行为**（2026-09-12）：
+**storage-api 行为要点**（版本见 `docker/docker-compose.yml`）：
 
 | 判据 | 结论 |
 |---|---|
-| 无策略时以 authenticated 身份上传 | 拒绝。**HTTP 400**，真实状态码在 body 的 `statusCode` 里（`{"statusCode":"403","code":"AccessDenied"}`）；service_role 同一请求 200 |
-| 跨用户 key / 不含斜杠的 key | 均拒绝 —— `(storage.foldername(name))[1]` 取不到段时 fail-closed |
-| **key 的字符集** | 含**非 ASCII**、`#`、`%` 的 key 一律 `400 InvalidKey`，**百分号编码救不了**（编码发生在客户端，服务端看到的是解码结果）。`?`、空格、大写、超长扩展名反而收 |
-| `DELETE /object/{bucket}` + `{"prefixes":[…]}` | **不做前缀匹配**，只认精确对象路径（字段名来自 S3 `DeleteObjects`）。传目录路径返回 `200 []` 且一个都不删 |
-| `POST /object/list/{bucket}` + `{"prefix":…}` | **目录式列举**：返回下一段路径名而非完整 key，伪目录 `id` 为 `null`、真对象 `id` 是真 uuid；`limit` / `offset` 可用 |
+| 无策略时 authenticated 上传 | 拒绝；真实状态码在 body 的 `statusCode` 里（HTTP 400），不是 403 |
+| 跨用户 key / 不含斜杠的 key | 拒绝，`storage.foldername(name)` 取不到段时 fail-closed |
+| key 的字符集 | 含非 ASCII、`#`、`%` 一律 `400 InvalidKey`，百分号编码救不了 |
+| 批量删 `DELETE /object/{bucket}` + `prefixes` | 不做前缀匹配，只认精确对象路径；传目录路径返回 `200 []` 且一个都不删 |
+| 列举 `POST /object/list/{bucket}` | 目录式：返回下一段路径名，伪目录 `id` 为 `null` |
 
-> 由此，`StorageClient.delete_prefix` 的实现是**递归 list + 按精确路径批量删**，而不是把目录路径丢给批量删端点——后者不报错也不生效，`delete_conversation` 会永远留孤儿。错误分类也**不能只看 HTTP 状态码**：RLS 拒绝是 400，只认 401/403 会让「有人动了 auth 密钥」那条告警永远不触发。
+> 因此 `delete_prefix` 是递归 list + 按精确路径批量删。错误分类也不能只看 HTTP 状态码：RLS 拒绝是 400，只认 401/403 会让「有人动了 auth 密钥」那条告警永远不触发。
 
 **key 必须由构造保证全 ASCII**（`storage.py` 的 `safe_ext` / `encode_key`）。两个桶现在都满足：`files` 是 `<uuid>/<uuid>/<hex>/original<扩展名>`，扩展名过 `safe_ext` 白名单（`[a-z0-9]{1,8}`，判不出就丢）；`knowledge` 是 `<sha256[:16]>/<uuid4.hex>/<序号>.<ext>`，前两段天然是十六进制，`<ext>` 来自 `ALLOWED_MIME` 白名单映射。**扩展名只给 key 一点可读性、不是下载依据**——真名在 `files.name`，`Content-Disposition` 用它，所以丢掉是安全的；反过来把非 ASCII 原样带进 key 就是让上传直接 400。

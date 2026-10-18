@@ -93,9 +93,10 @@ def _normalize(text: str) -> str:
 def extract_with_images(html: str, base_url: str = "") -> tuple[str, list[str]]:
     """HTML → (带图片占位的正文, 按出现顺序的图片 URL 列表)。
 
-    正文由 trafilatura 提取，**只关掉 include_comments 一项**（理由见该参数处的注释；
-    其余仍走默认配置，为什么不调 MIN_EXTRACTED_SIZE 见文件头），本函数只把它输出的
-    markdown 转成建库管道要的形状。base_url 传页面地址：trafilatura 靠它启用站点特定规则。
+    正文由 trafilatura 提取：显式要 markdown 输出并保留表格 / 图片 / 链接（建库管道需要），
+    同时关掉评论区（理由见该参数处的注释）；其余走默认配置。为什么不调
+    MIN_EXTRACTED_SIZE 见文件头。本函数只把输出的 markdown 转成建库管道要的形状。
+    base_url 传页面地址：trafilatura 靠它启用站点特定规则。
     """
     md = trafilatura.extract(
         html,

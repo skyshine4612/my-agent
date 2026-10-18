@@ -1,6 +1,6 @@
 # 个人智能助手
 
-多业务对话式 Agent 平台。后端基于 FastAPI + LangGraph 实现「通用 agent → 工具调用 → critic 事实校验」链路，前端是 Vue 3 通用对话界面。当前内置旅行助手、饮食规划、网页搜索、节假日、天气、翻译、热榜，另有一个本地知识库（RAG）存放自己收录的攻略语料，可通过接入更多工具自然扩展业务场景。
+多业务对话式 Agent 平台。后端基于 FastAPI + LangGraph 实现「通用 agent → 工具调用 → critic 事实校验」链路，前端是 Vue 3 通用对话界面。内置三个业务 skill（旅行规划、饮食规划、Excel 字段脱敏），工具覆盖 POI/推荐菜、天气、节假日、翻译、热榜、菜谱、营养、联网搜索，另有一个本地知识库（RAG）存放自己收录的攻略语料；新增业务按「skill + 工具」扩展。
 
 ## 功能特性
 
@@ -10,8 +10,8 @@
 - **标准 skill 两段式**：业务规则（`SKILL.md`）的清单常驻 system prompt，正文按需加载，新增业务无需改装配代码。
 - **子 Agent 委派**：复杂子任务可委派给独立上下文的子 Agent 处理、只返回摘要，避免主上下文被大量工具结果淹没。
 - **三层记忆**：工作记忆（本轮工具结果，易失）+ 短期记忆（summary 摘要 + 最近几轮结构化对话含工具调用，独立表持久化，是喂 LLM 的权威源）+ 长期记忆（跨会话偏好），记忆与会话历史分离：长期/短期记忆各从各表读，messages/conversations 仅前端展示；短期记忆超预算压成摘要（物理删除早期回合），工作记忆超长 spill（摘要 + 文件地址索引），子 Agent 按子会话隔离工具结果地址索引。
-- **本地知识库（RAG）**：自己收录的攻略语料（粘贴文本 / 上传文件 / 抓取网址三种入库方式）切块后用 `text-embedding-v4` 向量化存进 pgvector，检索按余弦相似度取 top-k。攻略页插图先转成文字描述再入库（知识库是文本语义检索，图片不转成文字就搜不到），**原图同时存进 Supabase Storage**，检索命中时随工具结果一起下发，对话里直接渲染成缩略图、点击可放大。知识库优先于通用查询工具：它记的是 POI 接口给不出的细节（具体店名、营业时间、避坑经验）。
-- **长结果地址索引 + 历史会话压缩**：工具结果超阈值时完整结果写临时文件，模型用 `read_file`/`grep` 按需读回；历史会话按 running summary 压缩——一个会话的短期记忆 = 累积摘要 + 最近几轮原文 + 完整历史文件，上下文到阈值才触发，早期答案压成摘要、最近几轮保留原文，跨轮引用靠 `read_file` 读回，既避免截断丢信息，也避免模型凭标题编造细节。
+- **本地知识库（RAG）**：自己收录的攻略语料（粘贴文本 / 上传文件 / 抓取网址三种入库方式）切块后用 `text-embedding-v4` 向量化存进 pgvector，检索按余弦相似度取 top-k，再过一道相关性下限（低于阈值直接视为「知识库暂无相关内容」，避免把无关片段当权威资料）。攻略页插图先转成文字描述再入库（知识库是文本语义检索，图片不转成文字就搜不到），**原图同时存进 Supabase Storage**，检索命中时随工具结果一起下发，对话里直接渲染成缩略图、点击可放大。知识库优先于通用查询工具：它记的是 POI 接口给不出的细节（具体店名、营业时间、避坑经验）。
+- **长结果地址索引**：工具结果超阈值时，完整结果写临时文件，窗口只留预览与路径，模型用 `read_file`/`grep` 按需读回；本轮结束清理，历史答案另存 `_history.txt` 供跨轮读回。
 - **记忆查看**：输入框旁「记忆」入口，弹窗内 tab 切换长期偏好与当前会话的短期记忆（摘要 + 最近几轮对话）。
 - **SSE 流式对话**：答案校验通过后按块流式下发（不是逐 token），实时展示工具调用进度；完整回复在流式输出前已落库，刷新后自动恢复会话与历史。
 - **账号登录 + 用户隔离**：Supabase Auth（GoTrue）注册/登录，前端持 JWT 调后端；后端本地 HS256 验签取用户身份，数据层按 `user_id` 过滤 **且** 每条查询都在 `role=authenticated` 事务里跑，由 Postgres RLS 策略兜底。
@@ -20,11 +20,11 @@
 
 | 层 | 技术                                                                                    |
 |---|-----------------------------------------------------------------------------------------|
-| 后端 | Python 3.11+ · FastAPI · LangGraph · langchain · pydantic-settings · openai SDK · mcp · sse-starlette · asyncpg · PyJWT · tiktoken |
+| 后端 | Python 3.11+ · FastAPI · LangGraph · langchain · langchain-openai · pydantic-settings · openai SDK（embedding / vision）· mcp · sse-starlette · asyncpg · PyJWT · tiktoken |
 | 前端 | Vue 3 · Vite · TypeScript · Element Plus · Pinia · supabase-js · marked + DOMPurify      |
 | 存储 / 身份 | 自托管 Supabase（Postgres + pgvector + Storage + GoTrue），6 张业务表全开 RLS          |
 | 抓取 | Playwright（跑完 JS 再取 DOM）+ trafilatura（提取正文）                                    |
-| LLM | 阿里云百炼 DashScope（`qwen3.7-plus`，OpenAI 兼容协议）                                 |
+| LLM | 阿里云百炼 DashScope（OpenAI 兼容协议，模型名由配置决定）                                |
 | 基础设施 | Docker + docker-compose（`docker/`：Supabase 全套 + 代码执行沙箱）                       |
 
 ## 目录结构
@@ -33,29 +33,21 @@
 my-agent/
 ├── backend/
 │   ├── app/
-│   │   ├── api/routes/        # 路由：SSE 对话 + 会话 + 记忆 + 知识库
-│   │   ├── core/              # 核心：agent(ReAct 图)/llm/critic/registry/db(连接池+RLS)/auth(JWT)/prompts/skills
-│   │   │                      #   memory(三层记忆)/knowledge(RAG)/ingest(抓取)/vision(插图转文字)/embedding/logging
-│   │   │                      #   storage(对象存储)/files(会话文件)/sandbox(沙箱)/skill_scripts(脚本)
-│   │   ├── datasource/        # 数据源：MCP（12306/机票）+ HTTP（高德/UAPIS/Tavily）
+│   │   ├── api/routes/        # HTTP 入口：SSE 对话、会话、记忆、知识库、文件
+│   │   ├── core/              # ReAct 图、critic、LLM、RLS 连接、记忆、RAG、存储、沙箱
+│   │   ├── datasource/        # MCP（12306 / 机票）+ HTTP（高德 / UAPIS / Tavily）
 │   │   ├── models/            # Pydantic 请求模型
-│   │   ├── prompts/           # 提示词 .md（system/grounding/critic）
+│   │   ├── prompts/           # 运行时提示词
 │   │   ├── services/          # AgentService 编排器
-│   │   ├── skills/            # 业务 skill（travel/meal_planning 等）
-│   │   ├── tools/             # 工具注册（travel/network/common/file/system/sub_agent）
+│   │   ├── skills/            # 业务 skill（travel / meal_planning / excel）
+│   │   ├── tools/             # 工具定义与注册
 │   │   ├── config.py          # 配置（读取 .env）
 │   │   └── main.py            # FastAPI 应用入口
-│   ├── tests/                 # pytest 测试（不依赖真实 LLM/网络）
+│   ├── tests/                 # pytest 测试（不依赖真实 LLM / 网络）
 │   ├── pyproject.toml         # 依赖 + pytest 配置
 │   └── run.py                 # 开发启动入口
 ├── frontend/
-│   └── src/
-│       ├── views/             # Login.vue（登录/注册）+ Chat.vue（SSE 事件分发 + 会话管理 + 记忆/知识库弹窗）
-│       ├── components/        # ChatPanel（markdown + 工具气泡 + 输入框）/ KnowledgeDialog（建库与文档列表）
-│       ├── services/          # api.ts / sse.ts / supabase.ts
-│       ├── router/            # 路由 + 登录守卫
-│       ├── stores/            # Pinia（auth / conversation）
-│       └── types/             # TS 类型定义
+│   └── src/                   # views / components / services / stores / router / types
 ├── deploy/                    # schema.sql（业务表 + RLS + 检索函数）、storage.sql（桶策略）
 ├── docker/                    # 自托管 Supabase 栈 + sandbox 服务
 ├── CLAUDE.md                  # 给改代码的 agent：命令、架构、不变量
@@ -107,7 +99,7 @@ cp .env.example .env   # 填入真实密钥（见下方配置说明）
 ```bash
 cd backend
 uv sync                 # 安装依赖
-uv run python run.py    # 启动于 http://0.0.0.0:8000（reload）
+uv run python run.py    # 启动于 http://0.0.0.0:8080（reload）
 ```
 
 > 未配 `SUPABASE_DATABASE_URL` 时启动会因连接池建不起来而报错；未配置 `LLM_API_KEY` 时后端仍可启动，但对话返回空内容。
@@ -129,7 +121,7 @@ Linux 上若报缺少系统库，再执行 `uv run playwright install-deps chrom
 cd frontend
 cp .env.example .env    # 填 VITE_SUPABASE_URL / VITE_SUPABASE_ANON_KEY
 npm install
-npm run dev             # 启动于 http://127.0.0.1:5173，/api 代理到 8000
+npm run dev             # 启动于 http://127.0.0.1:5173，/api 代理到 8080
 ```
 
 浏览器访问前端地址，注册账号后即可对话。
@@ -141,7 +133,7 @@ npm run dev             # 启动于 http://127.0.0.1:5173，/api 代理到 8000
 仓库只提供基础设施容器（`docker/`），后端与前端按上面的「本地开发」步骤在宿主机启动：
 
 - Supabase 与 `sandbox` 由 `docker compose up -d` 起；后端通过 `SUPABASE_URL` / `SANDBOX_URL` 指向它们——后端与容器同机时填服务名，跨机时填宿主机地址与映射端口（`sandbox` 映射 `8001`）。
-- 前端 `npm run build` 的产物交给静态服务器托管，`/api` 反代到后端 `:8000`；构建前先备好 `frontend/.env`（`VITE_` 变量在构建时内联）。
+- 前端 `npm run build` 的产物交给静态服务器托管，`/api` 反代到后端 `:8080`；构建前先备好 `frontend/.env`（`VITE_` 变量在构建时内联）。
 - 部署后端的那台机器同样要先装 Chromium（见「本地开发 → 3. 安装无头浏览器」）；后端若跑在容器里，需在镜像构建时装进浏览器，或通过 `PLAYWRIGHT_BROWSERS_PATH` 挂载宿主机的浏览器缓存，否则知识库抓网址会失败。
 
 ## 配置说明
@@ -152,13 +144,13 @@ npm run dev             # 启动于 http://127.0.0.1:5173，/api 代理到 8000
 |---|---|-----------------------------------------------------|
 | `LLM_API_KEY` | LLM 服务 API Key | 空                                                  |
 | `LLM_BASE_URL` | LLM 接口地址 | `https://dashscope.aliyuncs.com/compatible-mode/v1` |
-| `LLM_MODEL` | 使用的模型 | `qwen3.7-plus`                                      |
+| `LLM_MODEL` | 使用的模型 | 见 `.env.example` |
 | `ENABLE_THINKING` | Qwen 思考模式开关（`false` 关闭更快，`true` 更强推理但更慢） | `false`                                            |
 | `LLM_TEMPERATURE` | LLM 采样温度 | `0.5`                                                |
 | `EMBEDDING_API_KEY` | 向量化 API Key（知识库与长期记忆共用）。值通常与 `LLM_API_KEY` 相同，但必须显式配 | 空 |
 | `EMBEDDING_MODEL` | 向量化模型 | `text-embedding-v4`                                 |
 | `EMBEDDING_DIMENSIONS` | 向量维度，**必须与建表的 `vector(N)` 一致** | `1024`                                              |
-| `VISION_MODEL` | 多模态模型（攻略页插图转文字描述，`qwen3.7-plus` 支持图片输入） | `qwen3.7-plus` |
+| `VISION_MODEL` | 多模态模型（攻略页插图转文字描述），需支持图片输入 | 空（必须显式配） |
 | `VISION_API_KEY` | 多模态 API Key。值通常与 `LLM_API_KEY` 相同，但必须显式配 | 空 |
 | `MODELSCOPE_TOKEN` | ModelScope 访问令牌（调用 MCP 服务） | 空                                                  |
 | `TRAIN_12306_URL` | 12306 火车票 MCP 服务地址 | 空                                                  |
@@ -170,11 +162,14 @@ npm run dev             # 启动于 http://127.0.0.1:5173，/api 代理到 8000
 | `SUPABASE_DATABASE_URL` | 主库 `postgres` 的连接串（`postgresql://postgres:...@<host>:5432/postgres`） | 空 |
 | `SUPABASE_TEST_DATABASE_URL` | 测试库 `agent_test` 的连接串，未配置时跳过需要真实 Postgres 的用例 | 空 |
 | `SUPABASE_JWT_SECRET` | 与 Supabase `docker/.env` 的 `JWT_SECRET` 完全一致，本地 HS256 验签用 | 空 |
+| `SUPABASE_URL` | Supabase 网关地址（后端访问 Storage 用），不是数据库连接串 | 空 |
 | `LLM_CONTEXT_BUDGET` | 工作记忆 token 预算上限（超限淘汰最老 + LLM 摘要兜底） | `128000`                                            |
 | `TRUNCATE_LIMIT` | 工具结果字符串截断阈值（超限完整结果写文件，read_file/grep 按需读） | `4000`                                              |
 | `RESULT_DIR` | 工具结果地址索引的落盘目录（本轮用完即删） | `results`                                           |
 | `HISTORY_BUDGET_RATIO` | 历史答案原文占 `llm_context_budget` 的比例（早期答案落盘+摘要） | `0.5`                                                |
 | `LONG_TERM_HINT_RATIO` | 长期记忆 hint 占 `llm_context_budget` 的比例（召回偏好注入 system） | `0.05`                                              |
+| `SANDBOX_URL` | 代码执行沙箱地址（容器内用服务名，本地指向映射端口） | `http://sandbox:8001`                               |
+| `SANDBOX_TIMEOUT` | 沙箱执行超时秒数（后端实际多等 5s 拿结构化响应） | `60`                                                |
 
 ### 密钥获取来源
 

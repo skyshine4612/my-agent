@@ -201,13 +201,18 @@ class AgentService:
                 # 流式输出最终答案：拆小块逐块上发（此时已过 critic 校验，保证只输出一段干净答案）
                 for j in range(0, len(answer), 40):
                     await queue.put({"type": "token", "content": answer[j:j + 40]})
-                # 清理本轮 spill 文件（保留 _history.txt）；异步提炼长期记忆（fire-and-forget，不影响主流程返回）
-                await self.tool_result_store.clear_spill(conv_id, user_id)
+                # 异步提炼长期记忆（fire-and-forget，不影响主流程返回）
                 asyncio.create_task(self.memory.extract_facts(user_id, message))
                 # 观测出口：每轮收尾打一条指标快照日志，供线上观察
                 log_snapshot()
                 await queue.put({"type": "done"})
             finally:
+                # 本轮 spill 文件无论成败都清（保留 _history.txt）：异常结束不清会积到下一轮成功或删会话。
+                # 清理失败只告警，不能盖掉原始异常。
+                try:
+                    await self.tool_result_store.clear_spill(conv_id, user_id)
+                except Exception:
+                    logger.warning("清理会话 spill 文件失败：%s", conv_id, exc_info=True)
                 # 终止标记：成功或异常都放，保证主协程能退出；异常随后在 await worker 处重新抛出
                 await queue.put(None)
 
