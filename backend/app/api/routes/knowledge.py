@@ -44,6 +44,25 @@ def _fallback_title(content: str, title: str) -> str:
     return title.strip() or content.strip()[:20]
 
 
+# Playwright 的「浏览器没装 / 系统依赖不全」只会抛一行英文原文，前端原样显示等于没说，
+# 所以按消息特征翻成可执行的安装指引。
+_BROWSER_MISSING_MARKERS = ("Executable doesn't exist", "playwright install")
+_DEPS_MISSING_MARKERS = ("Host system is missing dependencies", "missing dependencies to run browsers")
+
+
+def _browser_error_hint(exc: Exception) -> str | None:
+    """浏览器缺失时返回安装指引；其他异常返回 None，交回原有透传路径。"""
+    message = str(exc)
+    # 先判依赖：`playwright install-deps` 那条消息里也含 "playwright install" 子串
+    if any(m in message for m in _DEPS_MISSING_MARKERS):
+        return ("Playwright 浏览器缺少系统依赖。请执行 `uv run playwright install-deps chromium` "
+                "（Linux 需要 root）后重试。")
+    if any(m in message for m in _BROWSER_MISSING_MARKERS):
+        return ("未安装 Playwright 浏览器。请在后端目录执行 `uv run playwright install chromium`。"
+                "未安装不影响粘贴文本 / 上传文件入库。")
+    return None
+
+
 async def _ingest(user_id: str, content: str, title: str, source_url: str,
                   images: list[dict] | None = None) -> int:
     """入库并对失败打日志：切块与向量化可能跑几十秒，中途失败必须留痕。
@@ -83,6 +102,9 @@ async def ingest_url(body: UrlIn, user_id: str = Depends(get_current_user)):
         title, content, images = await fetch_url_text(url)
     except Exception as e:
         logger.warning("[知识库] 抓取失败 url=%s：%s", url, e)
+        hint = _browser_error_hint(e)
+        if hint:
+            raise HTTPException(status_code=502, detail=f"抓取失败：{hint}") from e
         raise HTTPException(status_code=502, detail=f"抓取失败：{e}") from e
     # 正文太短基本是没抓到（纯 JS 渲染 / 被反爬 / 需要登录），宁可报错也不入库一堆噪声
     if len(content) < _MIN_CONTENT_LEN:

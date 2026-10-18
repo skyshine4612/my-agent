@@ -13,7 +13,7 @@
 - **本地知识库（RAG）**：自己收录的攻略语料（粘贴文本 / 上传文件 / 抓取网址三种入库方式）切块后用 `text-embedding-v4` 向量化存进 pgvector，检索按余弦相似度取 top-k。攻略页插图先转成文字描述再入库（知识库是文本语义检索，图片不转成文字就搜不到），**原图同时存进 Supabase Storage**，检索命中时随工具结果一起下发，对话里直接渲染成缩略图、点击可放大。知识库优先于通用查询工具：它记的是 POI 接口给不出的细节（具体店名、营业时间、避坑经验）。
 - **长结果地址索引 + 历史会话压缩**：工具结果超阈值时完整结果写临时文件，模型用 `read_file`/`grep` 按需读回；历史会话按 running summary 压缩——一个会话的短期记忆 = 累积摘要 + 最近几轮原文 + 完整历史文件，上下文到阈值才触发，早期答案压成摘要、最近几轮保留原文，跨轮引用靠 `read_file` 读回，既避免截断丢信息，也避免模型凭标题编造细节。
 - **记忆查看**：输入框旁「记忆」入口，弹窗内 tab 切换长期偏好与当前会话的短期记忆（摘要 + 最近几轮对话）。
-- **SSE 流式对话**：逐字输出答案，实时展示工具调用进度；完整回复在流式输出前已落库，刷新后自动恢复会话与历史。
+- **SSE 流式对话**：答案校验通过后按块流式下发（不是逐 token），实时展示工具调用进度；完整回复在流式输出前已落库，刷新后自动恢复会话与历史。
 - **账号登录 + 用户隔离**：Supabase Auth（GoTrue）注册/登录，前端持 JWT 调后端；后端本地 HS256 验签取用户身份，数据层按 `user_id` 过滤 **且** 每条查询都在 `role=authenticated` 事务里跑，由 Postgres RLS 策略兜底。
 
 ## 技术栈
@@ -25,7 +25,7 @@
 | 存储 / 身份 | 自托管 Supabase（Postgres + pgvector + Storage + GoTrue），6 张业务表全开 RLS          |
 | 抓取 | Playwright（跑完 JS 再取 DOM）+ trafilatura（提取正文）                                    |
 | LLM | 阿里云百炼 DashScope（`qwen3.7-plus`，OpenAI 兼容协议）                                 |
-| 部署 | Docker + docker-compose · nginx                                                         |
+| 基础设施 | Docker + docker-compose（`docker/`：Supabase 全套 + 代码执行沙箱）                       |
 
 ## 目录结构
 
@@ -56,25 +56,28 @@ my-agent/
 │       ├── router/            # 路由 + 登录守卫
 │       ├── stores/            # Pinia（auth / conversation）
 │       └── types/             # TS 类型定义
-├── docker-compose.yml
+├── deploy/                    # schema.sql（业务表 + RLS + 检索函数）、storage.sql（桶策略）
+├── docker/                    # 自托管 Supabase 栈 + sandbox 服务
+├── CLAUDE.md                  # 给改代码的 agent：命令、架构、不变量
+├── DATABASE.md                # 表结构、RLS、Storage 与 spill 落盘约定
 └── README.md
 ```
 
 ## 快速开始
 
-### 前置：自托管 Supabase
+### 前置：自托管 Supabase + 沙箱
 
-存储与登录都依赖 Supabase，需先把它跑起来（[官方自托管指引](https://supabase.com/docs/guides/self-hosting/docker)）：
+存储、登录与代码执行沙箱都由仓库自带的 `docker/docker-compose.yml` 起：
 
 ```bash
-git clone --depth 1 https://github.com/supabase/supabase
-cd supabase/docker
-cp .env.example .env
-sh ./utils/generate-keys.sh     # 生成 JWT_SECRET / ANON_KEY / SERVICE_ROLE_KEY 等
-docker compose up -d            # 起完整栈，Kong 网关默认 8000 端口
+cd docker
+cp env.example .env     # 填 POSTGRES_PASSWORD / JWT_SECRET，并重新生成 ANON_KEY / SERVICE_ROLE_KEY
+docker compose up -d    # 起 Supabase 全套 + sandbox，API 网关默认 8000 端口
 ```
 
-拿到 `docker/.env` 里的 `JWT_SECRET` 与 `ANON_KEY`，然后在 Studio（Kong 的 `/`）里建库：
+`env.example` 里的 `ANON_KEY` / `SERVICE_ROLE_KEY` 是官方 demo 值，必须用你的 `JWT_SECRET` 重新签发（[官方 generate-keys.sh](https://github.com/supabase/supabase/blob/master/docker/utils/generate-keys.sh)），否则 GoTrue 签发的 token 与后端验签、Storage 用的密钥对不上。其余变量含义见[官方自托管指引](https://supabase.com/docs/guides/self-hosting/docker)。
+
+拿到 `docker/.env` 里的 `JWT_SECRET` 与 `ANON_KEY`，然后在 Studio（网关 `/`，默认 8000 端口）里建库：
 
 - **主库 `postgres`**：跑 `deploy/schema.sql`——建 `extensions` schema 与 `vector` 扩展（`documents` 与 `long_term_memory` 的向量列依赖它，这里是幂等兜底），再建 6 张业务表（`conversations` / `messages` / `short_term_memory` / `long_term_memory` / `documents` / `files`）+ 各自的 RLS 策略 + 两个向量检索函数（`match_documents` / `match_long_term`）。表用 `if not exists`、策略先 drop 再建、函数 `create or replace`，可反复执行：
 
@@ -109,7 +112,18 @@ uv run python run.py    # 启动于 http://0.0.0.0:8000（reload）
 
 > 未配 `SUPABASE_DATABASE_URL` 时启动会因连接池建不起来而报错；未配置 `LLM_API_KEY` 时后端仍可启动，但对话返回空内容。
 
-**3. 配置并启动前端**（需 Node 22+）
+**3. 安装无头浏览器**（仅知识库「抓取网址」需要）
+
+`uv sync` 只装 Python 依赖，**不会**下载 Chromium——抓网址入口靠真实浏览器跑完 JS 再取 DOM，首次必须单独装（约 700MB）：
+
+```bash
+cd backend
+uv run playwright install chromium
+```
+
+Linux 上若报缺少系统库，再执行 `uv run playwright install-deps chromium`（需要 root）。未装时粘贴文本 / 上传文件入口照常可用，只有抓网址会失败，并在前端提示这条安装命令。
+
+**4. 配置并启动前端**（需 Node 22+）
 
 ```bash
 cd frontend
@@ -120,19 +134,15 @@ npm run dev             # 启动于 http://127.0.0.1:5173，/api 代理到 8000
 
 浏览器访问前端地址，注册账号后即可对话。
 
-> 知识库的「抓取网址」入口要跑无头浏览器，首次需装 Chromium（约 700MB）：`uv run playwright install chromium`。直连 `cdn.playwright.dev` 在国内约 27KB/s 且频繁断流，加镜像快约 600 倍：`PLAYWRIGHT_DOWNLOAD_HOST=https://cdn.npmmirror.com/binaries/playwright uv run playwright install chromium`。未装时粘贴文本 / 上传文件入口照常可用，只有抓网址会失败。
-
 > `VITE_` 前缀的变量在构建时被内联进产物，改完 `.env` 需重启 dev server / 重新 build。
 
-### Docker 部署
+### 部署
 
-```bash
-docker compose up --build
-```
+仓库只提供基础设施容器（`docker/`），后端与前端按上面的「本地开发」步骤在宿主机启动：
 
-- 前端 nginx 对外唯一入口 `:80`，反代 `/api`（含 SSE）到后端 `:8000`。
-- 后端读取挂载的 `./backend/.env`（密钥不写进 compose），数据全在 Supabase Postgres，容器本身不需要持久化卷。
-- 前端在**构建时**读取 `./frontend/.env`，所以构建前必须先备好该文件（含 `VITE_SUPABASE_URL`）。
+- Supabase 与 `sandbox` 由 `docker compose up -d` 起；后端通过 `SUPABASE_URL` / `SANDBOX_URL` 指向它们——后端与容器同机时填服务名，跨机时填宿主机地址与映射端口（`sandbox` 映射 `8001`）。
+- 前端 `npm run build` 的产物交给静态服务器托管，`/api` 反代到后端 `:8000`；构建前先备好 `frontend/.env`（`VITE_` 变量在构建时内联）。
+- 部署后端的那台机器同样要先装 Chromium（见「本地开发 → 3. 安装无头浏览器」）；后端若跑在容器里，需在镜像构建时装进浏览器，或通过 `PLAYWRIGHT_BROWSERS_PATH` 挂载宿主机的浏览器缓存，否则知识库抓网址会失败。
 
 ## 配置说明
 
@@ -182,7 +192,7 @@ docker compose up --build
 
 | 变量 | 说明 | 默认值 |
 |---|---|---|
-| `VITE_SUPABASE_URL` | 浏览器直连 Supabase 的地址（Kong 网关，自托管默认 `http://localhost:8000`） | 空 |
+| `VITE_SUPABASE_URL` | 浏览器直连 Supabase 的地址（API 网关，自托管默认 `http://localhost:8000`） | 空 |
 | `VITE_SUPABASE_ANON_KEY` | Supabase 匿名公钥，取自 `docker/.env` 的 `ANON_KEY`（**不是** `SERVICE_ROLE_KEY`） | 空 |
 | `VITE_AMAP_WEB_JS_KEY` | 高德 Web 端 JS Key（地图组件用） | 空 |
 
@@ -197,12 +207,15 @@ docker compose up --build
 | `POST` | `/api/conversations` | 新建会话 |
 | `GET` | `/api/conversations/{id}` | 获取会话历史消息 |
 | `DELETE` | `/api/conversations/{id}` | 删除会话 |
+| `POST` | `/api/files` | 上传会话文件（multipart；`conversation_id` 不属于当前用户时另建会话并在返回值里给出） |
+| `GET` | `/api/files/{file_id}?conversation_id=…` | 下载会话文件 |
 | `GET` | `/api/memory/long-term` | 当前用户长期记忆（跨会话偏好） |
 | `GET` | `/api/memory/short-term/{conversation_id}` | 某会话短期记忆（summary 摘要 + 最近几轮对话） |
 | `POST` | `/api/knowledge/text` | 粘贴文本入库（切块 + 向量化） |
 | `POST` | `/api/knowledge/url` | 抓取网址正文入库（无头浏览器 + 正文提取 + 插图转文字） |
 | `GET` | `/api/knowledge/documents` | 已入库文档列表（按来源聚合，含块数与入库时间） |
 | `DELETE` | `/api/knowledge/documents` | 按来源删除整篇文档的所有块 |
+| `GET` | `/api/knowledge/images/{source_key}/{ingest_id}/{name}` | 取知识库原图（后端代理 Storage，返回 blob） |
 | `GET` | `/api/health` | 健康检查 |
 
 ## 测试

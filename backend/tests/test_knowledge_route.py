@@ -96,6 +96,56 @@ async def test_short_page_never_reaches_ingest(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_browser_missing_returns_install_hint(monkeypatch):
+    """没装 Chromium 时前端要看到安装命令，而不是 Playwright 的英文原文。"""
+    async def fetch(url):
+        raise RuntimeError(
+            "BrowserType.launch: Executable doesn't exist at "
+            "C:\\Users\\x\\AppData\\Local\\ms-playwright\\chromium-123\\chrome.exe\n"
+            "Please run the following command to download new browsers:\n"
+            "    playwright install")
+
+    monkeypatch.setattr(route, "fetch_url_text", fetch)
+
+    with pytest.raises(HTTPException) as ei:
+        await route.ingest_url(route.UrlIn(url="https://example.com/a"), user_id="u1")
+
+    assert ei.value.status_code == 502
+    assert "uv run playwright install chromium" in ei.value.detail
+    assert "Executable doesn't exist" not in ei.value.detail
+
+
+@pytest.mark.asyncio
+async def test_missing_system_deps_returns_install_deps_hint(monkeypatch):
+    """浏览器装好了但系统库缺失时给 install-deps，别让用户去重装浏览器。"""
+    async def fetch(url):
+        raise RuntimeError("Host system is missing dependencies to run browsers.")
+
+    monkeypatch.setattr(route, "fetch_url_text", fetch)
+
+    with pytest.raises(HTTPException) as ei:
+        await route.ingest_url(route.UrlIn(url="https://example.com/a"), user_id="u1")
+
+    assert "playwright install-deps chromium" in ei.value.detail
+
+
+@pytest.mark.asyncio
+async def test_other_fetch_failure_keeps_original_message(monkeypatch):
+    """与浏览器安装无关的抓取失败照旧透传，不被安装指引顶掉。"""
+    async def fetch(url):
+        raise RuntimeError("net::ERR_NAME_NOT_RESOLVED")
+
+    monkeypatch.setattr(route, "fetch_url_text", fetch)
+
+    with pytest.raises(HTTPException) as ei:
+        await route.ingest_url(route.UrlIn(url="https://example.com/a"), user_id="u1")
+
+    assert ei.value.status_code == 502
+    assert "ERR_NAME_NOT_RESOLVED" in ei.value.detail
+    assert "playwright install" not in ei.value.detail
+
+
+@pytest.mark.asyncio
 async def test_page_at_threshold_is_ingested(monkeypatch):
     """阈值边界：刚好达标放行，少一个字拦下。"""
     called = {}
