@@ -1,4 +1,4 @@
-# app/core/storage.py
+# app/core/storage/client.py
 # Supabase Storage 客户端：上传/下载/删除对象。
 # 身份用「每次调用内现签的短时 JWT」——RLS 判定发生在 storage-api 进程里，不是后端进程里。
 # 后端没法「设置」它的会话状态（rls_conn 能直说是因为后端自己就是那个 PG 连接的主人），

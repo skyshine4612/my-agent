@@ -1,4 +1,4 @@
-# app/core/vision.py
+# app/core/knowledge/vision.py
 # 图片转文字：把网页里的插图交给多模态模型生成描述。
 # 知识库是文本语义检索，图片不转成文字就搜不到——这是让图片内容可被检索的唯一途径。
 import asyncio

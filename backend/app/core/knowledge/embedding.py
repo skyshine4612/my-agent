@@ -1,4 +1,4 @@
-# app/core/embedding.py
+# app/core/knowledge/embedding.py
 # Embedding 客户端：知识库与长期记忆共用的向量化管道。
 # 与 get_chat_model() 的单例工厂同构（均为进程级单例），但**不做降级兜底**：
 # 知识库没有向量就检索不到，属于必须失败的情形；长期记忆允许降级，由 store 自己接异常。

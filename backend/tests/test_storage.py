@@ -108,7 +108,7 @@ async def test_delete_prefix_pages_through_large_dirs(monkeypatch):
     分页靠 `offset`（实测可用）。它若不生效，同一个前缀会一直返回同一页 ——
     所以这个用例同时钉住「页数有限」，不会挂死。
     """
-    from app.core import storage as storage_mod
+    from app.core.storage import client as storage_mod
     monkeypatch.setattr(storage_mod, "_PAGE_MAX", 2)
     client, fake = make_client()
     for n in range(5):

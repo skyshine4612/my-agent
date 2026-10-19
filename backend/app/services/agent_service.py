@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from app.config import settings
 from app.core.agent import HARD_DATA_TOOLS, Agent, CriticConfig
 from app.core.context import current_conversation_id, current_user_id
-from app.core.files import FileStore
+from app.core.storage.files import FileStore
 from app.core.knowledge import KnowledgeStore
 from app.core.llm import close_chat_model, get_chat_model
 from app.core.memory import ConversationStore, LongTermMemory, ShortTermMemory, ToolResultStore
@@ -114,7 +114,8 @@ class AgentService:
                                              self.tool_result_store,
                                              critic=CriticConfig(read_file_tool=self.critic_tools[0],
                                                                  grep_tool=self.critic_tools[1],
-                                                                 skills=self.skills))
+                                                                 skills=self.skills),
+                                             max_tool_rounds=settings.max_tool_rounds)
         registry.register_tool(sub_agent_tool, "委派子任务")
         return registry
 
@@ -287,6 +288,7 @@ class AgentService:
                     critic=CriticConfig(read_file_tool=self.critic_tools[0],
                                         grep_tool=self.critic_tools[1],
                                         skills=self.skills),
+                    max_tool_rounds=settings.max_tool_rounds,
                 )
             finally:
                 await queue.put(None)

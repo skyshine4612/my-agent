@@ -1,4 +1,4 @@
-# app/core/chunking.py
+# app/core/knowledge/chunking.py
 # 文本切块：单元按顺序累积到 chunk_size 再成块，单元自身超长则逐级降级
 # （段落 → 句子 → 字符硬切）。纯函数，便于单测；按字符数而非 token 数计量，对中文更直观。
 #

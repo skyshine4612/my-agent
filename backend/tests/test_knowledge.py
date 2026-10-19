@@ -7,10 +7,11 @@ import hashlib
 import pytest
 
 from app.core.db import rls_conn
-from app.core.ingest import image_mark
+from app.core.knowledge.ingest import image_mark
 from app.core.knowledge import SIMILARITY_FLOOR, KnowledgeStore, filter_relevant
 from app.core.storage import BUCKET_KNOWLEDGE
 from tests.fake_storage import make_client
+from tests.tool_utils import ainvoke_raw
 
 # 段落各自成块的配置：短段落会被合并，想验「一块一段」的用例就把 chunk_size 压到段落长度量级
 _PER_PARA = {"chunk_size": 12, "overlap": 0}
@@ -249,7 +250,7 @@ async def test_search_knowledge_tool_returns_hits_and_images(kb, user_id):
                        source_url="http://a/1", images=[_img()])
     # 直接 set：ContextVar 的属性是只读的，monkeypatch.setattr 装不上
     current_user_id.set(user_id)
-    got = await make_search_knowledge(store).ainvoke({"query": "西湖"})
+    got = await ainvoke_raw(make_search_knowledge(store), {"query": "西湖"})
     assert isinstance(got, dict)
     assert got["hits"] and "content" in got["hits"][0]
     assert len(got["images"]) == 1
@@ -268,7 +269,7 @@ async def test_search_knowledge_tool_keeps_empty_branch(kb, user_id):
 
     store, _ = kb()
     current_user_id.set(user_id)
-    got = await make_search_knowledge(store).ainvoke({"query": "西湖"})
+    got = await ainvoke_raw(make_search_knowledge(store), {"query": "西湖"})
     assert got == "知识库暂无相关内容"
 
 

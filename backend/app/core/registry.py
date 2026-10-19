@@ -1,6 +1,6 @@
 # app/core/registry.py
-# 工具注册表（ToolRegistry）：统一管理工具元信息并执行工具函数。模型侧的 schema 由 langchain
-# 在装配时从各 tool 对象的 pydantic args_schema 生成，本模块不经手。
+# 工具注册表（ToolRegistry）：统一管理工具元信息；生产执行由 create_agent 的 ToolNode 负责。
+# 模型侧的 schema 由 langchain 在装配时从各 tool 对象的 pydantic args_schema 生成，本模块不经手。
 from dataclasses import dataclass
 from typing import Callable
 
@@ -19,11 +19,12 @@ class Tool:
 
 
 class ToolRegistry:
-    """工具注册表：统一管理工具并执行。
+    """工具注册表：统一管理工具元信息。
 
     职责：
         - register_tool：注册 langchain tool 对象
-        - call_raw：按名字执行工具并返回结构化原始结果
+        - get / list_names / label：供 create_agent 装配与前端展示
+        - call_raw：仅供测试/直接调用，不在生产执行路径上
     """
 
     def __init__(self):
@@ -31,10 +32,10 @@ class ToolRegistry:
         self._tools = {}
 
     def register_tool(self, tool, label=""):
-        """从 langchain tool 对象注册，执行走 tool.ainvoke。
+        """从 langchain tool 对象注册；工具对象交给 create_agent / ToolNode 执行。
 
-        存 tool 对象而非底层函数：ainvoke 返回结构化原始对象，截断与 spill 判断拿得到结构；
-        同时白拿 pydantic 校验——类型强转、缺必填报错、多余参数静默忽略。
+        存 tool 对象而非底层函数：schema 由框架从 args_schema 生成并完成 pydantic 校验；
+        结构化工具通过 content_and_artifact 把原始结构带在 ToolMessage.artifact 上。
         """
         self._tools[tool.name] = Tool(tool, label)
 
@@ -52,9 +53,14 @@ class ToolRegistry:
         return (t.label or name) if t else name
 
     async def call_raw(self, name, arguments):
-        """执行工具并返回结构化原始结果（dict/list/str 等），不做 str() 转换。
+        """直接执行工具并返回原始结果；不在生产执行路径上，仅供测试/直接调用。
 
-        调用方拿到原始结构才能按类型截断（list 前 20 条 / dict 前 20 键），
-        `str()` 会把结构信息压平丢失。
+        结构化工具（content_and_artifact）必须用合成 ToolCall 调用才能取回 artifact；
+        普通 dict 调用会只返回 content，artifact 被静默丢弃。
         """
-        return await self._tools[name].fn.ainvoke(arguments)
+        tool = self._tools[name].fn
+        if getattr(tool, "response_format", None) == "content_and_artifact":
+            msg = await tool.ainvoke({"type": "tool_call", "id": "call_raw",
+                                      "name": name, "args": arguments})
+            return msg.artifact if msg.artifact is not None else msg.content
+        return await tool.ainvoke(arguments)

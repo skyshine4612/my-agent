@@ -11,7 +11,7 @@ from pydantic import BaseModel, Field
 
 from app.core.agent import _redact_secrets
 from app.core.auth import get_current_user
-from app.core.ingest import fetch_url_text
+from app.core.knowledge.ingest import fetch_url_text
 from app.core.storage import BUCKET_KNOWLEDGE
 from app.services.agent_service import service
 

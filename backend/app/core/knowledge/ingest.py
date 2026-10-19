@@ -1,4 +1,4 @@
-# app/core/ingest.py
+# app/core/knowledge/ingest.py
 # 建库管道：把 URL 抓成正文文本。对话时一律不爬，只有前端建库入口会走到这里。
 import asyncio
 import logging
@@ -8,7 +8,7 @@ from urllib.parse import urljoin
 
 import trafilatura
 
-from app.core.vision import describe_images
+from app.core.knowledge.vision import describe_images
 
 logger = logging.getLogger(__name__)
 

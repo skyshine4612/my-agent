@@ -5,7 +5,7 @@ import pytest_asyncio
 
 from app.core.agent import NON_QUERY_TOOLS
 from app.core.context import current_conversation_id, current_user_id
-from app.core.files import FileStore
+from app.core.storage.files import FileStore
 from app.core.memory import ConversationStore
 from app.tools.file import LIST_LIMIT, make_list_uploaded_files
 from tests.fake_storage import make_client
@@ -57,6 +57,6 @@ async def test_tool_is_declared_non_query():
 
 def test_list_limit_fits_within_file_ref_limit():
     """清单 limit 必须 ≤ 反查 limit，否则出现「清单里看得见、引用时解析不到」的死角。"""
-    from app.core.files import FILE_REF_LIMIT
+    from app.core.storage.files import FILE_REF_LIMIT
 
     assert LIST_LIMIT <= FILE_REF_LIMIT

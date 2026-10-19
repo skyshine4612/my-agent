@@ -1,4 +1,4 @@
-# app/core/knowledge.py
+# app/core/knowledge/store.py
 # 知识库存储：documents 表 + 切块 + 向量化入库 + 语义检索 + 原图进 Storage。
 # 全局共享（不像长期记忆那样按 user 隔离），但读写仍走 rls_conn：
 # 1A 的规矩是放进这套栈的表全开 RLS，业务查询一律不裸池直连。
@@ -7,12 +7,12 @@ import logging
 import time
 import uuid
 
-from app.core.chunking import chunk_units
+from app.core.knowledge.chunking import chunk_units
 from app.core.db import rls_conn
-from app.core.embedding import embed_batched, get_embedding, to_vector_literal
-from app.core.ingest import assign_images, image_mark, scrub_marks
-from app.core.storage import BUCKET_KNOWLEDGE
-from app.core.vision import ALLOWED_MIME
+from app.core.knowledge.embedding import embed_batched, get_embedding, to_vector_literal
+from app.core.knowledge.ingest import assign_images, image_mark, scrub_marks
+from app.core.storage.client import BUCKET_KNOWLEDGE
+from app.core.knowledge.vision import ALLOWED_MIME
 
 logger = logging.getLogger(__name__)
 

@@ -12,6 +12,7 @@ from langchain_core.tools import tool
 from pydantic import Field
 
 from app.core.context import current_conversation_id, current_user_id
+from app.tools.content import render_content
 
 logger = logging.getLogger(__name__)
 
@@ -51,16 +52,17 @@ def make_run_skill_script(sandbox, file_store, scripts):
     SkillName = Literal[tuple(skill_names)] if skill_names else str
     ScriptName = Literal[tuple(script_names)] if script_names else str
 
-    @tool
+    @tool(response_format="content_and_artifact")
     async def run_skill_script(
         skill: Annotated[SkillName, Field(description="业务名")],
         script: Annotated[ScriptName, Field(description="脚本名")],
         params: Annotated[dict, Field(description="脚本参数（字段含义见该业务的规则正文）")],
-    ) -> dict:
+    ) -> tuple[str, dict]:
         """执行一个已评审的数据处理脚本（如 Excel 字段脱敏）。可用的脚本与参数含义见对应业务的规则正文。"""
         path = scripts.get((skill, script))
         if path is None:
-            return {"ok": False, "error": f"没有这个脚本：{skill}/{script}"}
+            raw = {"ok": False, "error": f"没有这个脚本：{skill}/{script}"}
+            return render_content(raw), raw
 
         user_id = current_user_id.get()
         conversation_id = current_conversation_id.get()
@@ -75,7 +77,8 @@ def make_run_skill_script(sandbox, file_store, scripts):
             # 用条目自己的 file_id 去读。名字是模型可见的键，不是路径键，直接拿去 read 会被拒
             got = await file_store.read(user_id, conversation_id, known[name]["file_id"])
             if got is None:
-                return {"ok": False, "error": f"文件不存在或无权访问：{name}"}
+                raw = {"ok": False, "error": f"文件不存在或无权访问：{name}"}
+                return render_content(raw), raw
             files.append({"name": name, "data": base64.b64encode(got[1]).decode()})
 
         # 脚本源码从白名单路径读盘：模型递进来的只有 skill/script 两个名字
@@ -91,7 +94,7 @@ def make_run_skill_script(sandbox, file_store, scripts):
         out = {"ok": ok, "output": result.get("stdout", ""), "artifacts": artifacts}
         if not ok:
             out["error"] = result.get("stderr", "") or f"脚本退出码 {result.get('exit_code')}"
-        return out
+        return render_content(out), out
 
     return run_skill_script
 

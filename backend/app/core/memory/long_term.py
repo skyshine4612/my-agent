@@ -4,7 +4,7 @@
 import logging
 
 from app.core.db import rls_conn
-from app.core.embedding import embed_batched, get_embedding, to_vector_literal
+from app.core.knowledge.embedding import embed_batched, get_embedding, to_vector_literal
 from app.core.memory.metrics import bump
 
 logger = logging.getLogger(__name__)

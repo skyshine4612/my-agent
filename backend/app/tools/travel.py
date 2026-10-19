@@ -10,22 +10,24 @@ from pydantic import Field
 
 from app.datasource.flight_variflight import FlightVariflightDataSource
 from app.datasource.train_12306 import Train12306DataSource
+from app.tools.content import render_content
 
 
 def make_poi_search(ds):
     """POI 搜索工具：按关键词或分类码搜索景点/酒店/美食，可限定城市。"""
 
-    @tool
+    @tool(response_format="content_and_artifact")
     async def poi_search(
         keywords: Annotated[str, Field(description="搜索关键词（地点名，如 西湖、灵隐寺）")] = "",
         city: Annotated[str, Field(description="限定城市，可选，不填则全局搜索")] = "",
         types: Annotated[str, Field(description="高德分类码（110000风景名胜/140000科教文化/050000餐饮/100000住宿）")] = "",
         sortrule: Annotated[str, Field(description="排序规则：distance(按距离)/weight(综合推荐)/rating(按评分)，不填默认综合")] = "",
-    ) -> list[dict]:
+    ) -> tuple[str, list[dict]]:
         """按关键词或分类码搜索POI(景点/酒店/美食)，可限定城市，返回名称/地址等基本信息"""
         pois = await ds.search_poi(keywords=keywords, city=city, types=types, sortrule=sortrule)
-        return pois or [
+        raw = pois or [
             {"name": "未找到结果", "address": "", "location": None, "category": keywords or types, "price": 0}]
+        return render_content(raw), raw
 
     return poi_search
 
@@ -33,10 +35,11 @@ def make_poi_search(ds):
 def make_poi_detail(ds):
     """POI 详情工具：按 id 查地址与推荐菜。"""
 
-    @tool
-    async def poi_detail(id: Annotated[str, Field(description="POI id，来自 poi_search 返回")]) -> dict:
+    @tool(response_format="content_and_artifact")
+    async def poi_detail(id: Annotated[str, Field(description="POI id，来自 poi_search 返回")]) -> tuple[str, dict]:
         """调用前必须先调用 poi_search，按 poi_search 返回的 POI id 查询详情，返回名称/地址/推荐菜标签（餐饮类 POI 的 tag 含招牌菜）"""
-        return await ds.get_poi_detail(id)
+        raw = await ds.get_poi_detail(id)
+        return render_content(raw), raw
 
     return poi_detail
 

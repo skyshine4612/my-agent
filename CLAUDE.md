@@ -42,12 +42,12 @@ npm run type-check
 路由层                    service 编排层                    核心执行层
 api/routes/chat.py  →  services/agent_service.py  →  core/agent.py (ReAct 循环)
   POST /api/agent/chat    AgentService.chat_stream         Agent.run_stream
-  (SSE)                   装配历史/记忆/LLM/工具/技能      → core/registry.py (工具执行)
+  (SSE)                   装配历史/记忆/LLM/工具/技能      → core/registry.py (工具元数据)
                           + 知识库检索 + critic + LTM 提炼   → core/llm.py (模型工厂)
 ```
 
-- `core/agent.py`：`Agent.run_stream` 实现 ReAct 循环，图侧额度 `RECURSION_LIMIT` 固定 60 步（一轮 ReAct 占 3 步）；同一轮多个 tool_calls 由框架并行执行。
-- `core/registry.py`：`ToolRegistry` 管理工具元信息并执行；模型侧 schema 由各 tool 的 pydantic `args_schema` 直接转换。
+- `core/agent.py`：`Agent.run_stream` 实现 ReAct 循环。工具由框架的 `ToolNode` 执行（参数校验、并行调度、异常与 `Command` 控制流都归它）；`_ToolExecMiddleware` 只做事件上报、结构化截断与 spill。轮次上限由 `_ToolRoundLimitMiddleware` 按 `settings.max_tool_rounds` 计数（一轮 = 一次带 `tool_calls` 的模型响应），到点后摘掉工具强制作答；图额度按 `max_tool_rounds` 的 10 倍派生，只当硬保护。
+- `core/registry.py`：`ToolRegistry` 管理工具元信息（工具对象 + 中文 label）；模型侧 schema 由各 tool 的 pydantic `args_schema` 直接转换。返回 dict/list 的工具用 `@tool(response_format="content_and_artifact")` 返回 `(content, raw)`：content 给模型，artifact 给截断/spill/前端侧信道；纯文本工具保持普通 `@tool`。
 - `core/llm.py`：全项目唯一 LLM 通路。`get_chat_model()` 单例（DashScope 走 OpenAI 兼容协议，故用 `ChatOpenAI`）；`close_chat_model()` 由 lifespan 调用。
 
 ## 不变量

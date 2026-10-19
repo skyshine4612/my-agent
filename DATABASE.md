@@ -239,7 +239,7 @@ grant usage, select on sequence
 
 > **storage schema 每张表都开着 RLS 却没有任何内置策略**，所以「不加策略」不等于「不限制」，而是除 `service_role` 外**全拒——包括后端自己**。这两条策略是必需的，不是额外保险。
 
-**后端访问方式是「每次调用内现签的短时 HS256 JWT」**（`app/core/storage.py`）：RLS 判定发生在 storage-api 进程里，不是后端进程里，后端说不了话（`rls_conn` 能直说是因为后端自己就是那个 PG 连接的主人），storage-api 能取到的 `auth.uid()` 唯一来源就是请求头里的签名。所以**启用非对称密钥会同时打断后端本地验签与 storage 链路**。
+**后端访问方式是「每次调用内现签的短时 HS256 JWT」**（`app/core/storage/client.py`）：RLS 判定发生在 storage-api 进程里，不是后端进程里，后端说不了话（`rls_conn` 能直说是因为后端自己就是那个 PG 连接的主人），storage-api 能取到的 `auth.uid()` 唯一来源就是请求头里的签名。所以**启用非对称密钥会同时打断后端本地验签与 storage 链路**。
 
 **storage-api 行为要点**（版本见 `docker/docker-compose.yml`）：
 

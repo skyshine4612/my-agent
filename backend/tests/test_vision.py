@@ -2,7 +2,7 @@
 # 图片转文字的降级路径测试：不依赖网络与真实模型，下载/调用失败都必须退化成空条目而不是抛。
 from types import SimpleNamespace
 
-from app.core.vision import MAX_IMAGES, describe_images
+from app.core.knowledge.vision import MAX_IMAGES, describe_images
 
 # 失败/无信息时的统一样子：描述为空、字节为 None、mime 为空
 EMPTY = {"desc": "", "data": None, "mime": ""}
@@ -26,7 +26,7 @@ async def test_describe_pins_temperature_to_zero():
     装饰图会连字节一起丢（不进正文、不进桶），于是「同一页面抓两次图片不一样」。这个参数
     删掉不报错、只是慢慢失效，所以拿测试钉住。
     """
-    from app.core.vision import OpenAICompatVision
+    from app.core.knowledge.vision import OpenAICompatVision
 
     vision = OpenAICompatVision(base_url="http://example.invalid", api_key="k", model="m")
     recorder = _RecordingCompletions()
@@ -40,7 +40,7 @@ async def test_describe_passes_page_title_into_the_prompt():
     """页面标题是判定的关键依据：实测同一份图片字节，不带标题时熊猫照片 5 次里会摇摆
     （丢留丢丢丢），带上标题后 5 次全稳定保留 —— 「这张图对页面主题有没有用」只有知道
     页面讲什么才判得出来。"""
-    from app.core.vision import OpenAICompatVision
+    from app.core.knowledge.vision import OpenAICompatVision
 
     vision = OpenAICompatVision(base_url="http://example.invalid", api_key="k", model="m")
     recorder = _RecordingCompletions()
@@ -84,7 +84,7 @@ async def test_empty_urls():
 
 async def test_describe_images_returns_bytes_and_mime(monkeypatch):
     """返回结构里必须带字节与 mime：原图要一起进 Storage，重下一次就是多一轮网络往返。"""
-    from app.core import vision as V
+    from app.core.knowledge import vision as V
 
     async def fake_download(http, url):
         return b"x" * (V.MIN_IMAGE_BYTES + 1), "image/png"
@@ -101,7 +101,7 @@ async def test_describe_images_returns_bytes_and_mime(monkeypatch):
 
 async def test_describe_images_drops_useless_image_entirely(monkeypatch):
     """模型判「无有效信息」的图连字节一起丢：它既不进正文也不该进桶。"""
-    from app.core import vision as V
+    from app.core.knowledge import vision as V
 
     async def fake_download(http, url):
         return b"x" * (V.MIN_IMAGE_BYTES + 1), "image/jpeg"
@@ -119,7 +119,7 @@ async def test_describe_images_drops_useless_image_entirely(monkeypatch):
 async def test_download_rejects_svg(monkeypatch):
     """svg 是文本可执行的 XML，桶里存一份、将来被当图片内联回吐就有 XSS 面。"""
     import httpx
-    from app.core.vision import _download
+    from app.core.knowledge.vision import _download
 
     def handler(request):
         return httpx.Response(200, headers={"content-type": "image/svg+xml"},
@@ -132,7 +132,7 @@ async def test_download_rejects_svg(monkeypatch):
 async def test_download_rejects_unknown_mime(monkeypatch):
     """白名单而不是黑名单：扩展名要拿来定代理端点的 Content-Type，是 XSS 面的一部分。"""
     import httpx
-    from app.core.vision import _download
+    from app.core.knowledge.vision import _download
 
     def handler(request):
         return httpx.Response(200, headers={"content-type": "image/bmp"},

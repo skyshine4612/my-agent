@@ -1,6 +1,6 @@
 # tests/test_chunking.py
 # 切块纯函数测试：覆盖累积成块与三级降级（段落 / 句子 / 字符硬切）的边界情形。
-from app.core.chunking import chunk_spans, chunk_text, chunk_units
+from app.core.knowledge.chunking import chunk_spans, chunk_text, chunk_units
 
 
 def test_short_text_stays_single_chunk():

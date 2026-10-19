@@ -3,7 +3,6 @@
 # 验证 service 装配成功、工具非空、chat_stream 用 fake LLM 跑通并产出 conversation_id/done 事件。
 import asyncio
 import json
-from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -11,11 +10,11 @@ from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage
 from langchain_core.messages.utils import convert_to_openai_messages
 from langchain_core.outputs import ChatGeneration, ChatResult
-from langchain_core.tools import tool
 
 from app.config import settings
 from app.services.agent_service import AgentService
 from app.tools import travel as travel_tools
+from tests.tool_utils import make_stub_tool
 
 
 def _lc_tool_call(tc):
@@ -53,16 +52,6 @@ class EventScriptChatModel(BaseChatModel):
             message=AIMessage(content=content, tool_calls=[_lc_tool_call(tc) for tc in (calls or [])]))])
 
 
-def _StubTool(name):
-    """占位工具条目（与 ToolRegistry.get 返回的 Tool 同形）：fn 是同名 langchain tool，
-    仅供 create_agent 装配 schema —— 执行被 middleware 短路，不会真跑。"""
-
-    @tool(name)
-    def _stub() -> str:
-        """占位工具。"""
-        return ""
-
-    return SimpleNamespace(fn=_stub)
 
 
 class FakeStreamingLLM:
@@ -275,7 +264,7 @@ class SlowFastRegistry:
         return ["poi_search"]
 
     def get(self, name):
-        return _StubTool(name)
+        return make_stub_tool(name, self.call_raw)
 
     def label(self, name):
         return name
@@ -348,7 +337,7 @@ class ImageRegistry:
         return ["search_knowledge"]
 
     def get(self, name):
-        return _StubTool(name)
+        return make_stub_tool(name, self.call_raw)
 
     def label(self, name):
         return "检索知识库"

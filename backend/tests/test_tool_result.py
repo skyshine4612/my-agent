@@ -2,7 +2,6 @@
 # 地址索引契约测试：ToolResultStore 写文件/读/搜/删目录，read_file/grep 工具，run_stream spill 写文件。
 import json
 import re
-from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -10,7 +9,6 @@ from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage
 from langchain_core.messages.utils import convert_to_openai_messages
 from langchain_core.outputs import ChatGeneration, ChatResult
-from langchain_core.tools import tool
 
 from app.core.agent import Agent
 from app.core.context import current_user_id
@@ -18,6 +16,7 @@ from app.core.memory import ToolResultStore
 from app.core.memory.metrics import snapshot
 from app.core.registry import ToolRegistry
 from app.tools.file import register_file_tools
+from tests.tool_utils import make_stub_tool
 
 
 def _lc_tool_call(tc):
@@ -67,22 +66,13 @@ class FakeRegistry:
         return self.r[name]
 
     def get(self, name):
-        # create_agent 需要真工具对象（middleware 才拿得到 request.tool）；执行由 middleware 短路，不会真跑
-        return _StubTool(name)
+        # create_agent 需要真工具对象；工具由 ToolNode 执行，内部再调 call_raw 保留记录逻辑
+        return make_stub_tool(name, self.call_raw)
 
     def label(self, name):
         return name
 
 
-def _StubTool(name):
-    """占位工具条目（与 ToolRegistry.get 返回的 Tool 同形）：fn 是同名 langchain tool。"""
-
-    @tool(name)
-    def _stub() -> str:
-        """占位工具。"""
-        return ""
-
-    return SimpleNamespace(fn=_stub)
 
 
 class StreamingLLM:

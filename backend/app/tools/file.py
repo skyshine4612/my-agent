@@ -11,6 +11,7 @@ from pydantic import Field
 
 from app.core.context import current_conversation_id, current_user_id
 from app.core.prompts import render_file_directory
+from app.tools.content import render_content
 
 # 清单列多少个文件：够覆盖一个会话的常态用量，又不至于把上下文塞满。
 # 必须 ≤ FileStore 反查用的 FILE_REF_LIMIT，否则会出现「清单里看得见、引用时解析不到」的死角。
@@ -42,13 +43,14 @@ def make_read_file(store):
 def make_grep(store):
     """构造 grep 工具：闭包 ToolResultStore，按 path + 正则搜，返回位置与上下文片段。"""
 
-    @tool
+    @tool(response_format="content_and_artifact")
     async def grep(
         pattern: Annotated[str, Field(description="正则表达式，如 MU5160、525元")],
         path: Annotated[str, Field(description="结果文件的相对路径")],
-    ) -> dict:
+    ) -> tuple[str, dict]:
         """在某个工具结果文件里正则搜索关键词，返回每个命中的位置与上下文片段。当需要定位结果里的某个车次号、价格、名称等关键信息时使用。"""
-        return await store.search(path, pattern, user_id=current_user_id.get())
+        raw = await store.search(path, pattern, user_id=current_user_id.get())
+        return render_content(raw), raw
 
     return grep
 

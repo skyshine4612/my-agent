@@ -1,4 +1,4 @@
-# app/core/files.py
+# app/core/storage/files.py
 # 会话文件存储：字节在 Supabase Storage 的 files 桶，元数据在 files 表。
 # key 约定 <user_id>/<conversation_id>/<file_id>/original<后缀>：前两段让「按会话前缀删」
 # 一次到位（不读表），第三段是防穿越校验过的 uuid。
@@ -9,7 +9,7 @@ import uuid
 from pathlib import Path
 
 from app.core.db import rls_conn
-from app.core.storage import BUCKET_FILES, safe_ext
+from app.core.storage.client import BUCKET_FILES, safe_ext
 
 logger = logging.getLogger(__name__)
 

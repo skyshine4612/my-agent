@@ -23,7 +23,7 @@ from app.core.prompts import load_prompt, today_hint
 
 
 def make_call_sub_agent(model, registry, skill_names, context_budget, tool_result_store=None,
-                        critic=None):
+                        critic=None, max_tool_rounds=20):
     """构造 call_sub_agent 工具（langchain tool 对象）。
 
     子 Agent = 通用子助手：system prompt 含职责 + 可用业务清单 + 事实规范 + 日期；
@@ -31,6 +31,7 @@ def make_call_sub_agent(model, registry, skill_names, context_budget, tool_resul
     规则由子 Agent 按需 get_skill 加载，主 Agent 委派时不指定 skill。
     tool_result_store：工具结果地址索引存储，子 Agent 超长结果同样落库（与主 Agent 统一）；
     为 None 时不落库（保持向后兼容）。
+    max_tool_rounds：子 Agent 自己的工具调用轮次上限（与主 Agent 各自计数）。
     model：langchain 模型实例（子 Agent 的 ReAct 循环与工作记忆蒸馏都由它驱动）。
     critic：CriticConfig，非空时子 Agent 也做事实校验。子 Agent 调硬数据工具时，主 Agent 的
     hard_results 是空的（它这轮调的是 call_sub_agent，不在 HARD_DATA_TOOLS 里），
@@ -87,7 +88,8 @@ RULES：
                                              conversation_id=sub_conversation_id,
                                              context_budget=context_budget,
                                              tool_result_store=tool_result_store,
-                                             critic=critic)
+                                             critic=critic,
+                                             max_tool_rounds=max_tool_rounds)
             # 回纯文本：返回 dict 会被父 Agent 侧的 str() 转成 repr，换行变字面量 \n、整段挤成一行
             return answer
         finally:

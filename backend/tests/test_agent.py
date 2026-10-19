@@ -5,7 +5,6 @@
 import asyncio
 import json
 import logging
-from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -14,12 +13,12 @@ from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage
 from langchain_core.messages.utils import convert_to_openai_messages
 from langchain_core.outputs import ChatGeneration, ChatResult
-from langchain_core.tools import tool
 
 import app.core.agent as agent_mod
 from app.config import settings
-from app.core.agent import RECURSION_LIMIT, Agent, CriticConfig, _CriticMiddleware
+from app.core.agent import Agent, CriticConfig, _CriticMiddleware
 from app.core.context import current_tool_call_id
+from tests.tool_utils import make_stub_tool
 
 
 def _lc_tool_call(tc):
@@ -106,6 +105,11 @@ class FakeRegistry:
         self.raises = raises or {}  # name → 要抛的异常，驱动工具失败的异常出口
         self.called = []
         self.seen_call_ids = []  # 每次执行时读到的 current_tool_call_id
+        self.tool_invoked = []  # 工具函数真的被执行的记录（证明 middleware 走了 handler）
+
+    async def _run_tool(self, name, args):
+        self.tool_invoked.append(name)
+        return await self.call_raw(name, args)
 
     async def call_raw(self, name, args):
         self.called.append((name, args))
@@ -116,8 +120,8 @@ class FakeRegistry:
         return self.r[name]
 
     def get(self, name):
-        # create_agent 需要真工具对象（middleware 才拿得到 request.tool）；执行由 middleware 短路，不会真跑
-        return _StubTool(name)
+        # create_agent 需要真工具对象；工具由 ToolNode 执行，内部再调 call_raw 保留记录逻辑
+        return make_stub_tool(name, self._run_tool)
 
     def label(self, name):
         return name
@@ -144,7 +148,7 @@ class ConcurrentRegistry:
         return self.results[name]
 
     def get(self, name):
-        return _StubTool(name)
+        return make_stub_tool(name, self.call_raw)
 
     def label(self, name):
         return name
@@ -166,22 +170,12 @@ class CallIdRecordingRegistry:
         return name
 
     def get(self, name):
-        return _StubTool(name)
+        return make_stub_tool(name, self.call_raw)
 
     def label(self, name):
         return name
 
 
-def _StubTool(name):
-    """占位工具条目（与 ToolRegistry.get 返回的 Tool 同形）：fn 是同名 langchain tool，
-    仅供 create_agent 装配 schema —— 执行被 middleware 短路，不会真跑。"""
-
-    @tool(name)
-    def _stub() -> str:
-        """占位工具。"""
-        return ""
-
-    return SimpleNamespace(fn=_stub)
 
 
 @pytest.mark.asyncio
@@ -216,6 +210,21 @@ async def test_run_stream_tool_call_and_accumulated_text():
     assert reg.called == [("w", {"c": "成都"})]
     assert any(e["type"] == "tool_call" and e["tool"] == "w" and e["args"] == {"c": "成都"} for e in events)
     assert any(e["type"] == "tool_result" and e["tool"] == "w" and e["status"] is True and e["result"] == "晴" for e in events)
+
+
+@pytest.mark.asyncio
+async def test_tool_execution_goes_through_handler():
+    """工具必须由 ToolNode 的 handler 执行，而不是 middleware 直接 call_raw。"""
+    llm = StreamingLLM([
+        [{"type": "end", "tool_calls": [{"id": "1", "function": {"name": "w", "arguments": "{}"}}]}],
+        [{"type": "content", "text": "ok"}, {"type": "end", "tool_calls": None}],
+    ])
+    reg = FakeRegistry({"w": "晴"})
+    a = Agent(name="t", system_prompt="s", tools=["w"], model=EventScriptChatModel(llm=llm))
+
+    await a.run_stream("go", [], reg)
+
+    assert reg.tool_invoked == ["w"], "工具函数没有被执行，说明仍在绕过 handler"
 
 
 @pytest.mark.asyncio
@@ -388,15 +397,68 @@ async def test_status_event_precedes_first_content_block():
 
 
 @pytest.mark.asyncio
-async def test_never_converging_model_hits_recursion_limit():
-    """模型每轮只回 tool_calls、从不给答案：跑满 60 步后返回兜底文案、rounds 记满。
+async def test_round_limit_strips_tools_after_max_tool_rounds():
+    """业务轮次限制：数到上限后，下一次模型调用拿不到工具，并注入收口提示。"""
+    from langchain.agents.middleware.types import ModelRequest, ModelResponse
+    from langchain_core.messages import SystemMessage
 
-    额度固定 60 步，一轮 ReAct 占 3 步（before_model 钩子 + 模型 + 工具），故恰好放行 20 轮；
-    第 21 次模型调用不会发生。
+    from app.core.agent import _ToolRoundLimitMiddleware
+
+    mw = _ToolRoundLimitMiddleware(2)
+    seen = []
+
+    async def handler(request):
+        seen.append(request)
+        return ModelResponse(result=[AIMessage(content="", tool_calls=[
+            {"id": "x", "name": "w", "args": {}, "type": "tool_call"}])])
+
+    request = ModelRequest(
+        model=None,
+        tools=[object()],
+        system_message=SystemMessage(content="sys"),
+        messages=[],
+        state={"messages": []},
+    )
+    for _ in range(3):
+        await mw.awrap_model_call(request, handler)
+
+    assert seen[0].tools and seen[1].tools  # 前两轮正常带工具
+    assert seen[2].tools == []             # 第三轮被摘掉
+    assert "轮次限制" in seen[2].system_message.text
+
+
+@pytest.mark.asyncio
+async def test_tool_round_log_counts_only_current_turn(caplog):
+    """轮次日志只数本轮工具轮次：短期记忆历史里的 assistant(tool_calls) 不算进来。"""
+    llm = StreamingLLM([
+        [{"type": "end", "tool_calls": [{"id": "c1", "function": {"name": "w", "arguments": "{}"}}]}],
+        _answer_round("done"),
+    ])
+    reg = FakeRegistry({"w": "晴"})
+    a = Agent(name="t", system_prompt="s", tools=["w"], model=EventScriptChatModel(llm=llm))
+    # assemble_history 的形状：前几问留下的 3 个工具轮次（assistant(tool_calls) + tool 占位）
+    history = []
+    for i in range(3):
+        history.append({"role": "assistant", "content": None, "tool_calls": [
+            {"id": f"h{i}", "type": "function",
+             "function": {"name": "w", "arguments": "{}"}}]})
+        history.append({"role": "tool", "tool_call_id": f"h{i}", "content": ""})
+
+    with caplog.at_level(logging.INFO, logger="app.core.agent"):
+        await a.run_stream("go", history, reg)
+
+    assert "第 1 轮 调工具" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_never_converging_model_stops_at_max_tool_rounds():
+    """模型每轮只回 tool_calls：跑满 max_tool_rounds 后强制作答，不再靠图额度兜底。
+
+    20 轮工具后第 21 次模型调用拿不到工具，脚本给出的答案轮正常产出。
     """
     llm = StreamingLLM([
         [{"type": "end", "tool_calls": [{"id": f"c{i}", "function": {"name": "w", "arguments": "{}"}}]}]
-        for i in range(20)])
+        for i in range(20)] + [_answer_round("基于已有结果作答")])
     reg = FakeRegistry({"w": "晴"})
     a = Agent(name="t", system_prompt="s", tools=["w"], model=EventScriptChatModel(llm=llm))
     events = []
@@ -405,15 +467,10 @@ async def test_never_converging_model_hits_recursion_limit():
         events.append(e)
 
     out, rounds = await a.run_stream("go", [], reg, on_event=on_event)
-    assert out == _FALLBACK
+    assert out == "基于已有结果作答"
     assert len(rounds) == 20  # 跑满 20 轮，每轮都真实执行了工具
     assert reg.called == [("w", {})] * 20
-    assert llm.i == 20
-
-
-def test_recursion_limit_is_pinned_at_60():
-    """图侧额度常量就是写死的 60：一轮 ReAct 占 3 步（before_model 钩子 + 模型 + 工具），即最多 20 轮。"""
-    assert RECURSION_LIMIT == 60
+    assert llm.i == 21  # 第 21 次模型调用用于强制作答
 
 
 @pytest.mark.asyncio
@@ -447,7 +504,6 @@ async def test_model_sees_distilled_summary_before_kept_window():
 # ---------------------------------------------------------------------------
 
 _HARD_TOOL = "weather_query"
-_FALLBACK = "抱歉，本轮查询了较多信息但未能整合成完整回答，请换个方式或精简需求后再试。"
 
 
 def _tool_round(call_id):
@@ -553,14 +609,11 @@ async def test_critic_does_not_leak_rounds(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_critic_turn_still_hits_recursion_limit(monkeypatch):
-    """永不收敛 + 带 critic：额度与无 critic 时相同，仍恰跑满 20 轮，返回兜底文案。
-
-    第 21 轮模型决策不会发生（额度在第 21 轮的 before_model 钩子处触顶），故 reg 只被调 20 次、
-    rounds 只有 20 条。
-    """
-    llm = StreamingLLM([_tool_round(f"c{i}") for i in range(20)])
-    _install_critic(monkeypatch, [{"ok": True, "issues": []}])
+async def test_critic_turn_stops_at_max_tool_rounds(monkeypatch):
+    """永不收敛 + 带 critic：跑满 20 轮工具后强制作答，critic 照常校验。"""
+    llm = StreamingLLM([_tool_round(f"c{i}") for i in range(20)]
+                       + [_answer_round("基于已有结果作答")])
+    calls = _install_critic(monkeypatch, [{"ok": True, "issues": []}])
     reg = FakeRegistry({_HARD_TOOL: "晴"})
     a = Agent(name="t", system_prompt="s", tools=[_HARD_TOOL],
               model=EventScriptChatModel(llm=llm))
@@ -570,48 +623,10 @@ async def test_critic_turn_still_hits_recursion_limit(monkeypatch):
         events.append(e)
 
     out, rounds = await a.run_stream("go", [], reg, on_event=on_event, critic=CriticConfig())
-    assert out == _FALLBACK
+    assert out == "基于已有结果作答"
     assert len(rounds) == 20
     assert reg.called == [(_HARD_TOOL, {})] * 20
-
-
-@pytest.mark.asyncio
-async def test_recursion_limit_used_up_by_tool_rounds_skips_critic(monkeypatch):
-    """20 轮工具 + 一次答案轮 + 带 critic：落兜底文案，且 critic 一次都没被调用。
-
-    20 轮工具占掉第 1-60 步，答案轮的模型调用与收口钩子都排在更后面，故整轮零校验、
-    连答案轮的模型调用都没发生（llm.i 停在 20）。额度放宽到 62 时这一档就收敛出答案，本用例转红。
-    """
-    assert RECURSION_LIMIT == 60  # 第 61 步是 before_model 钩子步，只放宽到 61 时行为不可分，故常量单独钉死
-    llm = StreamingLLM([_tool_round(f"c{i}") for i in range(20)]
-                       + [_answer_round("成都明天晴")])
-    calls = _install_critic(monkeypatch, [{"ok": True, "issues": []}])
-    reg = FakeRegistry({_HARD_TOOL: "晴"})
-    a = Agent(name="t", system_prompt="s", tools=[_HARD_TOOL],
-              model=EventScriptChatModel(llm=llm))
-    out, rounds = await a.run_stream("go", [], reg, critic=CriticConfig())
-    assert out == _FALLBACK
-    assert calls == []  # 收口钩子没跑到，critic 零调用
-    assert len(rounds) == 20
-    assert llm.i == 20  # 答案轮的模型调用没发生
-
-
-@pytest.mark.asyncio
-async def test_critic_runs_on_converging_turn_with_critic():
-    """收敛 + 带 critic：在额度用尽的最后一轮才收口，收口钩子仍跑得到、critic 确实被触发。
-
-    19 轮工具占 57 步，收口轮（before_model + 模型 + 收口钩子）用掉第 58-60 步、刚好跑满；
-    末尾到 END 差一步超限抛异常，但答案已在钩子返回的 state 更新里下发。
-    """
-    llm = StreamingLLM([_tool_round(f"c{i}") for i in range(19)]
-                       + [_answer_round("成都明天晴"), _verdict_turn(ok=True)])
-    chat_model = EventScriptChatModel(llm=llm)
-    reg = FakeRegistry({_HARD_TOOL: "晴"})
-    a = Agent(name="t", system_prompt="s", tools=[_HARD_TOOL], model=chat_model)
-    out, rounds = await a.run_stream("成都天气", [], reg, critic=CriticConfig())
-    assert out == "成都明天晴"
-    assert chat_model.verdict_calls >= 1  # 收口钩子确实跑到并触发了 critic
-    assert len(rounds) == 19
+    assert len(calls) == 1  # 硬数据轮触发了 critic
 
 
 class _ProbeAfterAgent(AgentMiddleware):

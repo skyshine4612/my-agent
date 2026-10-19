@@ -8,7 +8,7 @@ import httpx
 import pytest
 
 from app.core.auth import get_current_user
-from app.core.files import FileStore
+from app.core.storage.files import FileStore
 from app.core.memory import ConversationStore
 from app.main import app
 from app.services.agent_service import service

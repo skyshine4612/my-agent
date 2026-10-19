@@ -8,6 +8,7 @@ from app.tools.common import (
     make_holiday_calendar, make_weather_query, make_translate, make_hotboard,
     make_recipe_search, make_recipe_detail, make_ingredient_nutrition,
 )
+from tests.tool_utils import ainvoke_raw
 
 
 class FakeDS:
@@ -41,49 +42,49 @@ class FakeDS:
 
 @pytest.mark.asyncio
 async def test_holiday_calendar():
-    r = await make_holiday_calendar(FakeDS()).ainvoke({"date": "2026-10-01"})
+    r = await ainvoke_raw(make_holiday_calendar(FakeDS()), {"date": "2026-10-01"})
     assert r["holidays"][0]["name"] == "国庆节"
 
 
 @pytest.mark.asyncio
 async def test_holiday_calendar_requires_date_month_or_year():
     """holiday_calendar 的 date/month/year 三选一：都不传时返回错误提示而非抛异常。"""
-    r = await make_holiday_calendar(FakeDS()).ainvoke({})
+    r = await ainvoke_raw(make_holiday_calendar(FakeDS()), {})
     assert "error" in r
 
 
 @pytest.mark.asyncio
 async def test_weather_query_default_days():
     """weather_query 的 days 有默认值：只传 city 不传 days 时不应抛 TypeError。"""
-    res = await make_weather_query(FakeDS()).ainvoke({"city": "成都"})
+    res = await ainvoke_raw(make_weather_query(FakeDS()), {"city": "成都"})
     assert res[0]["day_weather"] == "晴"
 
 
 @pytest.mark.asyncio
 async def test_translate():
-    r = await make_translate(FakeDS()).ainvoke({"text": "你好", "to_lang": "en"})
+    r = await ainvoke_raw(make_translate(FakeDS()), {"text": "你好", "to_lang": "en"})
     assert r["translate"] == "HELLO"
 
 
 @pytest.mark.asyncio
 async def test_hotboard():
-    r = await make_hotboard(FakeDS()).ainvoke({"type": "weibo"})
+    r = await ainvoke_raw(make_hotboard(FakeDS()), {"type": "weibo"})
     assert r["list"][0]["title"] == "热搜1"
 
 
 @pytest.mark.asyncio
 async def test_recipe_search():
-    r = await make_recipe_search(FakeDS()).ainvoke({"keyword": "宫保鸡丁"})
+    r = await ainvoke_raw(make_recipe_search(FakeDS()), {"keyword": "宫保鸡丁"})
     assert r["items"][0]["title"] == "宫保鸡丁"
 
 
 @pytest.mark.asyncio
 async def test_recipe_detail():
-    r = await make_recipe_detail(FakeDS()).ainvoke({"id": "333"})
+    r = await ainvoke_raw(make_recipe_detail(FakeDS()), {"id": "333"})
     assert r["ingredients"][0] == "鸡腿 2个"
 
 
 @pytest.mark.asyncio
 async def test_ingredient_nutrition():
-    r = await make_ingredient_nutrition(FakeDS()).ainvoke({"keyword": "鸡胸肉"})
+    r = await ainvoke_raw(make_ingredient_nutrition(FakeDS()), {"keyword": "鸡胸肉"})
     assert r["calory"] == "118"

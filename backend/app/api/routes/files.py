@@ -8,7 +8,7 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from fastapi.responses import Response
 
 from app.core.auth import get_current_user
-from app.core.files import safe_filename
+from app.core.storage.files import safe_filename
 from app.services.agent_service import service
 
 router = APIRouter()

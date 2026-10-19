@@ -9,26 +9,29 @@ from langchain_core.tools import tool
 from pydantic import Field
 
 from app.datasource.uapis import UapisDataSource
+from app.tools.content import render_content
 
 
 def make_holiday_calendar(ds):
     """节假日工具：查指定日期/月份/年份的节假日、农历、节气。"""
 
-    @tool
+    @tool(response_format="content_and_artifact")
     async def holiday_calendar(
         date: Annotated[str, Field(description="按天查询，格式 YYYY-MM-DD")] = "",
         month: Annotated[str, Field(description="按月查询，格式 YYYY-MM")] = "",
         year: Annotated[str, Field(description="按年查询，格式 YYYY")] = "",
-    ) -> dict:
+    ) -> tuple[str, dict]:
         """查询指定日期/月份/年份的节假日、农历、节气、休息日信息"""
         if not date and not month and not year:
-            return {"error": "必须提供 date、month 或 year 参数之一"}
+            raw = {"error": "必须提供 date、month 或 year 参数之一"}
+            return render_content(raw), raw
         result = await ds.get_holiday_calendar(date=date, month=month, year=year)
-        return {
+        raw = {
             "summary": result.get("summary"),
             "days": result.get("days"),
             "holidays": result.get("holidays"),
         }
+        return render_content(raw), raw
 
     return holiday_calendar
 
@@ -36,13 +39,14 @@ def make_holiday_calendar(ds):
 def make_weather_query(ds):
     """天气查询工具：查城市未来 N 天天气（UAPIS 数据源，最多 7 天预报）。"""
 
-    @tool
+    @tool(response_format="content_and_artifact")
     async def weather_query(
         city: Annotated[str, Field(description="城市名（中文/英文）或 adcode")],
         days: Annotated[int, Field(description="预报天数，最多 7 天")] = 7,
-    ) -> list[dict]:
+    ) -> tuple[str, list[dict]]:
         """查询城市未来天气（最多 7 天预报），city 支持中文名/英文名/adcode"""
-        return await ds.get_weather(city, days)
+        raw = await ds.get_weather(city, days)
+        return render_content(raw), raw
 
     return weather_query
 
@@ -50,13 +54,14 @@ def make_weather_query(ds):
 def make_translate(ds):
     """翻译工具：把文本翻译成目标语言。"""
 
-    @tool
+    @tool(response_format="content_and_artifact")
     async def translate(
         text: Annotated[str, Field(description="要翻译的文本")],
         to_lang: Annotated[str, Field(description="目标语言代码，如 en(英语)/zh(中文)/ja(日语)/ko(韩语)，默认 en")] = "en",
-    ) -> dict:
+    ) -> tuple[str, dict]:
         """翻译文本，自动检测源语言，翻译成目标语言"""
-        return await ds.translate(text, to_lang)
+        raw = await ds.translate(text, to_lang)
+        return render_content(raw), raw
 
     return translate
 
@@ -64,13 +69,14 @@ def make_translate(ds):
 def make_hotboard(ds):
     """热榜工具：查指定平台热搜。"""
 
-    @tool
+    @tool(response_format="content_and_artifact")
     async def hotboard(
         type: Annotated[str, Field(description="平台类型，如 weibo/zhihu/baidu/bilibili")],
         limit: Annotated[int, Field(description="返回条数，默认 20")] = 20,
-    ) -> dict:
+    ) -> tuple[str, dict]:
         """查询指定平台的热搜热榜（微博/知乎/百度等）"""
-        return await ds.get_hotboard(type, limit)
+        raw = await ds.get_hotboard(type, limit)
+        return render_content(raw), raw
 
     return hotboard
 
@@ -78,12 +84,13 @@ def make_hotboard(ds):
 def make_recipe_search(ds):
     """菜谱搜索工具：按菜名/食材搜菜谱。"""
 
-    @tool
+    @tool(response_format="content_and_artifact")
     async def recipe_search(
         keyword: Annotated[str, Field(description="菜名或食材关键词，如 宫保鸡丁、鸡胸肉")],
-    ) -> dict:
+    ) -> tuple[str, dict]:
         """按菜名或食材关键词搜索菜谱，返回菜谱列表（含 id）"""
-        return await ds.search_recipe(keyword)
+        raw = await ds.search_recipe(keyword)
+        return render_content(raw), raw
 
     return recipe_search
 
@@ -91,12 +98,13 @@ def make_recipe_search(ds):
 def make_recipe_detail(ds):
     """菜谱详情工具：查菜谱做法。"""
 
-    @tool
+    @tool(response_format="content_and_artifact")
     async def recipe_detail(
         id: Annotated[str, Field(description="菜谱 id，来自 recipe_search 返回")],
-    ) -> dict:
+    ) -> tuple[str, dict]:
         """调用前必须先调用 recipe_search，按 recipe_search 返回的 菜谱 id 查询菜谱详情，返回食材用量清单 + 分步做法"""
-        return await ds.get_recipe_detail(id)
+        raw = await ds.get_recipe_detail(id)
+        return render_content(raw), raw
 
     return recipe_detail
 
@@ -104,12 +112,13 @@ def make_recipe_detail(ds):
 def make_ingredient_nutrition(ds):
     """食材营养工具：查食材营养成分。"""
 
-    @tool
+    @tool(response_format="content_and_artifact")
     async def ingredient_nutrition(
         keyword: Annotated[str, Field(description="食材名称，如 鸡胸肉、白菜")],
-    ) -> dict:
+    ) -> tuple[str, dict]:
         """查询食材的营养成分（热量/蛋白质/脂肪/碳水/膳食纤维）"""
-        return await ds.get_ingredient_nutrition(keyword)
+        raw = await ds.get_ingredient_nutrition(keyword)
+        return render_content(raw), raw
 
     return ingredient_nutrition
 

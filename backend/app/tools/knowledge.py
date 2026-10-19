@@ -8,6 +8,7 @@ from langchain_core.tools import tool
 from pydantic import Field
 
 from app.core.context import current_user_id
+from app.tools.content import render_content
 
 
 def number_hit_images(hits: list[dict]) -> list[dict]:
@@ -57,20 +58,21 @@ def make_search_knowledge(store):
     不代表怕截断 —— 图片走 `_tool_result_event` 的侧信道，读的是 raw 而非截断后的 text。
     """
 
-    @tool
+    @tool(response_format="content_and_artifact")
     async def search_knowledge(
         query: Annotated[str, Field(description="检索问题，用自然语言，如「杭州三天怎么玩」")],
         top_k: Annotated[int, Field(description="返回片段数，默认 3")] = 3,
-    ) -> dict | str:
+    ) -> tuple[str, dict | str]:
         """在本地知识库中按语义检索攻略/游记语料，返回最相关的片段。当需要目的地的深度玩法、避坑经验、行程细节等攻略类信息时使用。"""
         hits = await store.search(current_user_id.get(), query, top_k)
         if not hits:
             # 空分支保留中文短句：改成 dict 后模型会看到 {"hits": [], "images": []}，
             # 那句显式提示就没了
-            return "知识库暂无相关内容"
+            return "知识库暂无相关内容", "知识库暂无相关内容"
         # 图片单列一份（照 artifacts 的路子，由 agent 侧的侧信道带给前端），并就地给
         # 正文里的图编号：模型照号引用，前端照号取图 —— 拼图片 URL 这件事压根不给模型。
-        return {"hits": hits, "images": number_hit_images(hits)}
+        raw = {"hits": hits, "images": number_hit_images(hits)}
+        return render_content(raw), raw
 
     return search_knowledge
 

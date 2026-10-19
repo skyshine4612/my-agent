@@ -3,7 +3,7 @@
 # 不连库就测不到隔离这一层。
 import pytest
 
-from app.core.files import MAX_NAME_CHARS, FileStore
+from app.core.storage.files import MAX_NAME_CHARS, FileStore
 from app.core.memory import ConversationStore
 from app.core.storage import BUCKET_FILES
 from tests.fake_storage import make_client

@@ -34,7 +34,10 @@ my-agent/
 ├── backend/
 │   ├── app/
 │   │   ├── api/routes/        # HTTP 入口：SSE 对话、会话、记忆、知识库、文件
-│   │   ├── core/              # ReAct 图、critic、LLM、RLS 连接、记忆、RAG、存储、沙箱
+│   │   ├── core/              # ReAct 图、critic、LLM、RLS 连接、沙箱
+│   │   │   ├── knowledge/     # 切块 / 向量化 / 抓取入库 / 检索 / 图片描述
+│   │   │   ├── memory/        # 工作记忆 / 短期记忆 / 长期记忆
+│   │   │   └── storage/       # Storage 客户端 + 会话文件
 │   │   ├── datasource/        # MCP（12306 / 机票）+ HTTP（高德 / UAPIS / Tavily）
 │   │   ├── models/            # Pydantic 请求模型
 │   │   ├── prompts/           # 运行时提示词
@@ -230,6 +233,7 @@ uv run pytest tests/test_agent.py -k critic   # 按关键字筛选
 2. **工具（三步，缺一不可）**：
    1. **写数据源**：走 MCP 继承 `datasource/mcp_base.py` 的 `McpDataSource`（子类传 `url` + 认证头，实现查询方法）；走 HTTP 继承 `datasource/http_base.py` 的 `HttpDataSource`（基类封装了 `httpx.AsyncClient`）。
    2. **写注册函数**：在 `app/tools/` 下写 `register_xxx_tools(registry, ...)`，内部用 langchain 的 `@tool` 装饰工具函数（类型注解即参数 schema），再用 `registry.register_tool(tool_obj, "<中文动作短语>")` 登记，并返回内联 `new` 的数据源（供上层统一 `close`）。
+      返回 dict/list 的工具用 `@tool(response_format="content_and_artifact")` 返回 `(content, raw)`：`content` 是模型可见文本（用 `render_content` 渲染），`raw` 保留原始结构供截断/spill/前端侧信道；返回 str 的工具保持普通 `@tool`。
    3. **登记**：在 `app/tools/__init__.py` 的 `register_all_tools()` 里加一行 `datasources.extend(xxx.register_xxx_tools(registry, ...))`。
 
    service 的 `_build_registry()` 只在启动时装配一次（数据源 `__init__` 会创建从不 `close` 的 httpx 客户端），新工具接入 `register_all_tools` 后即自动生效，无需改 service 装配代码。

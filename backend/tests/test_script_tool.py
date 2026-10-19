@@ -7,10 +7,11 @@ import pytest_asyncio
 
 from app.core.agent import NON_QUERY_TOOLS
 from app.core.context import current_conversation_id, current_user_id
-from app.core.files import FileStore
+from app.core.storage.files import FileStore
 from app.core.skill_scripts import scan_scripts
 from app.tools.script import make_run_skill_script
 from tests.fake_storage import make_client
+from tests.tool_utils import ainvoke_raw
 
 
 class _FakeSandbox:
@@ -56,7 +57,7 @@ async def test_rejects_unknown_skill_script_pair(env):
     sandbox = _FakeSandbox()
     tool = make_run_skill_script(sandbox, store, scripts)
     # excel 与 plan 各自都在白名单里，但组合不存在
-    r = await tool.ainvoke({"skill": "excel", "script": "plan", "params": {}})
+    r = await ainvoke_raw(tool, {"skill": "excel", "script": "plan", "params": {}})
     assert r["ok"] is False and "没有这个脚本" in r["error"]
     assert sandbox.calls == []
 
@@ -73,8 +74,8 @@ async def test_resolves_name_and_sends_bytes(env):
     await store.save(uid, cid, "a.xlsx", b"PK\x03\x04")
     sandbox = _FakeSandbox()
     tool = make_run_skill_script(sandbox, store, scripts)
-    r = await tool.ainvoke({"skill": "excel", "script": "desensitize",
-                            "params": {"file": "a.xlsx", "ops": [{"column": "联系电话"}]}})
+    r = await ainvoke_raw(tool, {"skill": "excel", "script": "desensitize",
+                                 "params": {"file": "a.xlsx", "ops": [{"column": "联系电话"}]}})
     call = sandbox.calls[0]
     # 参数原样透传（清单里的名字就是沙箱 work_dir 里的名字），字节另走 files 通道
     assert call["args"]["file"] == "a.xlsx"
@@ -116,8 +117,8 @@ async def test_name_equal_to_an_artifact_is_not_rewritten(env):
     await store.save(uid, cid, "已脱敏.xlsx", b"x", source="script:excel/desensitize")
     sandbox = _FakeSandbox()
     tool = make_run_skill_script(sandbox, store, scripts)
-    r = await tool.ainvoke({"skill": "excel", "script": "desensitize",
-                            "params": {"file": "已脱敏.xlsx", "out_name": "已脱敏.xlsx"}})
+    r = await ainvoke_raw(tool, {"skill": "excel", "script": "desensitize",
+                                 "params": {"file": "已脱敏.xlsx", "out_name": "已脱敏.xlsx"}})
     assert sandbox.calls[0]["args"]["out_name"] == "已脱敏.xlsx"
     assert sandbox.calls[0]["args"]["file"] == "已脱敏.xlsx"
     assert [f["name"] for f in sandbox.calls[0]["files"]] == ["已脱敏.xlsx"]   # 同名只收一次
@@ -144,7 +145,7 @@ async def test_artifacts_are_saved_back(env):
                                            "data": base64.b64encode(b"out").decode()}],
                             "duration_ms": 1})
     tool = make_run_skill_script(sandbox, store, scripts)
-    r = await tool.ainvoke({"skill": "excel", "script": "desensitize", "params": {"file": "a.xlsx"}})
+    r = await ainvoke_raw(tool, {"skill": "excel", "script": "desensitize", "params": {"file": "a.xlsx"}})
     art = r["artifacts"][0]
     assert art["name"] == "已脱敏.xlsx"
     got = await store.read(uid, cid, art["file_id"])
@@ -157,7 +158,7 @@ async def test_nonzero_exit_reports_stderr(env):
     sandbox = _FakeSandbox({"exit_code": 1, "stdout": "", "stderr": "列名不存在：手机号",
                             "artifacts": [], "duration_ms": 1})
     tool = make_run_skill_script(sandbox, store, scripts)
-    r = await tool.ainvoke({"skill": "excel", "script": "desensitize", "params": {}})
+    r = await ainvoke_raw(tool, {"skill": "excel", "script": "desensitize", "params": {}})
     assert r["ok"] is False and r["error"] == "列名不存在：手机号"
 
 

@@ -1,6 +1,6 @@
 # AgentService.delete_conversation 的接线测试：与 test_files.py 分工不同——
 # 那边测 FileStore 自己，这边测 service 层的「先删对象、再删会话行」顺序与归属校验语义。
-from app.core.files import FileStore
+from app.core.storage.files import FileStore
 from app.core.memory import ConversationStore
 from app.services.agent_service import service
 from tests.fake_storage import make_client

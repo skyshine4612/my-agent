@@ -1,7 +1,8 @@
 # app/core/agent.py
 # Agent 基类：ReAct 推理-行动循环（LLM 决策 → 工具调用 → 回填结果 → 再决策）由 create_agent 编译出的
-# 一张图承载，不套父图；工具执行（并行 + 结构化截断 + 地址索引落盘）、工作记忆 token 预算淘汰、
-# critic 事实校验与定向改写各落在一个中间件上，后者的环跑在收口钩子内部，对图不可见。
+# 一张图承载，不套父图；工具由 ToolNode 执行，_ToolExecMiddleware 只做事件/结构化截断/spill；
+# 轮次上限、工作记忆 token 预算淘汰、critic 事实校验与定向改写各落在一个中间件上，
+# critic 的环跑在收口钩子内部，对图不可见。
 import json
 import logging
 import re
@@ -11,10 +12,11 @@ from typing import Annotated, TypedDict
 
 from langchain.agents import create_agent
 from langchain.agents.middleware import AgentMiddleware
+from langchain.agents.middleware.types import ExtendedModelResponse, ModelResponse
 from langchain_core.messages import (AIMessage, HumanMessage, RemoveMessage,
                                      SystemMessage, ToolMessage)
 from langchain_core.messages.utils import convert_to_openai_messages
-from langgraph.errors import GraphRecursionError
+from langgraph.errors import GraphBubbleUp, GraphRecursionError
 from langgraph.graph.message import add_messages
 from langgraph.types import Command
 
@@ -39,9 +41,9 @@ NON_QUERY_TOOLS = {"read_file", "grep", "get_skill", "run_skill_script",
 # 只有本轮调用了它们才触发 critic 回路（省成本，仅在硬数据场景做事实校验）。
 HARD_DATA_TOOLS = {"train_ticket_query", "flight_query", "weather_query", "holiday_calendar"}
 
-# 图侧步数额度：一轮 ReAct 占 3 步（before_model 钩子 + 模型 + 工具），60 步 = 20 轮。
-# 防死循环的粗上界，不是精确契约。
-RECURSION_LIMIT = 60
+# 硬保护倍数：业务轮次由 _ToolRoundLimitMiddleware 控制；图额度只防失控，
+# 按 max_tool_rounds 的 10 倍派生（20 轮 → 200 步），不对外暴露为配置。
+HARD_RECURSION_MULTIPLIER = 10
 
 # 配置里按值携带凭据的字段：工具异常常带完整请求 URL（高德把 key 放 query）、连接串异常带密码。
 # 两个 MCP 服务地址不含凭据（token 走 header），故不在列。
@@ -278,32 +280,30 @@ class _CriticMiddleware(AgentMiddleware):
 
 
 class _ToolExecMiddleware(AgentMiddleware):
-    """工具执行中间件：图里「执行单个工具」这一步的实际执行者。
+    """工具观察中间件：执行由 ToolNode 的 handler 完成，本类只做事件与后处理。
 
-    create_agent 的工具节点删不掉、只能在外面包一层，awrap_tool_call 就是那层包。本类不做，下面这些
-    就没有别的落点：上报 tool_call / tool_result 事件（前端工具气泡的唯一来源）、结构化截断 + 超限
-    结果 spill 落盘、工具异常脱敏后转文本回喂模型（不炸整轮）、把本轮事实写进 state 的自定义键
-    （tool_results / hard_results / rounds，critic 校验与短期记忆落库都读它们）。框架默认路径只回填
-    ToolMessage，上述一件都不做。
+    create_agent 的工具节点删不掉、只能在外面包一层，awrap_tool_call 就是那层包。本类负责：
+    上报 tool_call / tool_result 事件（前端工具气泡的唯一来源）、结构化截断 + 超限结果 spill 落盘、
+    工具异常脱敏后转文本回喂模型（不炸整轮）、把本轮事实写进 state 的自定义键
+    （tool_results / hard_results / rounds，critic 校验与短期记忆落库都读它们）。
 
-    handler 与自己是二选一，不是前后两步：handler 就是框架自带的执行实现（ToolNode → tool.ainvoke）。
-    调它再自己跑一遍 = 每个工具执行两次（train_ticket_query 这类外部配额接口双倍消耗）；只调它则
-    上面那些全丢。
+    一定 await handler(request)：参数校验、参数注入、并行调度、Command / GraphBubbleUp 控制流
+    由 ToolNode 负责；自己再跑一遍 = 每个工具执行两次（外部配额接口双倍消耗）。
+    结构化工具用 content_and_artifact 返回 (content, raw)：content 进 ToolMessage，artifact
+    保留 list/dict，供这里做结构化截断与 spill；纯文本工具的 artifact 为 None，回退 content。
 
-    自己执行另有一处必要：registry.call_raw 不 str()，上游才能按类型结构化截断（list 前 20 条 /
-    dict 前 20 键）；ToolNode 会把结果 normalize 成消息内容，结构信息就没了。
-
-    并行调度与 tool 消息顺序仍归框架：同一轮多个 tool_calls 每个各过一遍本钩子，本类只管其中一个。
-    代价是 ToolNode 原先代劳的事得自己补：异常接住转成文本回喂、ToolMessage 自建；它另外做的参数
-    注入本项目用不上，没复刻。
+    普通异常 ToolNode 默认不兜底（只转 ToolInvocationError），故这里自己接住并转文本；
+    GraphBubbleUp 必须原样放行。
     """
 
-    def __init__(self, agent_name, registry, emit, conversation_id=None,
+    def __init__(self, agent_name, registry, emit, round_limit, conversation_id=None,
                  tool_result_store=None, user_id=None):
         super().__init__()
         self.agent_name = agent_name
         self.registry = registry
         self.emit = emit
+        # 轮次计数与限流共用：两者都是「模型返回过几次 tool_calls」，分开算会各自漂移
+        self.round_limit = round_limit
         self.conversation_id = conversation_id
         self.tool_result_store = tool_result_store
         self.user_id = user_id
@@ -327,44 +327,57 @@ class _ToolExecMiddleware(AgentMiddleware):
         name = tc["name"]
         # 框架已把 arguments 解析成 dict，直接取用；缺省时空 dict 即无参调用
         args = tc.get("args") or {}
-        # 轮次只用于日志：state 里已产生 tool_calls 的 assistant 消息数即当前轮
-        round_no = max(1, sum(1 for m in request.state["messages"]
-                              if isinstance(m, AIMessage) and m.tool_calls))
+        # 此刻模型已返回本轮 tool_calls，限流器的计数即当前轮号；历史消息不参与
+        round_no = self.round_limit.rounds
         logger.info("[Agent:%s] 第 %d 轮 调工具 %s（id=%s），参数 %s", self.agent_name, round_no, name, tc["id"],
                     json.dumps(args, ensure_ascii=False))
         await self.emit({"type": "tool_call", "agent": self.agent_name, "tool": name, "args": args,
                          "id": tc["id"], "label": self.registry.label(name)})
-        # 通过 registry 真正执行工具，拿到结构化原始结果（call_raw 不做 str() 转换）；
-        # 失败时把错误回传给 LLM 而非让整轮崩溃（MCP 限流/网络抖动会抛异常）。
-        # 执行期间暴露本 call 的 id：call_sub_agent 拿它当子任务的归属键（子 Agent 的事件带上它，
-        # 前端才知道该挂到哪次委派下）。并行工具各在自己的 Task 里跑，context 副本互不污染。
+        # 执行权归 ToolNode：这里只负责本 call 的身份注入与异常出口。
+        # GraphBubbleUp 是 interrupt 等控制流，必须放行；普通异常自己转文本回喂模型，
+        # 不依赖框架兜底（ToolNode 默认只处理 ToolInvocationError）。
+        # 执行期间暴露本 call 的 id：call_sub_agent 拿它当子任务的归属键。
         id_token = current_tool_call_id.set(tc["id"])
         try:
-            raw = await self.registry.call_raw(name, args)
+            result = await handler(request)
+        except GraphBubbleUp:
+            raise
         except Exception as e:
-            # 出口共用于所有数据源：同一个异常串会进日志、回填模型、下发前端并落库，四处一起脱敏
             err = _redact_secrets(str(e))
             logger.warning("[Agent:%s] 工具 %s 执行失败：%s", self.agent_name, name, err)
-            raw = f"工具执行失败：{err}"
+            result = ToolMessage(content=f"工具执行失败：{err}", tool_call_id=tc["id"], status="error")
         finally:
             current_tool_call_id.reset(id_token)
-        # 后处理与上报的异常会被框架的工具错误兜底吞成 error ToolMessage（降级不炸轮），
-        # 不补日志就完全无痕：这里记完再原样抛出，保持框架既有的降级行为与错误串
+
+        # 工具直接返回 Command / list 时原样透传；当前没有这种工具
+        if not isinstance(result, ToolMessage):
+            return result
+
+        # 参数校验失败等框架生成的 error 消息：同样脱敏后回填
+        if result.status == "error":
+            err = _redact_secrets(str(result.content))
+            if not err.startswith("工具执行失败："):
+                err = f"工具执行失败：{err}"
+            result = result.model_copy(update={"content": err, "artifact": None, "name": None})
+
+        # artifact 优先：结构化工具靠它保留 list/dict；纯文本工具回退 content
+        raw = result.artifact if result.artifact is not None else result.content
         try:
             text = await postprocess_tool_result(name, raw, self.tool_result_store,
                                                  self.conversation_id, self.user_id)
-            logger.info("[Agent:%s] 第 %d 轮 工具 %s 完成（id=%s），返回 %.120s",
-                        self.agent_name, round_no, name, tc["id"], text)
-            # result 字段是模型工作记忆里的截断版结果，供上层 critic 校验，保证校验语料与模型所见一致
-            await self.emit(_tool_result_event(self.agent_name, name, self.registry.label(name),
-                                               tc["id"], text, raw))
         except Exception:
-            logger.exception("[Agent:%s] 第 %d 轮 工具 %s（id=%s）结果后处理/上报失败，交由框架降级为错误回填",
+            # 后处理失败不能炸整轮（并行时还会作废同轮其他结果）：降级为原始文本
+            logger.exception("[Agent:%s] 第 %d 轮 工具 %s（id=%s）结果后处理失败，降级为原始文本",
                              self.agent_name, round_no, name, tc["id"])
-            raise
+            text = str(raw)
+        logger.info("[Agent:%s] 第 %d 轮 工具 %s 完成（id=%s），返回 %.120s",
+                    self.agent_name, round_no, name, tc["id"], text)
+        # result 字段是模型工作记忆里的截断版结果，供上层 critic 校验，保证校验语料与模型所见一致
+        await self.emit(_tool_result_event(self.agent_name, name, self.registry.label(name),
+                                           tc["id"], text, raw))
         # 不回填 name：回填消息的 token 估算（WorkingMemory._estimate 序列化整条消息）必须只含
         # role / tool_call_id / content 三个键，多一个键就会抬高估算、把工作记忆的淘汰边界整体前移
-        update = {"messages": [ToolMessage(content=text, tool_call_id=tc["id"])],
+        update = {"messages": [result.model_copy(update={"content": text, "artifact": None, "name": None})],
                   # result 取模型所见语料（截断版），供 critic 校验与修正重写复用，保证语料一致
                   "tool_results": [{"tool": name, "args": args, "result": text}]}
         if name in HARD_DATA_TOOLS:
@@ -373,6 +386,46 @@ class _ToolExecMiddleware(AgentMiddleware):
         if round_calls:
             update["rounds"] = [round_calls]
         return Command(update=update)
+
+
+def _has_tool_calls(response):
+    """模型响应里是否包含 tool_calls（兼容 AIMessage / ModelResponse / ExtendedModelResponse）。"""
+    if isinstance(response, AIMessage):
+        return bool(response.tool_calls)
+    if isinstance(response, ExtendedModelResponse):
+        response = response.model_response
+    if isinstance(response, ModelResponse):
+        return any(isinstance(m, AIMessage) and m.tool_calls for m in response.result)
+    return False
+
+
+class _ToolRoundLimitMiddleware(AgentMiddleware):
+    """按 ReAct 工具调用轮次限流：数到上限后摘掉工具，强制模型基于已有结果作答。
+
+    计数放在实例上（run_stream 每轮 new），不按 state 里的 assistant 消息数算——
+    工作记忆淘汰会 RemoveMessage 掉早期消息，按消息数会漏计。
+    只有「模型返回 tool_calls」的调用 +1；一轮并行多个工具算 1 轮，纯文本答案不算。
+    """
+
+    def __init__(self, max_rounds):
+        super().__init__()
+        self.max_rounds = max_rounds
+        self.rounds = 0
+
+    async def awrap_model_call(self, request, handler):
+        if self.rounds >= self.max_rounds:
+            base = request.system_message.text if request.system_message else ""
+            request = request.override(
+                tools=[],
+                system_message=SystemMessage(
+                    content=base + "\n\n【轮次限制】已达到工具调用轮次上限，不要再调用工具，"
+                                   "请基于已获得的结果直接给出最终答案；查不到的如实说明。"
+                ),
+            )
+        response = await handler(request)
+        if _has_tool_calls(response):
+            self.rounds += 1
+        return response
 
 
 class _WorkingMemoryMiddleware(AgentMiddleware):
@@ -450,11 +503,14 @@ class Agent:
 
     async def run_stream(self, user_message, history, registry, on_event=None,
                          conversation_id=None, context_budget=None,
-                         tool_result_store=None, summary=None, critic=None):
+                         tool_result_store=None, summary=None, critic=None,
+                         max_tool_rounds=20):
         """以流式方式执行一轮对话，返回 (最终累积文本答复, 每轮 tool_calls)。
 
         流程：
-            - ReAct 循环由 create_agent 编译出的一张图承载：模型节点做决策，工具节点被 _ToolExecMiddleware 完全短路；
+            - ReAct 循环由 create_agent 编译出的一张图承载：模型节点做决策，工具节点由 ToolNode 执行，
+              _ToolExecMiddleware 只做事件上报、截断与 spill；
+            - _ToolRoundLimitMiddleware 按工具调用轮次限流，到上限后摘掉工具、强制作答；
             - 图在模型不再调工具处收口，_CriticMiddleware 在收口钩子里做事实校验与定向改写（环不占图额度）；
             - 调工具轮次的 content 是内部思考（thought），不上发前端；
             - 最终答案（不调工具的轮次，含 critic 改写后的答案）作为返回值交给调用方；
@@ -469,6 +525,7 @@ class Agent:
         tool_result_store：工具结果地址索引存储（ToolResultStore），为 None 时不落库（不启用地址索引）。
         summary：          历史对话摘要，非空时作为独立 system 消息紧跟主 system prompt 之后。
         critic：           CriticConfig，非空时挂上 critic 收口中间件（事实校验与定向改写）；为 None 时只跑 ReAct。
+        max_tool_rounds：  本轮最多允许的「模型返回 tool_calls」轮次，到上限后强制作答。
 
         on_event：可选异步回调，接收流式事件（tool_call / tool_result / status）；为 None 时静默。
         """
@@ -497,7 +554,9 @@ class Agent:
         tools = [registry.get(n).fn for n in self.tools] if self.tools else []
         # conversation_id 每轮不同，middleware 实例与本轮图一起 new，不挂成可变共享属性
         # （并发两轮对话时共享实例会互相踩）
-        middleware = [_ToolExecMiddleware(self.name, registry, emit,
+        round_limit = _ToolRoundLimitMiddleware(max_tool_rounds)
+        middleware = [round_limit,
+                      _ToolExecMiddleware(self.name, registry, emit, round_limit,
                                           conversation_id=conversation_id,
                                           tool_result_store=tool_result_store,
                                           user_id=current_user_id.get()),
@@ -516,15 +575,16 @@ class Agent:
         recorded = set()  # 已记录的答案消息 id：同一超步的 state 会在后续超步里重复出现，按 id 去重
         answer = None  # 不调工具轮次的 content = 面向用户的最终答案（None = 尚未产出）
         status_sent = False
+        # 图额度只做硬保护：业务轮次由 _ToolRoundLimitMiddleware 控制。
+        # 按 max_tool_rounds 的 10 倍派生，保证轮次限制器触发后的「强制作答」不会被图额度截断。
+        recursion_limit = HARD_RECURSION_MULTIPLIER * max_tool_rounds
         try:
             # 多模式流式：messages 拿模型的实时输出（发 status），values 拿每个超步的完整 state
             # （读最终答案与 middleware 写回 state 的轮次——工作记忆淘汰会把早先的 assistant 消息
             #  从 state 里删掉，故轮次不能从 messages 反推）
             async for mode, payload in graph.astream(
                     {"messages": inputs, "hard_results": [], "tool_results": [], "rounds": []},
-                    # 限额按「任务」计，一轮 ReAct 占 3 个：before_model 钩子 + 模型 + 工具。
-                    # 模型跑到额度用尽仍未收口时落到兜底文案。
-                    config={"recursion_limit": RECURSION_LIMIT},
+                    config={"recursion_limit": recursion_limit},
                     stream_mode=["messages", "values"]):
                 if mode == "messages":
                     chunk, meta = payload
@@ -556,7 +616,7 @@ class Agent:
         except GraphRecursionError:
             # 触顶：answer 已有值说明收口钩子跑完了，答案照常下发，只是末尾到 END 超了额度
             if answer is None:
-                logger.warning("[Agent:%s] 达到 %d 步上限仍未收敛，返回兜底文案", self.name, RECURSION_LIMIT)
+                logger.warning("[Agent:%s] 达到 %d 步硬上限仍未收敛，返回兜底文案", self.name, recursion_limit)
         # 判空用 None 而非空串：不调工具轮次即使 content 为空也算收敛（返回空串），
         # 只有「跑满额度仍每轮调工具」才落到下面的兜底文案
         if answer is not None:

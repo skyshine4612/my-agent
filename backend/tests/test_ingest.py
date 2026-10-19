@@ -1,7 +1,7 @@
 # tests/test_ingest.py
 # 正文提取测试（不依赖网络）：markdown 转换是纯函数，端到端用例喂结构完整的 HTML——
 # trafilatura 对残缺片段会走兜底链，行为与真实网页不同，不能拿它当输入。
-from app.core.ingest import extract_text, extract_with_images, markdown_to_text
+from app.core.knowledge.ingest import extract_text, extract_with_images, markdown_to_text
 
 
 def _marks(count: int = 1) -> str:
@@ -24,8 +24,8 @@ def test_hard_cut_never_splits_a_placeholder():
     1 个字符内部没有缝隙——结构性为 0，不是概率变低（2 字符实测也是 0 次，但那是样本
     没压到，不是切不开）。
     """
-    from app.core.chunking import chunk_spans, chunk_text
-    from app.core.ingest import assign_images
+    from app.core.knowledge.chunking import chunk_spans, chunk_text
+    from app.core.knowledge.ingest import assign_images
 
     mark = _marks(1)
     misses = []
@@ -148,15 +148,15 @@ def test_scrub_marks_removes_leftover_placeholders_and_null_bytes():
     要守的不变量：**输出里没有 null 字节** —— asyncpg 抛「a str must not contain
     null bytes」，丢的不是一张图，是整篇。
     """
-    from app.core.ingest import scrub_marks
+    from app.core.knowledge.ingest import scrub_marks
     assert scrub_marks(f"前{_marks(1)}后") == "前后"      # 完整占位符整体消失
     assert scrub_marks("前\x00后") == "前后"             # 任何来源的 null 字节也挡掉
 
 
 def test_assign_images_puts_image_in_the_chunk_holding_its_offset():
     """偏移法：按占位符在原文里的起始位置归属，跨边界归第一块。"""
-    from app.core.chunking import chunk_spans
-    from app.core.ingest import assign_images
+    from app.core.knowledge.chunking import chunk_spans
+    from app.core.knowledge.ingest import assign_images
 
     text = f"甲。{_marks(1)}\n\n乙。丙。丁。戊。己。庚。辛。壬。癸。"
     spans = chunk_spans(text, 12, 2)
@@ -169,7 +169,7 @@ def test_assign_images_puts_image_in_the_chunk_holding_its_offset():
 
 def test_assign_images_skips_images_without_a_mark():
     """describe_images 会 urls[:MAX_IMAGES]，IMG10+ 的图没有对应的占位符 —— 不能瞎挂。"""
-    from app.core.ingest import assign_images
+    from app.core.knowledge.ingest import assign_images
     text = f"甲。{_marks(1)}乙。"
     got = assign_images(text, [{"n": 0, "desc": "a"}, {"n": 9, "desc": "b"}], [(0, len(text))])
     assert got == [[{"n": 0, "desc": "a"}]]

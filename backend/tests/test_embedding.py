@@ -6,7 +6,7 @@ import logging
 
 import pytest
 
-from app.core.embedding import (_EMBED_BATCH, _EMBED_CONCURRENCY, _PROGRESS_EVERY,
+from app.core.knowledge.embedding import (_EMBED_BATCH, _EMBED_CONCURRENCY, _PROGRESS_EVERY,
                                 OpenAICompatEmbedding, embed_batched)
 
 
@@ -105,7 +105,7 @@ async def test_embed_batched_logs_progress_on_long_input(caplog):
     """批次够多时按间隔打进度，长文档不会全程黑屏。"""
     emb = _RecordingEmbedder()
     texts = [str(i) for i in range(_EMBED_BATCH * (_PROGRESS_EVERY + 10))]
-    with caplog.at_level(logging.INFO, logger="app.core.embedding"):
+    with caplog.at_level(logging.INFO, logger="app.core.knowledge.embedding"):
         await embed_batched(emb, texts)
 
     progress = [r for r in caplog.records if "向量化进度" in r.getMessage()]
@@ -117,7 +117,7 @@ async def test_embed_batched_logs_progress_on_long_input(caplog):
 async def test_embed_batched_stays_quiet_on_short_input(caplog):
     """短输入（长期记忆提炼那种量级）不刷进度日志。"""
     emb = _RecordingEmbedder()
-    with caplog.at_level(logging.INFO, logger="app.core.embedding"):
+    with caplog.at_level(logging.INFO, logger="app.core.knowledge.embedding"):
         await embed_batched(emb, [str(i) for i in range(5)])
 
     assert caplog.records == []

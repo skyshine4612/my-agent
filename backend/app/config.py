@@ -53,6 +53,8 @@ class Settings(BaseSettings):
     # 那是 Postgres 连接串。填后端所在主机能访问到的地址，浏览器那个是 docker/.env 的
     # SUPABASE_PUBLIC_URL（http://localhost:8000），两者不是一回事。
     supabase_url: str = ""
+    # 单轮对话最多允许的工具调用轮次：模型返回 tool_calls 记一轮，到上限后摘掉工具强制作答
+    max_tool_rounds: int = 20
     # 工作记忆 token 预算上限：每次 LLM 调用前估算上下文，超预算淘汰最老交互 + LLM 摘要兜底
     # 应 ≤ 模型上下文上限（如1M）并预留输出余量（128K）；取 128K 平衡成本与长上下文能力
     llm_context_budget: int = 128000
